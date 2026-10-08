@@ -1,11 +1,6 @@
 # NETBOOT-ANDROID
-### *Now playing on Interdimensional Cable. Channel 1 through 9,000-ish.*
 
-> *[static]* ...and you're watching a README. It is also a bash script. In some dimensions it is a sandwich. Please stay tuned. *[static]*
-
----
-
-## 📺 CH. 1: "WHAT IS THIS?" (live from Dimension C-137-ish)
+## 📺 CH. 1: "WHAT IS THIS?"
 
 **Host:** A man whose head is a boot loader.
 
@@ -15,7 +10,7 @@
 
 ---
 
-## 📺 CH. 2: "HOW IT WORKS" (a cooking show where everyone is a packet)
+## 📺 CH. 2: "HOW IT WORKS"
 
 **Chef Dhcpo:** "Step one: the PC cries, 'I NEED TO BOOT.' Step two: the phone hands it **iPXE** over TFTP. Step three: iPXE grabs the kernel, initrd and root image over HTTP. Step four: Linux comes out of the oven. Bon appétit!"
 
@@ -23,7 +18,7 @@
 
 ---
 
-## 📺 CH. 3: "TRUST ISSUES" (a courtroom drama, every witness is a hash)
+## 📺 CH. 3: "TRUST ISSUES"
 
 **The Honorable Judge Sha-256:** "Order! Order! This court only accepts evidence that has been verified!"
 
@@ -44,7 +39,7 @@ The script checks every link in the chain:
 
 ---
 
-## 📺 CH. 4: "THE MENU" (a restaurant where every dish is a Linux)
+## 📺 CH. 4: "THE MENU"
 
 *A waiter made of spaghetti reads you the specials:*
 
@@ -64,7 +59,7 @@ The script checks every link in the chain:
 
 ---
 
-## 📺 CH. 5: "PREPARE YOURSELF" (a home-improvement show about a house that's also a phone)
+## 📺 CH. 5: "PREPARE YOURSELF"
 
 **You will need:**
 
@@ -77,7 +72,7 @@ The script checks every link in the chain:
 
 ---
 
-## 📺 CH. 6: "THE ROUTINE" (a morning workout show, hosted by a clock)
+## 📺 CH. 6: "THE ROUTINE"
 
 **Coach Cron:** "FIRST TIME, IN THIS ORDER! Let's go! And ONE! And TWO!"
 
@@ -107,7 +102,7 @@ The script checks every link in the chain:
 
 ---
 
-## 📺 CH. 7: "HOW'S YOUR CONNECTION?" (a dating show: Phone seeks PC)
+## 📺 CH. 7: "HOW'S YOUR CONNECTION?"
 
 **Host:** "Three suitors have entered the Network Mode Mansion!"
 
@@ -121,7 +116,7 @@ The script checks every link in the chain:
 
 ---
 
-## 📺 CH. 8: "ARM64 AND x86_64: FORBIDDEN LOVE" (a telenovela)
+## 📺 CH. 8: "ARM64 AND x86_64: FORBIDDEN LOVE"
 
 *Dramatic zoom.* "Maria, your phone is arm64, but your PC is x86_64! You cannot build its iPXE natively!"
 
@@ -145,7 +140,7 @@ TRUST_CA=ca.crt FALLBACK_SERVER=<phone IP> ./netboot-android.sh --arch x86_64 bu
 
 ---
 
-## 📺 CH. 9: "THE REMOTE" (an infomercial for a TV remote with too many buttons)
+## 📺 CH. 9: "THE REMOTE"
 
 | Command | What it does |
 |---|---|
@@ -162,7 +157,7 @@ TRUST_CA=ca.crt FALLBACK_SERVER=<phone IP> ./netboot-android.sh --arch x86_64 bu
 
 ---
 
-## 📺 CH. 10: "THIS IS FINE" (a medical drama where everything is on fire)
+## 📺 CH. 10: "THIS IS FINE"
 
 **Dr. Segfault:** "Nurse, what are the symptoms?"
 
@@ -178,7 +173,7 @@ TRUST_CA=ca.crt FALLBACK_SERVER=<phone IP> ./netboot-android.sh --arch x86_64 bu
 
 ---
 
-## 📺 CH. 11: "THE FINE PRINT" (a show with no host, only a very fast voice)
+## 📺 CH. 11: "THE FINE PRINT"
 
 *[disclaimer voice, 4x speed]* "netboot-android does NOT do the following:
 
