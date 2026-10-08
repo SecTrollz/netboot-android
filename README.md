@@ -1,41 +1,47 @@
-# netboot-android
+ # HI, BILLY MAYS HERE FOR NETBOOT-ANDROID!
 
-*Writ by a feller from Planet Enu, where we all talk English and ain't none of us got more than half a brain between us.*
+**BOOT STUBBORN, STUCK-ON, CAN'T-FIND-THE-USB-STICK PCs IN SECONDS!**
 
-Well howdy, ya'll. Ol' Cletus Bubba-Quark here from Planet Enu. Folks say I'm a dumbshit head, and I ain't gonna argue, cuz I once tried to boot a computer by yellin' at it. But I finally figgered out sumthin' useful, so listen up.
+You've seen it. You've been there. You need Linux on a PC, and you're crawling around the floor looking for a USB stick. Then you find one, and it's got a *tax return from 2014* on it! **THERE HAS TO BE A BETTER WAY!**
 
-## What in tarnation is this?
+**THERE IS! NETBOOT-ANDROID!**
 
-It's a bash script called `netboot-android.sh`. You run it on a rooted Android phone (in Termux) or on any ol' Linux box. It turns that thing into a **PXE boot server**. Then you tell your PC to boot off the network, and the PC grabs a Linux live system from yer phone. No USB stick. No burnin' discs. We ain't got no discs on Enu, the cows ate 'em.
+It's ONE bash script, `netboot-android.sh`, and it turns your rooted Android phone (running Termux) or ANY Linux machine into a **VERIFIED PXE BOOT SERVER!** Your PC boots straight off the network and pulls a live Linux system from your phone. **NO USB STICK! NO DISC! NO FOOLIN'!**
 
-How it works, as best my skull can hold it:
+---
 
-1. PC asks the network "hey, I need to boot, who's got somethin'?"
-2. Yer phone says "me!" and hands over **iPXE** through TFTP.
-3. iPXE grabs the kernel, the initrd, and the big ol' root image over HTTP.
-4. Linux comes up. Hot damn.
+## LET ME SHOW YOU HOW IT WORKS!
 
-## Why ain't it just dumb?
+Watch this!
 
-On Enu, we trust nobody, not even our own mamas. So this script checks everything before it serves it up:
+1. Your PC yells, "I NEED TO BOOT!"
+2. Your phone answers and hands it **iPXE** over TFTP! *Boom!*
+3. iPXE grabs the kernel, the initrd, and the root image over HTTP! *Snap!*
+4. **LINUX BOOTS RIGHT ON YOUR SCREEN!** *That's right!*
 
-- **Vendor keys.** It knows the signin' key fingerprints for each distro and grabs each key from at least two different places. If they don't match up, it quits.
-- **Vendor signatures.** It only takes an ISO if the signature checks out against that key.
-- **TLS pinnin'.** It pins the public keys of the download servers and checks 'em against Certificate Transparency logs. If a server shows a key that ain't in CT, that smells like somebody snoopin' on ya, and it hollers.
-- **Yer own signin' keys.** It makes a GPG key and a little code-signin' CA right on yer device.
-- **iPXE built from source** at a pinned commit, with your CA baked in. It flat out refuses to run the boot script, kernel, or initrd unless the signature checks out.
-- **Integrity gate.** Before it serves nothin', it re-hashes every file against a list.
-- **Signed reports** that tie it all together so you can check later that nobody messed with it.
+---
 
-### The stuff it AIN'T checkin' (be honest now)
+## BUT HOW DO I KNOW IT'S SAFE?! HERE'S THE POWER OF VERIFICATION!
 
-- The big root image the initrd downloads **after** boot (Ubuntu ISO, Debian/Parrot squashfs, Fedora squashfs) ain't signature-checked on the PC. Arch and SystemRescue do check theirs.
-- If somebody can edit the script, they can edit the checkin' too. Write down the `fingerprints` output on **another device** and compare. That's the real protection, ya dingus.
-- The pins and vendor data baked in were collected 2026-10-08. Run `pins refresh` on yer own device before ya trust 'em.
+Other boot servers just hand over files and **CROSS THEIR FINGERS!** Not this one! Every single link gets checked:
 
-## What it can boot
+- ✅ **VENDOR KEYS!** Fingerprints are built right in! Each key comes from at least TWO independent sources, and they have to agree!
+- ✅ **VENDOR SIGNATURES!** The ISO is accepted ONLY when the vendor's signature verifies!
+- ✅ **TLS PINNING!** Download servers are pinned by public key and checked against **Certificate Transparency logs!** A key that's not in CT? That's interception, and the script SAYS SO!
+- ✅ **YOUR OWN SIGNING KEYS!** A GPG key and a code-signing CA, made right on YOUR device!
+- ✅ **iPXE BUILT FROM SOURCE!** At a pinned commit, with YOUR CA baked in! It REFUSES to run the boot script, kernel, or initrd unless the signature checks out!
+- ✅ **INTEGRITY GATE!** Every served file is re-hashed BEFORE the servers start!
+- ✅ **SIGNED ATTESTATION REPORTS!** Re-verify any time you want!
 
-| `--distro`     | What it is                    | CPU            | PC RAM needed |
+**CHECKED! SIGNED! VERIFIED! IT'S ALL IN ONE SCRIPT!**
+
+---
+
+## BUT WAIT! THERE'S MORE! SEVEN DISTROS!
+
+Order now and you get **SEVEN** live systems, **ALL IN THE SAME SCRIPT!**
+
+| `--distro`     | What you get                  | CPU            | PC RAM needed |
 |----------------|-------------------------------|----------------|---------------|
 | `ubuntu`       | Ubuntu 26.04.1 desktop        | x86_64, arm64  | ~10 GB (arm64 ~7) |
 | `ubuntu24`     | Ubuntu 24.04.5.1 desktop      | x86_64         | ~10 GB |
@@ -45,86 +51,115 @@ On Enu, we trust nobody, not even our own mamas. So this script checks everythin
 | `systemrescue` | SystemRescue 13.02            | x86_64         | ~4 GB |
 | `parrot`       | Parrot Security 7.4           | x86_64, arm64  | ~12 GB |
 
-`--arch` is the CPU of the **PC that's bootin'**, not yer phone. Don't mix 'em up like I did.
+`--arch` is the CPU of the PC that's BOOTING, not your phone!
 
-## What ya need
+---
 
-- A rooted Android phone with Termux (Magisk or KernelSU, give Termux root), **or** a Linux machine with sudo.
-- Enough free storage (the script's `check` tells ya, it's anywhere from 3 GB to 17 GB dependin' on the distro).
-- The PC on the same network as the phone, or a cable straight to it.
-- On the PC: turn on network (PXE) boot and **turn off Secure Boot**.
+## HOW MUCH?! YOU'D EXPECT TO PAY $99! $59! EVEN $29.99!
 
-## How to run it
+**NOT SO FAST!** It's **FREE!** Licensed under Apache-2.0! *(Just pay separate shipping and handling. Kidding! There's no shipping. It's a bash script.)*
 
-First time, in this order:
+---
+
+## WHAT YOU NEED! (NOT MUCH!)
+
+- A **rooted** Android phone with Termux (give Termux root in Magisk or KernelSU), OR a Linux machine with sudo!
+- Free storage! About 3 GB to 17 GB depending on the distro! The `check` command tells you!
+- The PC on the same network as the phone, OR a cable straight to it!
+- On the PC: **PXE boot ON! Secure Boot OFF!**
+
+---
+
+## CALL NOW! (JUST KIDDING, JUST RUN THESE!)
 
 ```sh
 ./netboot-android.sh check          # is everything here?
 ./netboot-android.sh deps           # install packages
-./netboot-android.sh attest-init    # make yer keys and CA
+./netboot-android.sh attest-init    # make your keys and CA
 ./netboot-android.sh self-sign      # sign the script's own hash
 ./netboot-android.sh pins refresh   # check pins against CT
 ./netboot-android.sh build-ipxe     # build iPXE (or import-ipxe DIR)
-./netboot-android.sh fetch          # download + verify the ISO
+./netboot-android.sh fetch          # download and verify the ISO
 ./netboot-android.sh extract        # pull out kernel, initrd, rootfs
 ./netboot-android.sh configure      # sign boot files, write dnsmasq conf
 ./netboot-android.sh attest         # signed report
 ./netboot-android.sh serve          # start the servers
 ```
 
-Too lazy for all that? (Me too.)
+**TOO MANY STEPS?!** Order the **ALL-IN-ONE:**
 
 ```sh
 ./netboot-android.sh --distro debian all
 ```
 
-Run it with no arguments and you get a menu you can poke at.
+**ONE COMMAND!** Or run it with NO arguments for the **GUIDED MENU!**
 
-### Pickin' a network mode
+---
 
-- `--mode proxy` : yer router keeps handin' out addresses, and the phone just adds the boot info. Both on the same Wi-Fi or LAN. Guest Wi-Fi and "client isolation" will wreck this.
-- `--mode direct` : cable from the phone (USB Ethernet) straight to the PC. The phone does DHCP itself.
-- `--mode auto` : it guesses. It's smarter than me.
+## PICK YOUR NETWORK MODE!
 
-Phone hotspot ain't reliable, cuz Android's own DHCP server likes to sit on port 67.
+- 📡 `--mode proxy`: Your router keeps handing out addresses, and the phone just adds the boot info! Guest Wi-Fi and client isolation will block it!
+- 🔌 `--mode direct`: A cable from the phone (USB Ethernet) straight to the PC! The phone does DHCP itself!
+- 🤖 `--mode auto`: It picks for you!
 
-### The "phone can't build x86 iPXE" problem
+**HERE'S A TIP:** The phone's own hotspot is unreliable, because Android's DHCP server may be sitting on port 67!
 
-Most phones are arm64 and most PCs are x86_64, so yer phone can't build the PC's iPXE by itself. Copy `~/netboot/attest/ca.crt` and the script to an x86_64 Linux box and run:
+---
+
+## PHONE IS ARM64 AND YOUR PC IS x86_64?! NO PROBLEM!
+
+Your phone can't build the PC's iPXE natively. So copy `~/netboot/attest/ca.crt` and the script to any x86_64 Linux machine and run:
 
 ```sh
 TRUST_CA=ca.crt FALLBACK_SERVER=<phone IP> ./netboot-android.sh --arch x86_64 build-ipxe
 ```
 
-Copy the `ipxe.efi` and `undionly.kpxe` it spits out back to the phone, then:
+Copy `ipxe.efi` and `undionly.kpxe` back to the phone, then:
 
 ```sh
 ./netboot-android.sh import-ipxe DIR
 ```
 
-## Other commands
+**IT'S THAT EASY!**
+
+---
+
+## ACT NOW AND GET THESE EXTRA COMMANDS, AT NO EXTRA CHARGE!
 
 | Command | What it does |
 |---|---|
-| `fingerprints` | Prints the values ya compare on another device |
-| `verify-attest` | Checks a signed report and re-hashes every file |
-| `pins show` | Lists the pins in use |
-| `logs` | Follows the HTTP log |
-| `selinux status\|permissive\|enforcing` | Android only. Permissive makes yer phone less safe, so put it back to `enforcing` after |
-| `clean` | Stops servers, removes generated files (keeps ISOs, keys, pins) |
+| `fingerprints` | Values to compare against a copy on ANOTHER device! |
+| `verify-attest` | Checks a signed report and re-hashes every file! |
+| `pins show` | Lists the pins in use! |
+| `logs` | Follows the HTTP log! |
+| `selinux status\|permissive\|enforcing` | Android only! Permissive lowers device security, so set it back to `enforcing` after! |
+| `clean` | Stops servers, removes generated files (keeps ISOs, keys, pins)! |
 
-Run `./netboot-android.sh --help` for every env variable (`DISTRO`, `HTTP_PORT`, `IFACE`, `BOOT_ARGS`, `VERIFIED_BOOT`, and a pile more).
+Run `./netboot-android.sh --help` for EVERY environment variable!
 
-## When it breaks (and it will)
+---
 
-- **"PIN MISMATCH"**: either the site rotated its cert (run `pins refresh HOST`) or somebody's tamperin' with yer connection. Don't download over that network.
-- **dnsmasq won't start**: somethin' else has ports 67 or 69. Check yer hotspot, other DHCP/TFTP services, or SELinux.
-- **"Network changed since configure"**: yer IP moved. Run `configure` again.
-- **Script says it changed since self-sign**: if you edited it, run `self-sign` again. If ya didn't edit it... well, now ya got a problem.
-- **Boot fails closed at `imgverify`**: the iPXE on the phone was built with a different CA than the one signin' the files. Rebuild iPXE.
+## WHEN THINGS GO WRONG, WE'VE GOT YOU COVERED!
 
-## Last words from Planet Enu
+- **"PIN MISMATCH"?** Either the site rotated its certificate (run `pins refresh HOST`) or someone is tampering with your connection. DON'T download over that network!
+- **dnsmasq won't start?** Something else holds port 67 or 69. Check your hotspot, other DHCP/TFTP services, and SELinux!
+- **"Network changed since configure"?** Your IP moved. Run `configure` again!
+- **"Script changed since self-sign"?** If YOU edited it, run `self-sign` again. If you DIDN'T, investigate!
+- **Boot stops at `imgverify`?** The iPXE binaries were built with a different CA. Rebuild iPXE!
 
-This thing does boot stuff, and it checks its work better than anybody I know back home. But I'm still a dumbshit head, so test it on a machine ya can afford to break. If it blows up, that ain't on me, I blame the cows.
+---
 
-Licensed under Apache-2.0, see `LICENSE`. Now go boot sumthin'. Yeehaw.
+## THE FINE PRINT! (I TALK FAST, BUT READ THIS PART!)
+
+Results may vary! netboot-android does NOT do the following:
+
+- The big root image the initrd downloads AFTER boot (Ubuntu ISO, Debian/Parrot squashfs, Fedora squashfs) is **NOT** signature-checked on the client! Arch and SystemRescue DO check theirs!
+- Self-verification is tamper EVIDENCE! Whoever can edit the script can edit the check! Compare the `fingerprints` output against a copy on another device!
+- Embedded pins and vendor data were collected on **2026-10-08**! Run `pins refresh` on your own device before first use!
+- Test on a machine you can afford to break!
+
+---
+
+# NETBOOT-ANDROID! BOOT LINUX FROM YOUR PHONE!
+
+# **BILLY MAYS HERE! AND I'LL BE BACK WITH A NEW SCRIPT NEXT WEEK!**
