@@ -1,49 +1,43 @@
 # NETBOOT-ANDROID
 
-## 📺 CH. 1: "WHAT IS THIS?"
+*Pirouettes onstage, trips on own tutu, glares at the audience like it was THEIR fault.*
 
-**Host:** A man whose head is a boot loader.
+Ugh. Hello, darlings. Yes, it's me, in the pink tutu, which I wear *ironically*, unlike EVERY other girl in this company. They're all "ooh, look at my little turnout." Please. My turnout could boot a computer. And now it does.
 
-"Welcome back to the program! Tonight: `netboot-android.sh`! It's ONE bash script that turns your rooted Android phone (in Termux) or any Linux machine into a **verified PXE boot server**! Your PC boots off the network and pulls a live Linux system from your phone! No USB stick! No disc! Wubba lubba dub dub, I am not joking!"
-
-*[channel flips]*
+`netboot-android.sh` is ONE bash script. It turns your rooted Android phone (in Termux) or any Linux machine into a **verified PXE boot server**. Your PC boots off the network and pulls a live Linux system straight from your phone. No USB stick. No disc. No clumsy little understudies fumbling with flash drives in the wings.
 
 ---
 
-## 📺 CH. 2: "HOW IT WORKS"
+## Act I: The Choreography
 
-**Chef Dhcpo:** "Step one: the PC cries, 'I NEED TO BOOT.' Step two: the phone hands it **iPXE** over TFTP. Step three: iPXE grabs the kernel, initrd and root image over HTTP. Step four: Linux comes out of the oven. Bon appétit!"
+Even the corps de ballet could follow this, and they can barely count to eight:
 
-*[channel flips]*
+1. The PC, *dramatically*, from stage left: "I NEED TO BOOT."
+2. The phone glides in and hands it **iPXE** over TFTP. *Plié.*
+3. iPXE fetches the kernel, initrd and root image over HTTP. *Relevé.*
+4. Linux boots. *Grand jeté.* Hold for applause. Longer. LONGER.
 
 ---
 
-## 📺 CH. 3: "TRUST ISSUES"
+## Act II: Trust Issues (Every Ballerina Has Them)
 
-**The Honorable Judge Sha-256:** "Order! Order! This court only accepts evidence that has been verified!"
+The other girls trust ANYONE who hands them a bouquet. Not me. This script checks every link in the chain:
 
-The script checks every link in the chain:
-
-1. **Vendor keys.** Fingerprints are built in. Each key is fetched from at least two independent sources and they must agree.
+1. **Vendor keys.** Fingerprints are built in. Each key is fetched from at least two independent sources, and they must agree. Like two judges who both agree I'm the best. Which they do.
 2. **Vendor signatures.** An ISO is accepted ONLY when a signature from the vendor key verifies.
-3. **TLS pinning.** Download servers are pinned by public key and checked against Certificate Transparency logs. A key that is not in CT means interception, and the script says so.
-4. **Your own signing keys.** A GPG key and a code-signing CA, generated on YOUR device.
-5. **iPXE built from source** at a pinned commit with your CA baked in. It refuses to run the boot script, kernel, or initrd unless the signature verifies.
+3. **TLS pinning.** Download servers are pinned by public key and checked against Certificate Transparency logs. A key that isn't in CT means interception, and the script calls it out. Loudly. Center stage.
+4. **Your own signing keys.** A GPG key and a code-signing CA, generated on YOUR device. Custom-fitted, like my pointe shoes. Theirs are from a bin.
+5. **iPXE built from source** at a pinned commit with your CA baked in. It refuses to run the boot script, kernel or initrd unless the signature verifies. It has standards, sweetie.
 6. **Integrity gate.** Every served file is re-hashed against the manifest before the servers start.
-7. **Signed attestation reports** tie it together, and you can re-verify any time.
-
-**Defense Attorney:** "Objection! This is a lot of checking!"
-**Judge:** "Overruled. That's the whole point."
-
-*[channel flips]*
+7. **Signed attestation reports** tie it all together, and you can re-verify any time.
 
 ---
 
-## 📺 CH. 4: "THE MENU"
+## Act III: The Repertoire
 
-*A waiter made of spaghetti reads you the specials:*
+Seven roles. I could dance all of them. The others could dance maybe one, badly.
 
-| `--distro`     | Dish of the day               | CPU            | PC RAM needed |
+| `--distro`     | Role                          | CPU            | PC RAM needed |
 |----------------|-------------------------------|----------------|---------------|
 | `ubuntu`       | Ubuntu 26.04.1 desktop        | x86_64, arm64  | ~10 GB (arm64 ~7) |
 | `ubuntu24`     | Ubuntu 24.04.5.1 desktop      | x86_64         | ~10 GB |
@@ -53,28 +47,24 @@ The script checks every link in the chain:
 | `systemrescue` | SystemRescue 13.02            | x86_64         | ~4 GB |
 | `parrot`       | Parrot Security 7.4           | x86_64, arm64  | ~12 GB |
 
-"`--arch` is the CPU of the PC that is BOOTING, not your phone. Sir, please stop eating the menu."
-
-*[channel flips]*
+`--arch` is the CPU of the PC that's BOOTING, not your phone. Brittany got this wrong in rehearsal. Twice.
 
 ---
 
-## 📺 CH. 5: "PREPARE YOURSELF"
+## Act IV: Costume Check
 
-**You will need:**
+You will need:
 
 - A **rooted** Android phone with Termux (grant Termux root in Magisk or KernelSU), OR a Linux machine with sudo.
 - Free storage: roughly 3 GB to 17 GB depending on the distro. The `check` command tells you.
 - The PC on the same network as the phone, or a cable straight to it.
 - On the PC: **PXE (network) boot ON, Secure Boot OFF.**
 
-*[channel flips]*
-
 ---
 
-## 📺 CH. 6: "THE ROUTINE"
+## Act V: Rehearsal, In Order, From The Top
 
-**Coach Cron:** "FIRST TIME, IN THIS ORDER! Let's go! And ONE! And TWO!"
+Five, six, seven, eight:
 
 ```sh
 ./netboot-android.sh check          # is everything here?
@@ -90,90 +80,59 @@ The script checks every link in the chain:
 ./netboot-android.sh serve          # start the servers
 ```
 
-"Too tired?! Do the all-in-one cooldown!"
+Too much choreography for you? Fine, here's the version for the corps:
 
 ```sh
 ./netboot-android.sh --distro debian all
 ```
 
-"Run it with no arguments and you get a guided menu! Stretch!"
-
-*[channel flips]*
+Run it with no arguments and you get a guided menu. Training wheels. On a tutu.
 
 ---
 
-## 📺 CH. 7: "HOW'S YOUR CONNECTION?"
+## Act VI: Partnering
 
-**Host:** "Three suitors have entered the Network Mode Mansion!"
+Every ballerina needs a partner. Pick one:
 
-- 📡 **`--mode proxy`**: Your router keeps handing out addresses, and the phone only adds the boot info. Guest Wi-Fi and client isolation will block it. *"Not compatible!"*
-- 🔌 **`--mode direct`**: A cable (USB Ethernet) straight from phone to PC. The phone does DHCP itself. *"They're going exclusive!"*
-- 🤖 **`--mode auto`**: Lets the script pick. *"Matchmaker."*
+- **`--mode proxy`**: Your router keeps handing out addresses, and the phone only adds the boot info. Guest Wi-Fi and client isolation will drop you mid-lift.
+- **`--mode direct`**: A cable (USB Ethernet) straight from phone to PC. The phone does DHCP itself. A committed partner, finally.
+- **`--mode auto`**: Lets the script pick. Like a blind date at the cast party.
 
-**Warning from the producers:** The phone's own hotspot is unreliable, because Android's DHCP server may hold port 67.
-
-*[channel flips]*
+The phone's own hotspot is unreliable, because Android's DHCP server may be hogging port 67. Like Jessica hogs the mirror.
 
 ---
 
-## 📺 CH. 8: "ARM64 AND x86_64: FORBIDDEN LOVE"
+## Act VII: Touring Abroad (arm64 Phone, x86_64 PC)
 
-*Dramatic zoom.* "Maria, your phone is arm64, but your PC is x86_64! You cannot build its iPXE natively!"
+Your phone is arm64 and your PC is x86_64, so your phone can't build the PC's iPXE natively. It simply cannot. Like Madison and a fouetté.
 
-"Then what do we do, Esteban?!"
-
-"Copy `~/netboot/attest/ca.crt` and the script to any x86_64 Linux machine, and run:"
+Copy `~/netboot/attest/ca.crt` and the script to any x86_64 Linux machine, then:
 
 ```sh
 TRUST_CA=ca.crt FALLBACK_SERVER=<phone IP> ./netboot-android.sh --arch x86_64 build-ipxe
 ```
 
-"Then bring `ipxe.efi` and `undionly.kpxe` back to the phone, and say:"
+Bring `ipxe.efi` and `undionly.kpxe` back to the phone:
 
 ```sh
 ./netboot-android.sh import-ipxe DIR
 ```
 
-*Gasp. Credits roll over a guitar solo.*
-
-*[channel flips]*
-
 ---
 
-## 📺 CH. 9: "THE REMOTE"
+## Act VIII: The Understudy Test (Did Anyone Swap Out My Keys?)
 
-| Command | What it does |
-|---|---|
-| `fingerprints` | Values to compare against a copy on ANOTHER device |
-| `release-stamp TIME` | Stamps the upload time into the script and prints its release code |
-| `verify-upstream` | Proves this script is byte-identical to the GitHub copy committed at that time |
-| `verify-attest` | Checks a signed report and re-hashes every file |
-| `pins show` | Lists the pins in use |
-| `logs` | Follows the HTTP log |
-| `selinux status\|permissive\|enforcing` | Android only. Permissive lowers device security, so set it back to `enforcing` afterward |
-| `clean` | Stops servers, removes generated files (keeps ISOs, keys, pins) |
+Somebody always tries to steal your role. The keys are hard-coded: the vendor fingerprints, the TLS pins, the iPXE commit. Here's how you catch an imposter.
 
-"Run `./netboot-android.sh --help` for EVERY environment variable! There are so many! Buttons! Everywhere!"
-
-*[channel flips]*
-
----
-
-## 📺 CH. 9½: "THE TIME HEIST"
-
-*A detective made of wristwatches stares into the rain.*
-
-"The keys are hard-coded, kid. Fingerprints, pins, the iPXE commit. Somebody touches 'em, I want to know. So here's the play."
-
-**Before the upload, pick the exact moment:**
+**Before you upload, pick your exact curtain time:**
 
 ```sh
 ./netboot-android.sh release-stamp 2026-10-09T18:00:00Z
 ```
 
-That writes the time into the script as `RELEASE_TIME`, re-signs it if you have attestation set up, and prints a **release code**: an HMAC-SHA256 of the whole script keyed by that exact time. **Write the code down somewhere that isn't the phone.**
+That writes the time into the script as `RELEASE_TIME` and re-signs it if you have attestation set up. Then it prints a **release code**: an HMAC-SHA256 of the whole script, keyed by that exact time. **Write the code down somewhere that isn't the phone.** Not on your hand. You'll sweat it off.
 
-**Upload at that exact time** (the script prints these lines for you):
+**Upload at exactly that time** (the script prints these lines for you):
 
 ```sh
 GIT_AUTHOR_DATE=2026-10-09T18:00:00Z GIT_COMMITTER_DATE=2026-10-09T18:00:00Z git commit -am "Release 2026-10-09T18:00:00Z"
@@ -187,24 +146,39 @@ git push origin main
 EXPECT_CODE=xxxx-xxxx-xxxx-xxxx-xxxx ./netboot-android.sh verify-upstream
 ```
 
-It pulls the script from GitHub over pinned TLS and finds the last commit that touched it. Then it checks three things:
+It fetches the script from GitHub over pinned TLS, finds the last commit that touched it, and checks three things:
 
 1. That commit's timestamp must equal `RELEASE_TIME`.
-2. The code recomputed from that timestamp must be identical for the local copy and the GitHub copy.
-3. If you pass `EXPECT_CODE`, it must match too.
+2. The code for your local copy must equal the code for the GitHub copy.
+3. If you pass `EXPECT_CODE`, the GitHub copy's code must match it too.
 
-**All good:** you get one box: `UPSTREAM MATCH`, the commit, the upload time, the code.
-**Anything off:** it names the problem. If keys or pins changed, it shows the exact lines.
+**Flawless:** you get one box: `UPSTREAM MATCH`, the commit, the upload time, the code. Curtsy.
+**Anything off:** it names the problem. If keys or pins changed, it shows the exact lines. Like a judge's scorecard.
 
-"One thing, kid. The time ain't a secret. Anybody can read a commit date. The code alone proves nothing. What proves it is the copy on GitHub plus the code you wrote down off the phone. Don't squash-merge or rebase that commit either, or the timestamp changes and the case goes cold."
-
-*[channel flips]*
+Listen carefully, because I'm only saying this once, unlike SOME people. The time isn't a secret. Anyone can read a commit date. The code alone proves nothing. What proves it is the GitHub copy plus the code you wrote down off the phone. And don't squash-merge or rebase the release commit, or the timestamp changes and the whole performance is ruined.
 
 ---
 
-## 📺 CH. 10: "THIS IS FINE"
+## Act IX: Props Table
 
-**Dr. Segfault:** "Nurse, what are the symptoms?"
+| Command | What it does |
+|---|---|
+| `fingerprints` | Values to compare against a copy on ANOTHER device |
+| `release-stamp TIME` | Stamps the upload time into the script and prints its release code |
+| `verify-upstream` | Proves this script is byte-identical to the GitHub copy committed at that time |
+| `verify-attest` | Checks a signed report and re-hashes every file |
+| `pins show` | Lists the pins in use |
+| `logs` | Follows the HTTP log |
+| `selinux status\|permissive\|enforcing` | Android only. Permissive lowers device security, so set it back to `enforcing` afterward |
+| `clean` | Stops servers, removes generated files (keeps ISOs, keys, pins) |
+
+`./netboot-android.sh --help` lists EVERY environment variable. There are more of them than girls who think they deserve the lead.
+
+---
+
+## Act X: Injuries
+
+Every production has them. Usually someone else's fault.
 
 - **"PIN MISMATCH"**: Either the site rotated its certificate (run `pins refresh HOST`) or someone is tampering with your connection. Do NOT download over that network.
 - **dnsmasq won't start**: Something else holds port 67 or 69. Check your hotspot, other DHCP/TFTP services, and SELinux.
@@ -214,31 +188,19 @@ It pulls the script from GitHub over pinned TLS and finds the last commit that t
 - **"TIME MISMATCH"**: The newest commit touching the script on GitHub wasn't made at `RELEASE_TIME`. Either someone pushed a newer version, or the release commit was made without the `GIT_*_DATE` variables.
 - **"Upstream verification FAILED"**: Your copy is not the one uploaded at that time. Read the diff it prints.
 
-**Dr. Segfault:** "He's going to be fine. Probably. Clear!"
-
-*[channel flips]*
-
 ---
 
-## 📺 CH. 11: "THE FINE PRINT"
-
-*[disclaimer voice, 4x speed]* "netboot-android does NOT do the following:
+## Act XI: What I Won't Do (A Diva Has Limits)
 
 - The big root image the initrd downloads AFTER boot (the Ubuntu ISO, the Debian/Parrot squashfs, the Fedora squashfs) is **NOT** signature-checked on the client. Arch and SystemRescue DO check theirs.
 - Self-verification is tamper EVIDENCE. Whoever can edit the script can edit the check. Compare the `fingerprints` output against a copy kept on another device.
 - Embedded pins and vendor data were collected on **2026-10-08**. Run `pins refresh` on your own device before first use.
-- Test on a machine you can afford to break.
+- Test on a machine you can afford to break. Unlike my ankles, which are priceless.
 
-Licensed under Apache-2.0. See `LICENSE`."
-
-*[channel flips]*
+Licensed under Apache-2.0. See `LICENSE`.
 
 ---
 
-## 📺 CH. 12: *[static]*
+## Curtain
 
-*A single pickle watches you from a beanbag chair.*
-
-*"...boot."*
-
-*[end of broadcast]*
+*Takes eleven bows. Nobody is clapping anymore. Takes a twelfth.*
