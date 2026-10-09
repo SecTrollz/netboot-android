@@ -66,11 +66,16 @@ Every step is checked. The script has trust issues, and they are healthy ones.
 ./netboot-android.sh restore FILE      # verify checksum, save current state, restore
 ```
 
-**Offsite copy (Terabox or anything else).** Set `BACKUP_UPLOAD_CMD` to any uploader command, such as an unofficial Terabox CLI you have logged in with. After each local backup the script encrypts the archive (AES256, passphrase from `BACKUP_GPG_PASSFILE`) and runs `CMD FILE.gpg`. It never uploads without the passphrase file, because the archive holds your signing keys. An upload failure only warns; the local backup stays.
+**Offsite copy to Terabox.** Terabox has no official API, so this uses the unofficial open-source CLI [fcr--/tbc](https://github.com/fcr--/tbc) (MIT, Go), pinned to one commit. It contacts only `www.terabox.com` and logs in with your `ndus` cookie, so treat that cookie like a password and keep it in a `chmod 600` file. Unofficial tools can break when Terabox changes its site.
 
 ```sh
-BACKUP_GPG_PASSFILE=~/.nb-pass BACKUP_UPLOAD_CMD='terabox-upload' ./netboot-android.sh serve
+./netboot-android.sh terabox-install                      # needs git and Go 1.24+
+export TERABOX_COOKIE_FILE=~/.terabox-cookie              # contains: ndus=...
+export BACKUP_GPG_PASSFILE=~/.nb-pass                     # archive passphrase
+./netboot-android.sh serve                                # backs up, encrypts, uploads to /netboot-backups
 ```
+
+The archive holds your signing keys, so it is AES256-encrypted first and never uploaded without the passphrase file. A failed upload only warns; the local backup stays. To restore from Terabox, fetch the `.gpg` file with `tbc get`, decrypt it with `gpg -d FILE.gpg > FILE`, and then run `restore FILE` after putting the matching `.sha256` next to it (or unpack it with `tar -xzf`). For any other uploader, set `BACKUP_UPLOAD_CMD` instead.
 
 This is a file-level archive, not a Clonezilla or Shadow Copy block image. To image the whole phone or disk, do that separately. Editing the script changes its hash, so run `self-sign` again after pulling this change.
 

@@ -130,6 +130,11 @@ BACKUP_KEEP="${BACKUP_KEEP:-5}"           # newest archives kept after each back
 BACKUP_DL="${BACKUP_DL:-0}"               # 1: include downloads/ (ISOs, large)
 BACKUP_UPLOAD_CMD="${BACKUP_UPLOAD_CMD:-}" # offsite hook, run as: CMD FILE.gpg (for example a Terabox uploader)
 BACKUP_GPG_PASSFILE="${BACKUP_GPG_PASSFILE:-}" # passphrase file; required to encrypt before upload
+TERABOX_COOKIE_FILE="${TERABOX_COOKIE_FILE:-}" # file holding the Terabox ndus cookie (or set TERABOX_COOKIE)
+TERABOX_DIR="${TERABOX_DIR:-/netboot-backups}" # remote folder on Terabox
+TBC_REPO="${TBC_REPO:-https://github.com/fcr--/tbc.git}"   # unofficial Terabox CLI (MIT, Go)
+TBC_COMMIT="${TBC_COMMIT:-4f1fb75d0defd5edfda9ae819873503af565055c}"
+TBC_BIN="${TBC_BIN:-}"
 
 # User overrides, captured before presets so they always win
 U_ISO_URL="${ISO_URL:-}"
@@ -1996,14 +2001,45 @@ backup_create() {
   backup_upload "$out"
 }
 
+# Builds the unofficial Terabox CLI (fcr--/tbc) at a pinned commit. It talks only to
+# www.terabox.com (checked in the source at that commit) and needs your ndus cookie.
+terabox_install() {
+  need git; need go
+  local d="$SRC_DIR/tbc" rev
+  mkdir -p "$SRC_DIR"
+  [[ -d $d/.git ]] || git clone -q "$TBC_REPO" "$d" || die "Could not clone $TBC_REPO"
+  git -C "$d" fetch -q origin "$TBC_COMMIT" 2>/dev/null || git -C "$d" fetch -q origin || true
+  git -C "$d" checkout -q "$TBC_COMMIT" || die "Pinned commit $TBC_COMMIT not found"
+  rev=$(git -C "$d" rev-parse HEAD)
+  [[ $rev == "$TBC_COMMIT" ]] || die "Checked-out commit $rev does not match the pin"
+  ( cd "$d" && go build -o "$SRC_DIR/tbc-bin" ./cmd/tbc ) || die "go build failed (needs Go 1.24 or newer)"
+  ok "Terabox CLI built at ${TBC_COMMIT:0:12}: $SRC_DIR/tbc-bin"
+  info "Save your ndus cookie to a private file, then: TERABOX_COOKIE_FILE=FILE $0 backup"
+}
+
+terabox_cmd() {
+  local bin=${TBC_BIN:-$SRC_DIR/tbc-bin}
+  [[ -x $bin ]] || return 1
+  if [[ -n $TERABOX_COOKIE_FILE ]]; then
+    [[ -s $TERABOX_COOKIE_FILE ]] || return 1
+    chmod 600 "$TERABOX_COOKIE_FILE" 2>/dev/null || true
+    printf '%q -c %q put -d %q' "$bin" "$TERABOX_COOKIE_FILE" "$TERABOX_DIR"
+  elif [[ -n ${TERABOX_COOKIE:-} ]]; then
+    printf '%q put -d %q' "$bin" "$TERABOX_DIR"
+  else
+    return 1
+  fi
+}
+
 # Optional offsite copy. The archive holds the attestation GPG key and CA key, so it
 # is encrypted first and nothing is uploaded without a passphrase file. A failure here
 # only warns: the verified local backup already exists.
 backup_upload() {
-  [[ -n $BACKUP_UPLOAD_CMD ]] || return 0
-  local f=$1 enc="$1.gpg"
+  local f=$1 enc="$1.gpg" cmd=$BACKUP_UPLOAD_CMD
+  [[ -n $cmd ]] || cmd=$(terabox_cmd || true)
+  [[ -n $cmd ]] || return 0
   if [[ -z $BACKUP_GPG_PASSFILE || ! -s $BACKUP_GPG_PASSFILE ]]; then
-    warn "BACKUP_UPLOAD_CMD is set but BACKUP_GPG_PASSFILE is missing or empty. Not uploading an unencrypted archive."
+    warn "Offsite upload is configured but BACKUP_GPG_PASSFILE is missing or empty. Not uploading an unencrypted archive."
     return 0
   fi
   need gpg
@@ -2012,8 +2048,8 @@ backup_upload() {
          --symmetric --cipher-algo AES256 --output "$enc" "$f" ) >/dev/null 2>&1; then
     rm -f "$enc"; warn "Encryption failed. Offsite upload skipped."; return 0
   fi
-  info "Uploading $(basename "$enc") with: $BACKUP_UPLOAD_CMD"
-  if bash -c "$BACKUP_UPLOAD_CMD \"\$1\"" _ "$enc"; then ok "Offsite upload done"; else warn "Offsite upload failed. Local backup is intact: $f"; fi
+  info "Uploading $(basename "$enc") offsite"
+  if bash -c "$cmd \"\$1\"" _ "$enc"; then ok "Offsite upload done"; else warn "Offsite upload failed. Local backup is intact: $f"; fi
   rm -f "$enc"
 }
 
@@ -2470,6 +2506,7 @@ COMMANDS
   attest                Write a signed attestation report (also served to clients)
   verify-attest [FILE]  Check a report's signature and re-hash every listed file
   backup                Archive the working folder (SHA-256 sidecar) into $BACKUP_DIR
+  terabox-install       Build the unofficial Terabox CLI (fcr--/tbc, pinned) for offsite backups
   backup-list           List backups, newest first
   restore ARCHIVE       Verify a backup, save the current state, then restore it
   serve                 Backs up the working folder, integrity gate, then HTTP + dnsmasq (DHCP/TFTP) as root
@@ -2526,6 +2563,8 @@ ENVIRONMENT VARIABLES
   BACKUP_DL             1: include downloads/ (ISOs) in backups   (default: 0)
   BACKUP_UPLOAD_CMD     Offsite hook, run as: CMD FILE.gpg after each backup
   BACKUP_GPG_PASSFILE   Passphrase file; the archive is AES256-encrypted before upload
+  TERABOX_COOKIE_FILE   File with your Terabox ndus cookie (or export TERABOX_COOKIE)
+  TERABOX_DIR           Remote Terabox folder                     (default: /netboot-backups)
   UPSTREAM_REPO         Repo for verify-upstream    (default: $DEFAULT_UPSTREAM_REPO)
   UPSTREAM_BRANCH       Branch for verify-upstream                (default: main)
   EXPECT_CODE           Release code you recorded; verify-upstream must match it
@@ -2605,6 +2644,7 @@ case "$COMMAND" in
   verify-attest)  verify_attest "${POSITIONAL[0]:-}" ;;
   backup)         backup_create manual ;;
   backup-list)    backup_list ;;
+  terabox-install) terabox_install ;;
   restore)        restore "${POSITIONAL[0]:-}" ;;
   serve)          serve ;;
   logs)           logs ;;
