@@ -56,6 +56,84 @@ Every step is checked. The script has trust issues, and they are healthy ones.
 
 ---
 
+## Backups of the working folder
+
+`serve` and `clean` first write a restorable archive of `~/netboot` (keys, attestation, pins, state, TFTP files, configs) to `~/netboot-backups`, with a SHA-256 sidecar. Extracted `http/`, `src/`, and `run/` are skipped because they rebuild. `downloads/` (the ISOs) is skipped unless `BACKUP_DL=1`. The newest 5 are kept (`BACKUP_KEEP`). If the backup fails, the command stops. `AUTO_BACKUP=0` turns this off.
+
+```sh
+./netboot-android.sh backup            # take one now
+./netboot-android.sh backup-list       # newest first
+./netboot-android.sh restore FILE      # verify checksum, save current state, restore
+```
+
+**Offsite copy to Terabox.** Terabox has no official API, so this uses the unofficial open-source CLI [fcr--/tbc](https://github.com/fcr--/tbc) (MIT, Go), pinned to one commit. It contacts only `www.terabox.com` and logs in with your `ndus` cookie, so treat that cookie like a password and keep it in a `chmod 600` file. Unofficial tools can break when Terabox changes its site.
+
+```sh
+./netboot-android.sh terabox-install                      # needs git and Go 1.24+
+export TERABOX_COOKIE_FILE=~/.terabox-cookie              # contains: ndus=...
+export BACKUP_GPG_PASSFILE=~/.nb-pass                     # archive passphrase
+./netboot-android.sh serve                                # backs up, encrypts, uploads to /netboot-backups
+```
+
+The archive holds your signing keys, so it is AES256-encrypted first and never uploaded without the passphrase file. A failed upload only warns; the local backup stays. To restore from Terabox, fetch the `.gpg` file with `tbc get`, decrypt it with `gpg -d FILE.gpg > FILE`, and then run `restore FILE` after putting the matching `.sha256` next to it (or unpack it with `tar -xzf`). For any other uploader, set `BACKUP_UPLOAD_CMD` instead.
+
+**Offsite copy to Google One storage.** Google One storage is your Google Drive space, and rclone has an official Drive backend. Install rclone (`pkg install rclone` in Termux), run `rclone config` once and create a remote of type `drive` (pick the `drive.file` scope so it only sees files it creates), then:
+
+```sh
+export GDRIVE_REMOTE=gdrive:netboot-backups
+export BACKUP_GPG_PASSFILE=~/.nb-pass
+./netboot-android.sh serve        # backs up, encrypts, uploads
+```
+
+Terabox, Google Drive, and `BACKUP_UPLOAD_CMD` can all be on at once; each gets the same encrypted file. To restore, `rclone copy gdrive:netboot-backups/FILE.gpg .`, then `gpg -d`, as above. On a phone with no browser for rclone's login, run `rclone authorize drive` on another machine and paste the token.
+
+This is a file-level archive, not a Clonezilla or Shadow Copy block image. To image the whole phone or disk, do that separately. Editing the script changes its hash, so run `self-sign` again after pulling this change.
+
+---
+
+## Easiest way: let it hold your hand
+
+```sh
+./netboot-android.sh
+```
+
+Choose **1, GUIDED SETUP**. It goes one small step at a time, says in plain words what each step does, and asks before it does anything. Press Enter to accept the suggested answer, type `q` to stop safely at any question. Steps you already finished are noticed and offered as "do it again?" with the answer No. If a step fails, you get retry, skip, or quit instead of a crash. The guide also covers the optional Google One and Terabox cloud backups. Run just that part with `./netboot-android.sh backup-setup`, or the guide alone with `./netboot-android.sh guide`.
+
+---
+
+## Daily use and emergencies
+
+Once set up, you only need three commands:
+
+```sh
+./netboot-android.sh go        # fix small problems, then start serving with your last settings
+./netboot-android.sh status    # one screen: what is ready, what needs attention, and the fix for each
+./netboot-android.sh heal      # repair leftovers from a crash, power loss, or an address change
+```
+
+**Emergency card.** Phone in hand, PC needs rescuing:
+
+1. Connect the phone to the same Wi-Fi (or cable it to the PC).
+2. Run `./netboot-android.sh go`. It needs no internet.
+3. Boot the PC from the network. Press Ctrl+C when done.
+
+What it does for you while it runs:
+
+- **Never half-writes.** Downloads, extractions, manifests, and your settings are written to a temporary name and renamed only when complete. If it is killed mid-way, the old files are still good and `heal` removes the leftovers.
+- **Undoes its own changes.** The IP address, routing rules, and Wi-Fi power mode it changes are recorded first. If the script dies, the next run puts them back.
+- **One at a time.** A lock stops two runs from corrupting each other. A lock left by a dead run clears itself.
+- **Starts in seconds.** Small boot files are always fully re-hashed. The multi-GB root image is checked by a signed fingerprint, then fully re-hashed in the background at low priority while it serves. If it ever changed, the servers stop with a red message. `./netboot-android.sh verify deep` (or `DEEP_VERIFY=1`) checks everything first instead.
+- **Watches itself.** A crashed HTTP server or dnsmasq is restarted (up to 5 times in 5 minutes, then it stops and tells you). If the phone's Wi-Fi address changes, it re-signs the boot files and carries on.
+- **Resumable file server.** Clients can resume downloads (HTTP Range), the server caps simultaneous connections, and it blocks path tricks.
+- **Plain errors.** Failures say what went wrong and the next command to run. Details go to `~/netboot/state/netboot.log`.
+- **Stays alive on Android.** On a rooted phone the servers are marked as important to the low-memory killer; keep Termux on unrestricted battery.
+
+Honest limits: the fast check trusts a file's size, time, and inode for a few minutes until the background check finishes, so someone with root who forges those could briefly serve a changed root image (the kernel and initrd are signed and always fully checked). The root image is unsigned on the client for most distros; see the header of the script. Android features (root, `oom_score_adj`, Wi-Fi power mode) can only be proven on a real phone.
+
+Tests: `tests/run.sh` runs 21 fault-injection checks (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
+
+---
+
 ## How to run it
 
 The first time, do these in this order. The order matters. Do not do them in alphabetical order. Someone did once. We don't talk about it.

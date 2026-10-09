@@ -44,7 +44,7 @@
 set -euo pipefail
 umask 022
 
-SCRIPT_VERSION="2026.10.08-final"
+SCRIPT_VERSION="2026.10.09-resilient"
 RELEASE_TIME=""   # upload time (UTC epoch) set by release-stamp; must equal the upstream commit time
 
 # =============================================================================
@@ -103,6 +103,8 @@ UPSTREAM_PATH="netboot-android.sh"
 # =============================================================================
 # Settings (environment overrides)
 # =============================================================================
+declare -A PRE_ENV=( [DISTRO]="${DISTRO:-}" [TARGET_ARCH]="${TARGET_ARCH:-}" [DHCP_MODE]="${DHCP_MODE:-}" [IFACE]="${IFACE:-}" [HTTP_PORT]="${HTTP_PORT:-}" )
+CLI_SET=""
 IFACE="${IFACE:-}"
 HTTP_PORT="${HTTP_PORT:-8000}"
 DISTRO="${DISTRO:-ubuntu}"
@@ -110,7 +112,7 @@ TARGET_ARCH="${TARGET_ARCH:-x86_64}"
 DHCP_MODE="${DHCP_MODE:-auto}"            # auto | proxy | direct
 DIRECT_CIDR="${DIRECT_CIDR:-10.42.0.1/24}"
 VERIFIED_BOOT="${VERIFIED_BOOT:-1}"
-DEEP_VERIFY="${DEEP_VERIFY:-1}"
+DEEP_VERIFY="${DEEP_VERIFY:-auto}"
 INCLUDE_UCODE="${INCLUDE_UCODE:-1}"
 IPXE_COMMIT="${IPXE_COMMIT:-$DEFAULT_IPXE_COMMIT}"
 IPXE_CROSS="${IPXE_CROSS:-}"
@@ -124,6 +126,37 @@ CT_BOOTSTRAP="${CT_BOOTSTRAP:-0}"
 UPSTREAM_REPO="${UPSTREAM_REPO:-$DEFAULT_UPSTREAM_REPO}"
 UPSTREAM_BRANCH="${UPSTREAM_BRANCH:-main}"
 EXPECT_CODE="${EXPECT_CODE:-}"
+# Settings saved by the guided offsite-backup setup. Read as plain NAME='value' lines
+# (never executed); a variable already set in the environment wins.
+load_saved_settings() {
+  local f="$STATE/backup.conf" line name val
+  [[ -r $f ]] || return 0
+  while IFS= read -r line; do
+    name=${line%%=*}; val=${line#*=}
+    case "$name" in
+      AUTO_BACKUP|BACKUP_DIR|BACKUP_KEEP|BACKUP_DL|BACKUP_GPG_PASSFILE|TERABOX_COOKIE_FILE|TERABOX_DIR|GDRIVE_REMOTE) ;;
+      *) continue ;;
+    esac
+    [[ $val == \'*\' ]] || continue
+    val=${val:1:${#val}-2}
+    [[ $val != *\'* ]] || continue
+    [[ -n ${!name:-} ]] || printf -v "$name" '%s' "$val"
+  done < "$f"
+}
+load_saved_settings
+
+AUTO_BACKUP="${AUTO_BACKUP:-1}"           # 1: back up the working folder before serve and clean
+BACKUP_DIR="${BACKUP_DIR:-$HOME/netboot-backups}"
+BACKUP_KEEP="${BACKUP_KEEP:-5}"           # newest archives kept after each backup
+BACKUP_DL="${BACKUP_DL:-0}"               # 1: include downloads/ (ISOs, large)
+BACKUP_UPLOAD_CMD="${BACKUP_UPLOAD_CMD:-}" # offsite hook, run as: CMD FILE.gpg (for example a Terabox uploader)
+BACKUP_GPG_PASSFILE="${BACKUP_GPG_PASSFILE:-}" # passphrase file; required to encrypt before upload
+TERABOX_COOKIE_FILE="${TERABOX_COOKIE_FILE:-}" # file holding the Terabox ndus cookie (or set TERABOX_COOKIE)
+TERABOX_DIR="${TERABOX_DIR:-/netboot-backups}" # remote folder on Terabox
+TBC_REPO="${TBC_REPO:-https://github.com/fcr--/tbc.git}"   # unofficial Terabox CLI (MIT, Go)
+TBC_COMMIT="${TBC_COMMIT:-4f1fb75d0defd5edfda9ae819873503af565055c}"
+TBC_BIN="${TBC_BIN:-}"
+GDRIVE_REMOTE="${GDRIVE_REMOTE:-}"        # rclone Drive remote and folder for Google One storage, e.g. gdrive:netboot-backups
 
 # User overrides, captured before presets so they always win
 U_ISO_URL="${ISO_URL:-}"
@@ -136,9 +169,13 @@ U_MIN_FREE_MB="${MIN_FREE_MB:-}"
 
 # Runtime state
 SERVE_HTTP_PID=""
+DNS_LOG=""
 DIRECT_ADDED=0
+JID_DIRECT=""
+JID_POWER=""
 POWER_TWEAKED=0
 COMMAND=""
+DRY_RUN=0
 POSITIONAL=()
 SIG_SIGNER=""
 GIT_PIN_OPTS=()
@@ -149,15 +186,151 @@ GIT_PIN_OPTS=()
 if [[ -t 1 ]]; then
   C_RED=$'\033[0;31m'; C_GREEN=$'\033[0;32m'; C_YELLOW=$'\033[0;33m'
   C_CYAN=$'\033[0;36m'; C_BOLD=$'\033[1m'; C_RESET=$'\033[0m'
+  C_DIM=$'\033[2m'; C_BLUE=$'\033[1;34m'
 else
-  C_RED=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_BOLD=""; C_RESET=""
+  C_RED=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_BOLD=""; C_RESET=""; C_DIM=""; C_BLUE=""
 fi
 
 info() { printf '%s[*]%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
 ok()   { printf '%s[+]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
-warn() { printf '%s[!]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
-err()  { printf '%s[-]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
-die()  { err "$*"; exit 1; }
+warn() { printf '%s[!]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; log_event WARN "$*"; }
+err()  { printf '%s[-]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; log_event ERROR "$*"; }
+# Exit-code classes. Plain `die "msg"` still works (code 1).
+E_USAGE=2; E_ENV=10; E_NET=20; E_INTEGRITY=30; E_DISK=40; E_BUSY=50
+LOG_FILE="$STATE/netboot.log"
+BIG_BYTES=536870912   # files at or above this are "big" (rootfs, ISO)
+
+log_event() {   # LEVEL message...  (never fails, never creates the state dir)
+  [[ -d $STATE && ${LOG_QUIET:-0} != 1 ]] || return 0
+  local lvl=$1; shift
+  printf '%s %-5s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$lvl" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+log_rotate() {  # keep 3 files of up to 1 MB
+  [[ -f $LOG_FILE ]] || return 0
+  local sz; sz=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
+  (( sz > 1048576 )) || return 0
+  mv -f "$LOG_FILE.2" "$LOG_FILE.3" 2>/dev/null || true
+  mv -f "$LOG_FILE.1" "$LOG_FILE.2" 2>/dev/null || true
+  mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true
+}
+
+next_step() { printf '%s    Next step: %s%s\n' "$C_BOLD" "$*" "$C_RESET" >&2; }
+
+die() {
+  local code=1
+  if [[ ${1:-} =~ ^[0-9]+$ ]]; then code=$1; shift; fi
+  err "$*"
+  log_event ERROR "exit code=$code"
+  case $code in
+    "$E_ENV")       next_step "run '$0 doctor' to see what this device is missing." ;;
+    "$E_NET")       next_step "check Wi-Fi/internet and run the same command again (downloads resume)." ;;
+    "$E_INTEGRITY") next_step "do NOT serve. Run '$0 heal' to re-check and rebuild what is bad." ;;
+    "$E_DISK")      next_step "free space (see '$0 status') or point NETBOOT_HOME at a larger internal drive." ;;
+    "$E_BUSY")      next_step "wait for the other run to finish, or run '$0 status'." ;;
+  esac
+  exit "$code"
+}
+
+on_err() {   # ERR trap: only fires where set -e would exit, so it adds the "where"
+  local rc=$1 line=$2 cmd=$3
+  log_event ERROR "unexpected rc=$rc fn=${FUNCNAME[1]:-main} line=$line cmd=$cmd"
+  err "Unexpected failure (exit $rc) in ${FUNCNAME[1]:-main}, line $line: $cmd"
+  err "Details: $LOG_FILE   |   Try: $0 doctor"
+}
+set -E
+trap 'on_err $? $LINENO "$BASH_COMMAND"' ERR
+
+# ---- lock: one mutating command at a time; stale locks (dead owner) clear themselves
+LOCK_DIR="$STATE/lock.d"
+LOCK_HELD=""
+proc_start() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'; }
+lock_owner_alive() {
+  local pid st
+  read -r pid st < "$LOCK_DIR/owner" 2>/dev/null || return 1
+  [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null && [[ $(proc_start "$pid") == "$st" ]]
+}
+acquire_lock() {
+  [[ $LOCK_HELD == "$BASHPID" ]] && return 0
+  mkdir -p "$STATE"
+  local tries=0 age
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    if [[ -f $LOCK_DIR/owner ]]; then
+      if ! lock_owner_alive; then warn "Clearing a stale lock left by a run that died."; rm -rf "$LOCK_DIR"; continue; fi
+    else
+      age=$(( $(date +%s) - $(stat -c %Y "$LOCK_DIR" 2>/dev/null || date +%s) ))
+      if (( age > 10 )); then rm -rf "$LOCK_DIR"; continue; fi
+    fi
+    if (( ++tries > 3 )); then
+      die "$E_BUSY" "Another netboot-android command is running (pid $(cut -d' ' -f1 "$LOCK_DIR/owner" 2>/dev/null || echo '?'))."
+    fi
+    sleep 1
+  done
+  printf '%s %s\n' "$BASHPID" "$(proc_start "$BASHPID")" > "$LOCK_DIR/owner"
+  LOCK_HELD=$BASHPID
+  trap release_lock EXIT
+}
+release_lock() {
+  if [[ $LOCK_HELD == "${BASHPID:-x}" ]]; then rm -rf "$LOCK_DIR"; fi
+  LOCK_HELD=""
+}
+with_lock() { acquire_lock; local rc=0; "$@" || rc=$?; release_lock; return "$rc"; }
+
+# ---- refuse to operate on dangerous locations (we rm -rf and chown -R under ROOT)
+guard_root() {
+  local r=${ROOT%/}
+  [[ $r == /* && ${#r} -ge 6 ]] || die "$E_USAGE" "Refusing NETBOOT_HOME='$ROOT' (must be an absolute path, not near /)."
+  case "$r" in
+    "$HOME"|/home|/root|/usr|/etc|/bin|/sbin|/var|/data|/system|/sdcard|/storage|/storage/emulated/0)
+      die "$E_USAGE" "Refusing NETBOOT_HOME='$ROOT': that is a system or home folder. Use a dedicated folder such as $HOME/netboot." ;;
+  esac
+  if [[ -e $r && ! -O $r && $(id -u) -ne 0 ]]; then
+    die "$E_ENV" "$ROOT is owned by another user. Fix with: sudo chown -R $(id -u) '$ROOT'"
+  fi
+}
+
+# ---- atomic writes: readers see the old file or the new one, never half of it
+sync_file() { sync "$1" 2>/dev/null || true; }
+atomic_write() {   # atomic_write FILE   (content on stdin)
+  local f=$1 tmp
+  tmp=$(mktemp "$f.XXXXXX") || return 1
+  if cat > "$tmp"; then
+    chmod 644 "$tmp"; sync_file "$tmp"; mv -f "$tmp" "$f"
+  else
+    rm -f "$tmp"; return 1
+  fi
+}
+atomic_dir_swap() {   # atomic_dir_swap NEW TARGET: TARGET is replaced by NEW; old copy removed last
+  local new=$1 target=$2 old="$2.old.$$"
+  if [[ -e $target ]]; then
+    mv -T "$target" "$old" && mv -T "$new" "$target" || { [[ -e $target ]] || mv -T "$old" "$target"; return 1; }
+    rm -rf "$old"
+  else
+    mv -T "$new" "$target"
+  fi
+}
+
+# ---- undo journal: every change outside ROOT is recorded first, so a crash can be undone
+JOURNAL="$STATE/undo.d"
+journal_push() {   # journal_push "root command that undoes the change" -> prints entry id
+  mkdir -p "$JOURNAL"
+  local id; id="$(date +%s%N)-$$-$RANDOM"
+  printf '%s\n' "$1" > "$JOURNAL/$id"
+  printf '%s' "$id"
+}
+journal_drop() { rm -f "$JOURNAL/$1" 2>/dev/null || true; }
+journal_count() { local f n=0; for f in "$JOURNAL"/*; do [[ -e $f ]] && n=$((n+1)); done; echo "$n"; }
+journal_replay() {   # newest first; entries that succeed are removed
+  local f cmd n=0
+  [[ -d $JOURNAL ]] || return 0
+  while IFS= read -r f; do
+    cmd=$(cat "$f" 2>/dev/null) || continue
+    if run_root "$cmd" >/dev/null 2>&1; then rm -f "$f"; n=$((n+1)); else warn "Could not undo: $cmd"; fi
+  done < <(ls -1r "$JOURNAL"/* 2>/dev/null || true)
+  (( n == 0 )) || { ok "Undid $n leftover system change(s) from an earlier run"; log_event INFO "journal replayed $n"; }
+  return 0
+}
+
 
 banner() {
   printf '%s  netboot-android %s  -  verified PXE live boot%s\n\n' "$C_BOLD" "$SCRIPT_VERSION" "$C_RESET"
@@ -175,10 +348,16 @@ box() {
 # =============================================================================
 # Small helpers
 # =============================================================================
-need()       { command -v "$1" >/dev/null 2>&1 || die "Missing '$1'. Run: $0 deps"; }
+need()       { command -v "$1" >/dev/null 2>&1 || die "$E_ENV" "Missing '$1'. Run: $0 deps"; }
 today()      { date -u +%F; }
 now_iso()    { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
-sha256_of()  { sha256sum "$1" | awk '{print $1}'; }
+sha256_of()  {
+  if [[ -n ${PYTHON:-} && -f ${LIB:-/nonexistent}/hashfile.py ]] && (( $(file_size "$1") >= 67108864 )); then
+    "$PYTHON" "$LIB/hashfile.py" "$1" sha256 | awk '{print $2}'
+  else
+    sha256sum "$1" | awk '{print $1}'
+  fi
+}
 sha512_of()  { sha512sum "$1" | awk '{print $1}'; }
 file_size()  { stat -c %s "$1" 2>/dev/null || wc -c <"$1" | tr -d ' '; }
 file_mtime() { stat -c %Y "$1" 2>/dev/null || echo 0; }
@@ -199,7 +378,7 @@ run_root() {
   elif command -v sudo >/dev/null 2>&1; then
     sudo bash -c "$cmd"
   else
-    die "Root is required for: $cmd"
+    die "$E_ENV" "Root is required for: $cmd"
   fi
 }
 
@@ -497,31 +676,219 @@ for key, (until, issuer) in sorted(pins.items(), key=lambda kv: kv[1][0], revers
 PYEOF
 
   cat > "$LIB/httpd.py" <<'PYEOF'
+import logging
+import logging.handlers
+import mimetypes
+import os
+import re
+import signal
+import socket
+import stat
 import sys
-from functools import partial
-from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote, urlsplit
 
-class Handler(SimpleHTTPRequestHandler):
-    def list_directory(self, path):
-        self.send_error(403, "Directory listing disabled")
-        return None
+bind, port, root = sys.argv[1], int(sys.argv[2]), os.path.realpath(sys.argv[3])
+allow = {os.path.realpath(p) for p in os.environ.get("HTTPD_ALLOW", "").split(os.pathsep) if p}
+max_conn = int(os.environ.get("HTTPD_MAX_CONN", "16"))
+log_path = os.environ.get("HTTPD_LOG")
+
+log = logging.getLogger("httpd")
+log.setLevel(logging.INFO)
+handler = (logging.handlers.RotatingFileHandler(log_path, maxBytes=1 << 20, backupCount=3)
+           if log_path else logging.StreamHandler(sys.stderr))
+handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%dT%H:%M:%S"))
+log.addHandler(handler)
+
+slots = threading.BoundedSemaphore(max_conn)
+stats_lock = threading.Lock()
+stats = {"requests": 0, "bytes": 0}
+RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "netboot-android"
+    timeout = 60
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("%s - [%s] %s\n" % (self.client_address[0],
-                         self.log_date_time_string(), fmt % args))
-        sys.stderr.flush()
+        pass
 
-bind, port, directory = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-ThreadingHTTPServer.daemon_threads = True
-ThreadingHTTPServer.allow_reuse_address = True
-server = ThreadingHTTPServer((bind, port), partial(Handler, directory=directory))
+    def _finish(self, status, sent, started):
+        log.info("%s %s %s %d %d %.2fs", self.client_address[0], self.command,
+                 self.path, status, sent, time.time() - started)
+        with stats_lock:
+            stats["requests"] += 1
+            stats["bytes"] += sent
+
+    def _simple(self, code, text, extra=None):
+        body = (text + "\n").encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        for key, value in (extra or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+        self.close_connection = True
+        return code
+
+    def _resolve(self):
+        path = unquote(urlsplit(self.path).path)
+        if "\x00" in path:
+            return None
+        fs = os.path.realpath(os.path.join(root, path.lstrip("/")))
+        if fs == root or fs.startswith(root + os.sep) or fs in allow:
+            return fs
+        return None
+
+    def _serve(self):
+        started = time.time()
+        if urlsplit(self.path).path == "/healthz":
+            with stats_lock:
+                text = "ok requests=%d bytes=%d" % (stats["requests"], stats["bytes"])
+            self._simple(200, text)
+            return
+        if not slots.acquire(blocking=False):
+            self._finish(self._simple(503, "busy, retry shortly", {"Retry-After": "2"}), 0, started)
+            return
+        try:
+            fs = self._resolve()
+            if fs is None:
+                self._finish(self._simple(403, "forbidden"), 0, started)
+                return
+            try:
+                f = open(fs, "rb")
+                st = os.fstat(f.fileno())
+            except OSError:
+                self._finish(self._simple(404, "not found"), 0, started)
+                return
+            with f:
+                if not stat.S_ISREG(st.st_mode):
+                    self._finish(self._simple(404, "not found"), 0, started)
+                    return
+                size = st.st_size
+                start, end, status = 0, size - 1, 200
+                match = RANGE_RE.match(self.headers.get("Range", "").strip())
+                if match and (match.group(1) or match.group(2)):
+                    first, last = match.groups()
+                    if first == "":
+                        count = int(last)
+                        start = max(size - count, 0)
+                        end = size - 1
+                        bad = count == 0
+                    else:
+                        start = int(first)
+                        end = min(int(last), size - 1) if last else size - 1
+                        bad = start >= size or start > end
+                    if bad:
+                        self._finish(self._simple(416, "range not satisfiable",
+                                                  {"Content-Range": "bytes */%d" % size}), 0, started)
+                        return
+                    status = 206
+                length = max(end - start + 1, 0)
+                ctype = "text/plain" if fs.endswith(".ipxe") else (
+                    mimetypes.guess_type(fs)[0] or "application/octet-stream")
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(length))
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Last-Modified", self.date_time_string(st.st_mtime))
+                if status == 206:
+                    self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                sent = 0
+                if self.command != "HEAD" and length > 0:
+                    try:
+                        sent = self.connection.sendfile(f, start, length)
+                    except (OSError, socket.timeout):
+                        sent = 0
+                self.close_connection = True
+                self._finish(status, sent, started)
+        finally:
+            slots.release()
+
+    do_GET = _serve
+    do_HEAD = _serve
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 64
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, socket.timeout)):
+            return
+        log.exception("error handling %s", client_address)
+
+
+server = Server((bind, port), Handler)
+
+
+def stop(*_):
+    threading.Thread(target=server.shutdown, daemon=True).start()
+
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+log.info("listening on %s:%d root=%s max_conn=%d", bind, port, root, max_conn)
 server.serve_forever()
 PYEOF
 
   cat > "$LIB/findbytes.py" <<'PYEOF'
-import sys
-data = open(sys.argv[1], "rb").read()
-sys.exit(0 if bytes.fromhex(sys.argv[2]) in data else 1)
+import mmap, sys
+needle = bytes.fromhex(sys.argv[2])
+with open(sys.argv[1], "rb") as f:
+    try:
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+            sys.exit(0 if m.find(needle) >= 0 else 1)
+    except ValueError:      # empty file
+        sys.exit(1)
+PYEOF
+
+  # One pass over a big file: several digests at once, without evicting the page cache.
+  cat > "$LIB/hashfile.py" <<'PYEOF'
+import hashlib, os, sys
+
+path = sys.argv[1]
+names = sys.argv[2].split(",") if len(sys.argv) > 2 else ["sha256"]
+digests = [hashlib.new(n) for n in names]
+CHUNK = 4 << 20
+DROP_EVERY = 256 << 20
+buf = bytearray(CHUNK)
+view = memoryview(buf)
+fd = os.open(path, os.O_RDONLY)
+try:
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_SEQUENTIAL)
+    except (AttributeError, OSError):
+        pass
+    done = dropped = 0
+    while True:
+        n = os.readv(fd, [view])
+        if n == 0:
+            break
+        part = view[:n]
+        for d in digests:
+            d.update(part)
+        done += n
+        if done - dropped >= DROP_EVERY:
+            try:
+                os.posix_fadvise(fd, dropped, done - dropped, os.POSIX_FADV_DONTNEED)
+            except (AttributeError, OSError):
+                pass
+            dropped = done
+finally:
+    os.close(fd)
+for name, d in zip(names, digests):
+    print(name, d.hexdigest())
 PYEOF
 }
 
@@ -1029,29 +1396,35 @@ self_sign() {
   info "Compare this hash with a copy of the script kept on another device."
 }
 
-self_check() {
-  if [[ ! -s $ATTEST/script.sha256 || ! -s $ATTEST/script.sha256.asc ]]; then
-    warn "Self-attestation is not set up. Run: $0 attest-init, then $0 self-sign"
-    return 0
-  fi
-  local st cur rec
+self_status() {   # prints: unset | bad | changed | ok   (never dies)
+  if [[ ! -s $ATTEST/script.sha256 || ! -s $ATTEST/script.sha256.asc ]]; then echo unset; return 0; fi
+  local st rec cur
   st=$(mktemp)
   gpg --homedir "$ATTEST_GNUPG" --batch --no-tty --status-file "$st" \
       --verify "$ATTEST/script.sha256.asc" "$ATTEST/script.sha256" >/dev/null 2>&1 || true
   if ! awk -v f="$(attest_fpr)" '$2=="VALIDSIG" && $NF==f {found=1} END{exit !found}' "$st"; then
-    rm -f "$st"
-    die "The signed script hash record failed verification. The attestation files may have been altered."
+    rm -f "$st"; echo bad; return 0
   fi
   rm -f "$st"
-  cur=$(sha256_of "$SELF")
-  rec=$(awk '{print $1}' "$ATTEST/script.sha256")
-  if [[ $cur != "$rec" ]]; then
-    if [[ $ACCEPT_SCRIPT_CHANGE == 1 ]]; then
-      warn "Script changed since it was signed (ACCEPT_SCRIPT_CHANGE=1). Run $0 self-sign to record the new version."
-    else
-      die "This script changed since it was self-signed (now $cur). If you edited it yourself, run: $0 self-sign"
-    fi
-  fi
+  cur=$(sha256_of "$SELF"); rec=$(awk '{print $1}' "$ATTEST/script.sha256")
+  if [[ $cur != "$rec" ]]; then echo changed; else echo ok; fi
+}
+
+self_check() {
+  case "$(self_status)" in
+    unset)
+      warn "Self-attestation is not set up. Run: $0 attest-init, then $0 self-sign" ;;
+    bad)
+      die "$E_INTEGRITY" "The signed script hash record failed verification. The attestation files may have been altered." ;;
+    changed)
+      if [[ $ACCEPT_SCRIPT_CHANGE == 1 ]]; then
+        warn "Script changed since it was signed (ACCEPT_SCRIPT_CHANGE=1). Run $0 self-sign to record the new version."
+      else
+        err "This script changed since it was last self-signed."
+        next_step "if YOU updated or edited it: run '$0 self-sign', then run your command again. If you did not, stop and compare '$0 fingerprints' with another device."
+        exit "$E_INTEGRITY"
+      fi ;;
+  esac
 }
 
 show_fingerprints() {
@@ -1426,8 +1799,8 @@ import_ipxe() {
 # =============================================================================
 iso_is_verified() {
   [[ -s $ISO && -s $ISO_VERIFIED ]] || return 1
-  local sha size mtime
-  read -r sha size mtime < "$ISO_VERIFIED" || return 1
+  local size mtime
+  read -r _ size mtime < "$ISO_VERIFIED" || return 1
   [[ $size == "$(file_size "$ISO")" && $mtime == "$(file_mtime "$ISO")" ]]
 }
 
@@ -1462,10 +1835,16 @@ verify_download() {
     iso_sig=1
   fi
 
-  info "Hashing the ISO"
-  sha256=$(sha256_of "$file")
+  info "Hashing the ISO (one pass)"
+  write_libs
+  if [[ -n $PYTHON && $SUMS_ALGO == sha512 ]]; then
+    local both; both=$("$PYTHON" "$LIB/hashfile.py" "$file" sha256,sha512)
+    sha256=$(awk '$1=="sha256"{print $2}' <<<"$both"); algohash=$(awk '$1=="sha512"{print $2}' <<<"$both")
+  else
+    sha256=$(sha256_of "$file"); algohash=$sha256
+    [[ -z $list || $SUMS_ALGO == sha256 ]] || algohash=$(sha512_of "$file")
+  fi
   if [[ -n $list ]]; then
-    if [[ $SUMS_ALGO == sha256 ]]; then algohash=$sha256; else algohash=$(sha512_of "$file"); fi
     expect=$(sums_lookup "$list" "$orig" "$SUMS_ALGO")
     if [[ -z $expect ]]; then
       err "$orig is not listed in the checksum file. The vendor may have published a newer release; set ISO_URL."
@@ -1500,21 +1879,42 @@ fetch() {
     die "No checksum or signature source for $DISTRO. Set SUMS_URL or ISO_SIG_URL, or ALLOW_UNVERIFIED=1."
   fi
 
-  local target code rc
+  local target code rc attempt=0 resumed=0 remote have need_mb avail_mb
   if [[ -s $ISO ]]; then
     target=$ISO
     info "ISO present but not verified. Verifying now."
   else
     target="$ISO.part"
-    info "Downloading $ISO_NAME (about ${P_ISO_MB} MB). Resumable: re-run to continue."
-    rc=0
-    code=$(curl -L --proto-redir '=https' -C - --retry 5 --retry-delay 5 --connect-timeout 30 \
-                -# -o "$ISO.part" -w '%{http_code}' "$ISO_URL") || rc=$?
-    if [[ $code == 416 ]]; then
-      info "Download was already complete"
-    elif (( rc != 0 )); then
-      die "Download interrupted (curl error $rc). Re-run fetch to resume."
+    [[ -s $ISO.part ]] && resumed=1
+    remote=$(curl -sIL --proto-redir '=https' --connect-timeout 20 "$ISO_URL" 2>/dev/null \
+             | awk 'tolower($1)=="content-length:" {gsub("\r","",$2); n=$2} END{print n+0}' || echo 0)
+    have=$(file_size "$ISO.part" 2>/dev/null || echo 0)
+    if (( remote > 0 )); then
+      need_mb=$(( (remote - have) / 1048576 + 1 )); avail_mb=$(df -Pm "$DL" | awk 'NR==2{print $4}')
+      if (( avail_mb < need_mb + 256 )); then
+        die "$E_DISK" "Not enough space for the download: need about $need_mb MB more, only $avail_mb MB free."
+      fi
     fi
+    info "Downloading $ISO_NAME (about ${P_ISO_MB} MB). Resumable: re-run to continue."
+    while :; do
+      rc=0
+      code=$(curl -L --proto-redir '=https' -C - --retry 5 --retry-delay 5 --connect-timeout 30 \
+                  --speed-limit 10240 --speed-time 60 \
+                  -# -o "$ISO.part" -w '%{http_code}' "$ISO_URL") || rc=$?
+      if [[ $code == 416 ]]; then info "Download was already complete"; break; fi
+      if (( rc == 0 )) && [[ $code =~ ^[23] ]]; then break; fi
+      if (( rc == 0 )) && [[ $code =~ ^[45] ]]; then
+        rm -f "$ISO.part"; die "$E_NET" "The server answered HTTP $code for $ISO_URL. The partial file was discarded."
+      fi
+      attempt=$((attempt+1))
+      (( attempt < 5 )) || die "$E_NET" "Download kept failing (curl error $rc). Your progress is saved; re-run fetch to resume."
+      warn "Download interrupted (curl error $rc). Retrying in $((attempt*5))s (attempt $attempt of 5); progress is kept."
+      sleep $((attempt*5))
+    done
+    if (( remote > 0 )) && [[ $(file_size "$ISO.part") != "$remote" ]]; then
+      warn "Downloaded size $(file_size "$ISO.part") differs from the server's $remote; verification will decide."
+    fi
+    sync_file "$ISO.part"
   fi
 
   if [[ -z $SUMS_URL && -z $ISO_SIG_URL ]]; then
@@ -1533,7 +1933,11 @@ fetch() {
   else
     rm -f "$VERIFY_REC.tmp" "$VERIFY_REC.sha"
     if [[ $target == "$ISO.part" ]]; then rm -f "$ISO.part"; fi
-    die "Verification FAILED. The download was discarded."
+    if (( resumed )) && [[ ${FETCH_RETRIED:-0} != 1 ]]; then
+      warn "A resumed download failed verification (a stale partial file is the usual cause). Downloading again from scratch, once."
+      FETCH_RETRIED=1; fetch; return
+    fi
+    die "$E_INTEGRITY" "Verification FAILED. The download was discarded."
   fi
 }
 
@@ -1607,7 +2011,32 @@ extract() {
 
   info "Extracting (the root image can be several GB)"
   mkdir -p "$HTTP"
-  bsdtar -xf "$ISO" -C "$HTTP" "${files[@]}" || die "Extraction failed"
+  local stage="$HTTP.new" need_mb avail_mb rel f
+  rm -rf "$stage"; mkdir -p "$stage"
+  need_mb=$(bsdtar -tvf "$ISO" 2>/dev/null | awk -v want="$(printf '%s\n' "${files[@]#./}")" '
+      BEGIN{n=split(want,a,"\n"); for(i=1;i<=n;i++) w[a[i]]=1}
+      { name=$NF; sub(/^\.\//,"",name); if (name in w) sum+=$5 } END{printf "%d", sum/1048576 + 1}' || echo 0)
+  avail_mb=$(df -Pm "$HTTP" | awk 'NR==2{print $4}')
+  if (( need_mb > 1 && avail_mb < need_mb + need_mb/20 + 64 )); then
+    rm -rf "$stage"
+    die "$E_DISK" "Not enough space to extract: need about $need_mb MB, only $avail_mb MB free. Nothing was changed."
+  fi
+  if ! bsdtar -xf "$ISO" -C "$stage" "${files[@]}"; then
+    rm -rf "$stage"
+    die "Extraction failed. Your previous boot files were not touched."
+  fi
+  for f in "${files[@]}"; do
+    rel=${f#./}
+    [[ -f $stage/$rel ]] || { rm -rf "$stage"; die "Extraction incomplete: $rel is missing. Your previous boot files were not touched."; }
+  done
+  # every file is complete: move each into place (renames are atomic; other distros' files stay)
+  for f in "${files[@]}"; do
+    rel=${f#./}
+    mkdir -p "$HTTP/$(dirname "$rel")"
+    sync_file "$stage/$rel"
+    mv -f "$stage/$rel" "$HTTP/$rel"
+  done
+  rm -rf "$stage"
 
   local root_rel=$R
   if [[ $FAMILY == casper ]]; then
@@ -1628,7 +2057,7 @@ extract() {
     printf 'SHA_REL=%q\n' "$S"
     printf 'BASEDIR=%q\n' "$B"
     printf 'UCODE_RELS=%q\n' "$U"
-  } > "$LAYOUT"
+  } | atomic_write "$LAYOUT"
   ok "Boot files ready in $HTTP"
 }
 
@@ -1813,39 +2242,106 @@ manifest_files() {
   echo "lib/httpd.py"
 }
 
+fp_of() { stat -c '%s %Y %i %d' "$1" 2>/dev/null || echo "0 0 0 0"; }
+
+# detached GPG signature with the local attestation key (same identity as self-sign)
+gpg_sign_file() {
+  [[ -n $(attest_fpr) ]] || return 0
+  gpg --homedir "$ATTEST_GNUPG" --batch --no-tty --yes --local-user "$(attest_fpr)" \
+      --armor --detach-sign --output "$1.asc" "$1" >/dev/null 2>&1
+}
+gpg_verify_file() {
+  [[ -n $(attest_fpr) ]] || return 0
+  [[ -s $1.asc ]] || return 1
+  gpg --homedir "$ATTEST_GNUPG" --batch --no-tty --status-fd 1 --verify "$1.asc" "$1" 2>/dev/null \
+    | awk -v f="$(attest_fpr)" '$2=="VALIDSIG" && $NF==f {ok=1} END{exit !ok}'
+}
+
+# Hashes every served file once. Big files whose size/mtime/inode/device are unchanged
+# since a signed earlier run reuse that earlier hash instead of being read again.
 write_manifest() {
-  local rel f h tmp
-  tmp="$MANIFEST.tmp"
-  : > "$tmp"
+  local rel f h tmp fpt sz fp a b c d e trust=0 reused=0 hashed=0
+  declare -A oh=() ofp=()
+  if [[ -f $MANIFEST && -f $MANIFEST.fp ]] && gpg_verify_file "$MANIFEST.fp"; then
+    trust=1
+    while read -r a b c; do oh[$c]=$a; done < "$MANIFEST"
+    while read -r a b c d e; do ofp[$e]="$a $b $c $d"; done < "$MANIFEST.fp"
+  fi
+  tmp="$MANIFEST.tmp"; fpt="$MANIFEST.fp.tmp"
+  : > "$tmp"; : > "$fpt"
   while IFS= read -r rel; do
     f="$ROOT/$rel"
     [[ -f $f ]] || die "Manifest: missing $rel"
+    sz=$(file_size "$f"); fp=$(fp_of "$f")
     if [[ $FAMILY == casper && $rel == "http/$ROOTFS_REL" ]] && iso_is_verified; then
       h=$(iso_verified_sha)
+    elif (( sz >= BIG_BYTES && trust )) && [[ ${ofp[$rel]:-} == "$fp" && -n ${oh[$rel]:-} ]]; then
+      h=${oh[$rel]}; reused=$((reused+1))
     else
-      h=$(sha256_of "$f")
+      h=$(sha256_of "$f"); hashed=$((hashed+1))
     fi
-    printf '%s %s %s\n' "$h" "$(file_size "$f")" "$rel" >> "$tmp"
+    printf '%s %s %s\n' "$h" "$sz" "$rel" >> "$tmp"
+    printf '%s %s\n' "$fp" "$rel" >> "$fpt"
   done < <(manifest_files)
+  sync_file "$tmp"; sync_file "$fpt"
+  mv -f "$fpt" "$MANIFEST.fp"
   mv -f "$tmp" "$MANIFEST"
+  rm -f "$MANIFEST.fp.asc"
+  gpg_sign_file "$MANIFEST.fp" || warn "Could not sign the fingerprint list; big files will be fully re-hashed at serve time."
+  (( reused == 0 )) || info "Reused hashes for $reused unchanged big file(s) instead of re-reading them"
+  log_event INFO "manifest written hashed=$hashed reused=$reused"
 }
 
+# Tiered gate. Small files: always fully hashed. Big files: skipped when their signed
+# fingerprint still matches (checked later in the background by deep_verify_bg).
+BIG_FAST=()
 verify_manifest() {
   [[ -f $MANIFEST ]] || die "No manifest. Run: $0 configure"
-  local h s rel f cur bad=0 checked=0
-  info "Integrity gate: checking every served file (DEEP_VERIFY=$DEEP_VERIFY)"
+  local h s rel f cur bad=0 checked=0 fast=0 trust=0 a b c d e t0=$SECONDS mode=$DEEP_VERIFY
+  declare -A ofp=()
+  BIG_FAST=()
+  if [[ $mode == auto ]]; then
+    if [[ -f $MANIFEST.fp ]] && gpg_verify_file "$MANIFEST.fp"; then
+      trust=1
+      while read -r a b c d e; do ofp[$e]="$a $b $c $d"; done < "$MANIFEST.fp"
+    else
+      warn "No valid signed fingerprint list: every file will be fully re-hashed (slower)."
+    fi
+  fi
+  info "Integrity gate: checking every served file (mode: $mode)"
   while read -r h s rel; do
     f="$ROOT/$rel"
     if [[ ! -f $f ]]; then err "MISSING: $rel"; bad=$((bad+1)); continue; fi
     if [[ $(file_size "$f") != "$s" ]]; then err "SIZE CHANGED: $rel"; bad=$((bad+1)); continue; fi
-    if [[ $DEEP_VERIFY == 1 ]] || (( s < 536870912 )); then
-      cur=$(sha256_of "$f")
-      if [[ $cur != "$h" ]]; then err "HASH MISMATCH: $rel"; bad=$((bad+1)); continue; fi
+    if (( s >= BIG_BYTES && trust )) && [[ ${ofp[$rel]:-} == "$(fp_of "$f")" ]]; then
+      BIG_FAST+=("$h $rel"); fast=$((fast+1)); checked=$((checked+1)); continue
     fi
+    if [[ $mode == 0 ]] && (( s >= BIG_BYTES )); then checked=$((checked+1)); continue; fi
+    cur=$(sha256_of "$f")
+    if [[ $cur != "$h" ]]; then err "HASH MISMATCH: $rel"; bad=$((bad+1)); continue; fi
     checked=$((checked+1))
   done < "$MANIFEST"
-  (( bad == 0 )) || die "Integrity gate FAILED ($bad file(s)). Refusing to serve. Re-run extract and configure."
-  ok "Integrity gate passed ($checked files)"
+  (( bad == 0 )) || die "$E_INTEGRITY" "Integrity gate FAILED ($bad file(s)). Refusing to serve. Re-run extract and configure."
+  ok "Integrity gate passed ($checked files, $fast big file(s) by fingerprint, $((SECONDS-t0))s)"
+}
+
+# Runs niced in the background while serving; stops everything loudly on a mismatch.
+DEEP_PID=""
+deep_verify_bg() {
+  local item h rel cur np=""
+  command -v ionice >/dev/null 2>&1 && np="ionice -c3"
+  for item in "${BIG_FAST[@]}"; do
+    h=${item%% *}; rel=${item#* }
+    cur=$($np nice -n 19 sha256sum "$ROOT/$rel" 2>/dev/null | awk '{print $1}')
+    if [[ $cur != "$h" ]]; then
+      printf '%s\n' "$rel" > "$RUN/DEEP_FAIL"
+      err "BACKGROUND VERIFY FAILED for $rel: it changed on disk. Stopping the servers."
+      kill_servers
+      return 1
+    fi
+  done
+  : > "$RUN/DEEP_OK"
+  log_event INFO "background deep verify passed (${#BIG_FAST[@]} file(s))"
 }
 
 # =============================================================================
@@ -1960,6 +2456,183 @@ verify_attest() {
 }
 
 # =============================================================================
+# Backup and restore of the working folder
+# =============================================================================
+# Restorable point-in-time copy of $ROOT (keys, attestation, pins, state, TFTP
+# files, configs). Rebuildable bulk (extracted http/, src/, run/) is skipped, and
+# downloads/ only with BACKUP_DL=1. Each archive gets a SHA-256 sidecar.
+backup_create() {
+  local label=${1:-manual} base parent ts out
+  need tar; need sha256sum
+  [[ -d $ROOT ]] || die "Nothing to back up: $ROOT does not exist"
+  base=$(basename "$ROOT"); parent=$(dirname "$ROOT")
+  ts=$(date -u +%Y%m%dT%H%M%SZ)
+  out="$BACKUP_DIR/netboot-$label-$ts.tar.gz"
+  ( umask 077; mkdir -p "$BACKUP_DIR" ) || die "Cannot create $BACKUP_DIR"
+  local ex=(--exclude="$base/http" --exclude="$base/run" --exclude="$base/src")
+  (( BACKUP_DL )) || ex+=(--exclude="$base/downloads")
+  case "$(readlink -f "$BACKUP_DIR")/" in "$(readlink -f "$ROOT")"/*) ex+=(--exclude="$base/${BACKUP_DIR#"$ROOT"/}") ;; esac
+  info "Backing up $ROOT -> $out"
+  if ! ( umask 077; tar -C "$parent" -czpf "$out.part" "${ex[@]}" "$base" ) 2>/dev/null; then
+    rm -f "$out.part"
+    die "Backup failed (unreadable files? run: sudo chown -R \$(id -u) $ROOT). Set AUTO_BACKUP=0 to skip."
+  fi
+  tar -tzf "$out.part" >/dev/null 2>&1 || { rm -f "$out.part"; die "Backup archive failed its read-back test"; }
+  mv -f "$out.part" "$out"
+  ( cd "$BACKUP_DIR" && sha256sum "$(basename "$out")" > "$(basename "$out").sha256" )
+  printf 'version=%s\ncreated=%s\ndistro=%s\narch=%s\nfiles=%s\n' "$SCRIPT_VERSION" "$(now_iso)" "$DISTRO" "$TARGET_ARCH" \
+    "$(tar -tzf "$out" | grep -vc '/$' || true)" > "$out.meta"
+  chmod 600 "$out" "$out.sha256" 2>/dev/null || true
+  ok "Backup written: $out ($(file_size "$out") bytes)"
+  backup_prune
+  backup_upload "$out"
+}
+
+# Builds the unofficial Terabox CLI (fcr--/tbc) at a pinned commit. It talks only to
+# www.terabox.com (checked in the source at that commit) and needs your ndus cookie.
+terabox_install() {
+  need git; need go
+  local d="$SRC_DIR/tbc" rev
+  mkdir -p "$SRC_DIR"
+  [[ -d $d/.git ]] || git clone -q "$TBC_REPO" "$d" || die "Could not clone $TBC_REPO"
+  git -C "$d" fetch -q origin "$TBC_COMMIT" 2>/dev/null || git -C "$d" fetch -q origin || true
+  git -C "$d" checkout -q "$TBC_COMMIT" || die "Pinned commit $TBC_COMMIT not found"
+  rev=$(git -C "$d" rev-parse HEAD)
+  [[ $rev == "$TBC_COMMIT" ]] || die "Checked-out commit $rev does not match the pin"
+  ( cd "$d" && go build -o "$SRC_DIR/tbc-bin" ./cmd/tbc ) || die "go build failed (needs Go 1.24 or newer)"
+  ok "Terabox CLI built at ${TBC_COMMIT:0:12}: $SRC_DIR/tbc-bin"
+  info "Save your ndus cookie to a private file, then: TERABOX_COOKIE_FILE=FILE $0 backup"
+}
+
+terabox_cmd() {
+  local bin=${TBC_BIN:-$SRC_DIR/tbc-bin}
+  [[ -x $bin ]] || return 1
+  if [[ -n $TERABOX_COOKIE_FILE ]]; then
+    [[ -s $TERABOX_COOKIE_FILE ]] || return 1
+    chmod 600 "$TERABOX_COOKIE_FILE" 2>/dev/null || true
+    printf '%q -c %q put -d %q' "$bin" "$TERABOX_COOKIE_FILE" "$TERABOX_DIR"
+  elif [[ -n ${TERABOX_COOKIE:-} ]]; then
+    printf '%q put -d %q' "$bin" "$TERABOX_DIR"
+  else
+    return 1
+  fi
+}
+
+# Optional offsite copy. The archive holds the attestation GPG key and CA key, so it
+# is encrypted first and nothing is uploaded without a passphrase file. A failure here
+# only warns: the verified local backup already exists.
+# Google One storage is Google Drive storage. Uses rclone's official Drive backend:
+# create a remote once with `rclone config` (type "drive", scope drive.file), then set
+# GDRIVE_REMOTE=NAME:folder, for example gdrive:netboot-backups.
+gdrive_cmd() {
+  [[ -n $GDRIVE_REMOTE ]] || return 1
+  command -v rclone >/dev/null 2>&1 || { warn "GDRIVE_REMOTE is set but rclone is not installed (Termux: pkg install rclone)"; return 1; }
+  printf 'rclone copy --retries 3 -- "$1" %q' "$GDRIVE_REMOTE"
+}
+
+backup_upload() {
+  local f=$1 enc="$1.gpg" c
+  local -a labels=() cmds=()
+  if [[ -n $BACKUP_UPLOAD_CMD ]]; then labels+=("custom"); cmds+=("$BACKUP_UPLOAD_CMD \"\$1\""); fi
+  if c=$(terabox_cmd); then labels+=("Terabox"); cmds+=("$c \"\$1\""); fi
+  if c=$(gdrive_cmd); then labels+=("Google One (Drive)"); cmds+=("$c"); fi
+  (( ${#cmds[@]} )) || return 0
+  if [[ -z $BACKUP_GPG_PASSFILE || ! -s $BACKUP_GPG_PASSFILE ]]; then
+    warn "Offsite upload is configured but BACKUP_GPG_PASSFILE is missing or empty. Not uploading an unencrypted archive."
+    return 0
+  fi
+  need gpg
+  rm -f "$enc"
+  if ! ( umask 077; gpg --batch --no-tty --yes --pinentry-mode loopback --passphrase-file "$BACKUP_GPG_PASSFILE" \
+         --symmetric --cipher-algo AES256 --output "$enc" "$f" ) >/dev/null 2>&1; then
+    rm -f "$enc"; warn "Encryption failed. Offsite upload skipped."; return 0
+  fi
+  local i good="" badl=""
+  for i in "${!cmds[@]}"; do
+    info "Uploading $(basename "$enc") to ${labels[$i]}"
+    if bash -c "${cmds[$i]}" _ "$enc"; then
+      ok "${labels[$i]} upload done"; good+="${good:+, }${labels[$i]}"
+    else
+      warn "${labels[$i]} upload failed. Local backup is intact: $f"; badl+="${badl:+, }${labels[$i]}"
+    fi
+  done
+  rm -f "$enc"
+  printf '%s %s%s\n' "$(now_iso)" "${good:+OK: $good}" "${badl:+ FAILED: $badl}" | atomic_write "$STATE/offsite.status" || true
+}
+
+backup_prune() {
+  [[ $BACKUP_KEEP =~ ^[0-9]+$ ]] && (( BACKUP_KEEP > 0 )) || return 0
+  local f n=0
+  while IFS= read -r f; do
+    n=$((n+1))
+    if (( n > BACKUP_KEEP )); then rm -f -- "$f" "$f.sha256" "$f.meta"; fi
+  done < <(ls -1t "$BACKUP_DIR"/netboot-*.tar.gz 2>/dev/null || true)
+  return 0
+}
+
+backup_list() {
+  ls -1t "$BACKUP_DIR"/netboot-*.tar.gz 2>/dev/null || { info "No backups in $BACKUP_DIR"; return 0; }
+}
+
+backup_verify() {
+  local f=$1
+  [[ -f $f ]] || die "No such backup: $f"
+  [[ -f $f.sha256 ]] || die "Missing checksum file: $f.sha256"
+  ( cd "$(dirname "$f")" && sha256sum -c "$(basename "$f").sha256" >/dev/null 2>&1 ) \
+    || die "Backup checksum mismatch: $f"
+  tar -tzf "$f" >/dev/null 2>&1 || die "Backup archive is unreadable: $f"
+}
+
+# Runs before anything that can change or remove served state.
+auto_backup() {
+  [[ $AUTO_BACKUP == 1 ]] || { warn "AUTO_BACKUP=0: skipping the pre-run backup"; return 0; }
+  [[ -d $ROOT ]] || return 0
+  backup_create "auto-$1"
+}
+
+restore() {
+  local f=${1:-} stage base parent top n
+  [[ -n $f ]] || { backup_list; die "Usage: $0 restore ARCHIVE [--dry-run]   (a file from the list above)"; }
+  [[ -f $f ]] || f="$BACKUP_DIR/$f"
+  need tar
+  backup_verify "$f"
+  base=$(basename "$ROOT"); parent=$(dirname "$ROOT")
+  if [[ ${DRY_RUN:-0} == 1 ]]; then
+    info "Dry run: restoring $(basename "$f") would replace these items in $ROOT (nothing is changed):"
+    tar -tzf "$f" | awk -F/ -v b="$base" 'NF>=2 && $1==b && $2!="" {print $2}' | sort -u | sed 's/^/    /'
+    [[ -f $f.meta ]] && sed 's/^/    /' "$f.meta"
+    return 0
+  fi
+  kill_servers
+  [[ -d $ROOT ]] && backup_create "pre-restore"
+  stage="$ROOT.restore.NEW"
+  rm -rf "$stage"; mkdir -p "$stage"
+  if ! tar -C "$stage" -xzpf "$f"; then
+    rm -rf "$stage"; die "Restore archive could not be unpacked. Nothing was changed."
+  fi
+  [[ -d $stage/$base ]] || { rm -rf "$stage"; die "This archive was not made from a folder named '$base'. Nothing was changed."; }
+  warn "Restoring $(basename "$f") into $ROOT (downloads and extracted files stay as they are)"
+  run_root "chown -R $(id -u):$(id -g) '$ROOT'" >/dev/null 2>&1 || true
+  mkdir -p "$ROOT"
+  n=0
+  for top in "$stage/$base"/* "$stage/$base"/.[!.]*; do
+    [[ -e $top ]] || continue
+    if [[ $(basename "$top") == state ]]; then
+      # state holds the live lock and undo journal: copy over it instead of replacing the folder
+      rm -rf "$top/lock.d" "$top/undo.d"
+      mkdir -p "$ROOT/state"; cp -af "$top"/. "$ROOT/state"/
+    elif [[ -d $top ]]; then
+      atomic_dir_swap "$top" "$ROOT/$(basename "$top")" || { rm -rf "$stage"; die "Could not swap in $(basename "$top"). Your previous state is in the pre-restore backup in $BACKUP_DIR."; }
+    else
+      mv -f "$top" "$ROOT/$(basename "$top")"
+    fi
+    n=$((n+1))
+  done
+  rm -rf "$stage"
+  ok "Restored $n item(s). Run: $0 status, then $0 go"
+}
+
+# =============================================================================
 # Serving
 # =============================================================================
 require_ready() {
@@ -1974,7 +2647,8 @@ setup_direct() {
   local ip=${DIRECT_CIDR%/*}
   if ! ip_q -4 -o addr show dev "$IFACE" | grep -q "inet $ip/"; then
     info "Assigning $DIRECT_CIDR to $IFACE"
-    run_root "ip link set $IFACE up && ip addr add $DIRECT_CIDR dev $IFACE" || die "Could not assign $DIRECT_CIDR to $IFACE"
+    JID_DIRECT=$(journal_push "ip addr del $DIRECT_CIDR dev $IFACE 2>/dev/null; ip rule del from $ip lookup main pref 9000 2>/dev/null; ip rule del to ${NET:-0.0.0.0}/${PREFIX_LEN:-24} lookup main pref 9001 2>/dev/null; true")
+    run_root "ip link set $IFACE up && ip addr add $DIRECT_CIDR dev $IFACE" || die "$E_ENV" "Could not assign $DIRECT_CIDR to $IFACE"
     DIRECT_ADDED=1
   fi
   if (( IS_ANDROID )); then
@@ -1987,24 +2661,28 @@ teardown_direct() {
   (( DIRECT_ADDED )) || return 0
   local ip=${DIRECT_CIDR%/*}
   run_root "ip addr del $DIRECT_CIDR dev $IFACE 2>/dev/null; ip rule del from $ip lookup main pref 9000 2>/dev/null; ip rule del to $NET/$PREFIX_LEN lookup main pref 9001 2>/dev/null; true" || true
+  [[ -n ${JID_DIRECT:-} ]] && journal_drop "$JID_DIRECT"
   DIRECT_ADDED=0
 }
 
 power_save_off() {
   if (( IS_ANDROID )); then
+    JID_POWER=$(journal_push "iw dev $IFACE set power_save on 2>/dev/null; cmd wifi force-hi-perf-mode disabled 2>/dev/null; true")
     if run_root "command -v iw >/dev/null 2>&1 && iw dev $IFACE set power_save off" >/dev/null 2>&1; then
       ok "Wi-Fi power save disabled on $IFACE (iw)"; POWER_TWEAKED=1; return 0
     fi
     if run_root "cmd wifi force-hi-perf-mode enabled" >/dev/null 2>&1; then
       ok "Wi-Fi high-performance mode enabled"; POWER_TWEAKED=1; return 0
     fi
+    journal_drop "$JID_POWER"; JID_POWER=""
     warn "Could not change Wi-Fi power save. Keep the screen on and Termux set to unrestricted battery use."
   fi
 }
 
 power_save_restore() {
   (( POWER_TWEAKED )) || return 0
-  run_root "cmd wifi force-hi-perf-mode disabled" >/dev/null 2>&1 || true
+  run_root "iw dev $IFACE set power_save on 2>/dev/null; cmd wifi force-hi-perf-mode disabled 2>/dev/null; true" >/dev/null 2>&1 || true
+  [[ -n $JID_POWER ]] && journal_drop "$JID_POWER"
   POWER_TWEAKED=0
 }
 
@@ -2024,6 +2702,9 @@ cleanup() {
   power_save_restore
   (( IS_TERMUX )) && termux-wake-unlock 2>/dev/null || true
   run_root "chown -R $(id -u):$(id -g) '$RUN'" >/dev/null 2>&1 || true
+  if [[ -n $DEEP_PID ]]; then pkill -P "$DEEP_PID" 2>/dev/null || true; kill "$DEEP_PID" 2>/dev/null || true; fi
+  note_serve "stopped"
+  release_lock
   echo
   info "Servers stopped"
 }
@@ -2037,9 +2718,13 @@ serve() {
   grep -q "^interface=$IFACE$" "$DNSMASQ_CONF" && grep -q "$PHONE_IP:$HTTP_PORT" "$TFTP/boot.ipxe" \
     || die "Network changed since configure (now $IFACE $PHONE_IP). Run: $0 configure"
 
+  auto_backup serve
+  journal_replay
   verify_manifest
+  save_profile
+  note_serve "started ($DISTRO/$TARGET_ARCH on $IFACE $PHONE_IP)"
 
-  if port_in_use tcp "$HTTP_PORT"; then die "TCP $HTTP_PORT is in use. Set HTTP_PORT=... or run: $0 clean"; fi
+  if port_in_use tcp "$HTTP_PORT"; then die "$E_BUSY" "TCP $HTTP_PORT is in use. Set HTTP_PORT=... or run: $0 clean"; fi
   if port_in_use udp 67; then warn "UDP 67 is in use. dnsmasq may fail to bind (see selinux or hotspot notes)."; fi
   if port_in_use udp 69; then warn "UDP 69 is in use. TFTP may fail to bind."; fi
 
@@ -2050,12 +2735,10 @@ serve() {
   power_save_off
 
   mkdir -p "$RUN"
-  info "Starting the HTTP server on $PHONE_IP:$HTTP_PORT (log: $HTTP_LOG)"
+  DNS_LOG="$ROOT/dnsmasq.log"
   printf '\n--- server start %s ---\n' "$(now_iso)" >> "$HTTP_LOG"
-  "$PYTHON" "$LIB/httpd.py" "$PHONE_IP" "$HTTP_PORT" "$HTTP" >> "$HTTP_LOG" 2>&1 &
-  SERVE_HTTP_PID=$!
-  sleep 1
-  kill -0 "$SERVE_HTTP_PID" 2>/dev/null || die "HTTP server failed to start. See $HTTP_LOG"
+  info "Starting the HTTP server on $PHONE_IP:$HTTP_PORT (log: $HTTP_LOG)"
+  start_http || die "$E_ENV" "HTTP server failed to start. See $HTTP_LOG.err"
 
   local vb_text="ON (signed, client verifies)"
   [[ $VERIFIED_BOOT == 1 ]] || vb_text="OFF"
@@ -2071,15 +2754,155 @@ serve() {
     "Client URL     : $BASE_URL" \
     "Verified boot  : $vb_text" \
     "" \
+    "Watching itself: restarts a crashed server, follows an address change" \
     "Live HTTP log  : $0 logs" \
     "Press Ctrl+C to stop."
   echo
 
+  rm -f "$RUN/DEEP_FAIL" "$RUN/DEEP_OK"
+  if (( ${#BIG_FAST[@]} )); then
+    info "Verifying ${#BIG_FAST[@]} big file(s) in the background at low priority; serving starts now"
+    deep_verify_bg & DEEP_PID=$!
+  fi
+
   info "Starting dnsmasq ($MODE DHCP + TFTP) as root"
+  start_dns
+  sleep 1
+  dns_alive || die "$E_ENV" "dnsmasq exited. If it could not bind a port, check: $0 selinux status, and whether a hotspot or another DHCP/TFTP service holds ports 67/69."
+  protect_pid "$(run_root "cat '$RUN/dnsmasq.pid'" 2>/dev/null || true)"
+  ok "Ready. Boot the PC from the network now."
+  watchdog || true
+  serve_epilogue
+}
+
+# ---- server processes, supervised by watchdog() ------------------------------------
+start_http() {
+  HTTPD_LOG="$HTTP_LOG" HTTPD_ALLOW="$ISO" "$PYTHON" "$LIB/httpd.py" "$PHONE_IP" "$HTTP_PORT" "$HTTP" >> "$HTTP_LOG.err" 2>&1 &
+  SERVE_HTTP_PID=$!
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.3
+    kill -0 "$SERVE_HTTP_PID" 2>/dev/null || return 1
+    http_health && { protect_pid "$SERVE_HTTP_PID"; return 0; }
+  done
+  kill -0 "$SERVE_HTTP_PID" 2>/dev/null
+}
+
+http_health() { curl -fsS -m 2 -o /dev/null "http://$PHONE_IP:$HTTP_PORT/healthz" 2>/dev/null; }
+http_stats()  { curl -fsS -m 2 "http://$PHONE_IP:$HTTP_PORT/healthz" 2>/dev/null || true; }
+
+start_dns() {
   local ldp=""
   (( IS_TERMUX )) && ldp="LD_LIBRARY_PATH=$PREFIX/lib "
-  run_root "${ldp}$DNSMASQ --no-daemon --conf-file=$DNSMASQ_CONF" \
-    || die "dnsmasq exited. If it could not bind a port, check: $0 selinux status, and whether a hotspot or another DHCP/TFTP service holds ports 67/69."
+  { run_root "${ldp}$DNSMASQ --no-daemon --conf-file=$DNSMASQ_CONF" || true; } > >(tee -a "$DNS_LOG") 2>&1 &
+}
+
+dns_alive() {
+  run_root "p=\$(cat '$RUN/dnsmasq.pid' 2>/dev/null); [ -n \"\$p\" ] && kill -0 \"\$p\" 2>/dev/null" >/dev/null 2>&1
+}
+
+stop_dns() {
+  run_root "kill \$(cat '$RUN/dnsmasq.pid' 2>/dev/null) 2>/dev/null; rm -f '$RUN/dnsmasq.pid'; pkill -f '$DNSMASQ_CONF' 2>/dev/null; true" >/dev/null 2>&1 || true
+}
+
+# Android's low-memory killer kills the least important apps first; make ours important.
+protect_pid() {
+  (( IS_ANDROID )) || return 0
+  [[ ${1:-} =~ ^[0-9]+$ ]] || return 0
+  run_root "echo -500 > /proc/$1/oom_score_adj" >/dev/null 2>&1 || true
+}
+
+WD_TIMES=()
+wd_budget() {   # at most 5 restarts per 5 minutes; backs off a little each time
+  local now t keep=()
+  now=$(date +%s)
+  for t in "${WD_TIMES[@]}"; do (( now - t < 300 )) && keep+=("$t"); done
+  WD_TIMES=("${keep[@]}")
+  (( ${#WD_TIMES[@]} < 5 )) || return 1
+  sleep $(( ${#WD_TIMES[@]} * 2 ))
+  WD_TIMES+=("$now")
+  return 0
+}
+
+wd_restart() {   # http | dns
+  if [[ -f $RUN/DEEP_FAIL ]]; then return 0; fi
+  if ! wd_budget; then
+    err "The $1 server keeps crashing (5 restarts in 5 minutes). Stopping so you can look. Log: $LOG_FILE"
+    log_event ERROR "watchdog gave up on $1"
+    return 1
+  fi
+  case "$1" in
+    http) kill "$SERVE_HTTP_PID" 2>/dev/null || true
+          if start_http; then ok "HTTP server restarted"; log_event WARN "watchdog restarted http"; else warn "HTTP restart failed; will retry"; fi ;;
+    dns)  stop_dns; start_dns; sleep 1
+          if dns_alive; then ok "dnsmasq restarted"; log_event WARN "watchdog restarted dnsmasq"; protect_pid "$(run_root "cat '$RUN/dnsmasq.pid'" 2>/dev/null || true)"; else warn "dnsmasq restart failed; will retry"; fi ;;
+  esac
+  return 0
+}
+
+NET_LOST=0
+net_check() {
+  local cur
+  cur=$( ( LOG_QUIET=1; resolve_network >/dev/null 2>&1 && printf '%s %s' "$IFACE" "$PHONE_IP" ) 2>/dev/null || true )
+  if [[ -z $cur ]]; then
+    (( NET_LOST )) || warn "Network lost on $IFACE. The servers stay up and will carry on when it returns."
+    NET_LOST=1; return 0
+  fi
+  NET_LOST=0
+  [[ ${cur#* } != "$PHONE_IP" ]] || return 0
+  warn "Phone address changed ($PHONE_IP -> ${cur#* }). Re-signing boot files and restarting the servers."
+  log_event WARN "address change $PHONE_IP -> ${cur#* }"
+  resolve_network
+  if ( configure ) >/dev/null 2>&1; then
+    kill "$SERVE_HTTP_PID" 2>/dev/null || true; stop_dns
+    start_http && start_dns
+    sleep 1
+    if dns_alive; then ok "Serving again on $PHONE_IP"; else warn "Servers did not come back; the watchdog will retry."; fi
+  else
+    err "Could not update the boot files for the new address. Run: $0 heal"
+  fi
+}
+
+LAST_REQ=-1
+show_activity() {
+  local st req bytes
+  st=$(http_stats)
+  [[ $st =~ requests=([0-9]+)\ bytes=([0-9]+) ]] || return 0
+  req=${BASH_REMATCH[1]}; bytes=${BASH_REMATCH[2]}
+  if [[ $req != "$LAST_REQ" ]]; then
+    LAST_REQ=$req
+    printf '%s[%s]%s %s requests served, %s MB sent\n' "$C_DIM" "$(date +%H:%M:%S)" "$C_RESET" "$req" "$((bytes/1048576))"
+  fi
+  if [[ -f $DNS_LOG ]] && (( $(file_size "$DNS_LOG") > 5242880 )); then : > "$DNS_LOG"; fi
+}
+
+watchdog() {
+  local tick=0 bad=0
+  while :; do
+    sleep 2 & wait $! || true
+    tick=$((tick+2))
+    if [[ -f $RUN/DEEP_FAIL ]]; then return 0; fi
+    if ! kill -0 "$SERVE_HTTP_PID" 2>/dev/null; then
+      warn "HTTP server stopped unexpectedly"; wd_restart http || return 1
+    elif (( tick % 6 == 0 )); then
+      if http_health; then bad=0
+      else
+        bad=$((bad+1))
+        if (( bad >= 3 )); then warn "HTTP server is not answering"; bad=0; wd_restart http || return 1; fi
+      fi
+    fi
+    if (( tick % 4 == 0 )) && ! dns_alive && [[ ! -f $RUN/DEEP_FAIL ]]; then
+      warn "dnsmasq stopped unexpectedly"; wd_restart dns || return 1
+    fi
+    if (( tick % 6 == 0 )); then net_check; fi
+    if (( tick % 10 == 0 )); then show_activity; fi
+  done
+}
+
+serve_epilogue() {
+  if [[ -f $RUN/DEEP_FAIL ]]; then
+    die "$E_INTEGRITY" "Served file changed on disk: $(cat "$RUN/DEEP_FAIL"). Servers were stopped. Run '$0 heal' and re-extract."
+  fi
 }
 
 logs() {
@@ -2141,6 +2964,13 @@ check() {
     err "Storage: only $avail_mb MB free (need $MIN_FREE_MB MB for $DISTRO)"; fails=$((fails+1))
   fi
 
+  case "$(fs_type "$ROOT")" in
+    msdos|vfat|exfat) err "Folder is on a FAT/exFAT drive: no files over 4 GB and no links. Use internal storage."; fails=$((fails+1)) ;;
+    fuse*|sdcardfs)   warn "Folder is on slow shared storage ($(fs_type "$ROOT")). Internal storage is faster." ;;
+  esac
+  local ma; ma=$(mem_avail_mb)
+  if (( ma > 0 && ma < 300 )); then warn "Only $ma MB of RAM free. Close other apps so Android keeps the servers alive."; fi
+
   if ( resolve_network ) >/dev/null 2>&1; then
     resolve_network
     link_state=$(ip_q -o link show "$IFACE")
@@ -2185,6 +3015,7 @@ check() {
 }
 
 clean() {
+  auto_backup clean
   info "Stopping servers"
   kill_servers
   ok "Servers stopped"
@@ -2202,10 +3033,459 @@ clean() {
 }
 
 # =============================================================================
+# Health: status, doctor, heal, go
+# =============================================================================
+fs_type()  { stat -f -c %T "$1" 2>/dev/null || echo unknown; }
+mem_avail_mb() { awk '/MemAvailable/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0; }
+is_pid_alive() { [[ -n ${1:-} ]] && kill -0 "$1" 2>/dev/null; }
+
+PROFILE="$STATE/profile"
+save_profile() {
+  mkdir -p "$STATE"
+  { printf "DISTRO='%s'\n" "$DISTRO"; printf "TARGET_ARCH='%s'\n" "$TARGET_ARCH"
+    printf "DHCP_MODE='%s'\n" "$DHCP_MODE"; printf "IFACE='%s'\n" "${IFACE:-}"
+    printf "HTTP_PORT='%s'\n" "$HTTP_PORT"; } | atomic_write "$PROFILE" || true
+}
+load_profile() {   # applies only values you did not give on the command line / environment
+  [[ -r $PROFILE ]] || return 1
+  local line name val
+  while IFS= read -r line; do
+    name=${line%%=*}; val=${line#*=}
+    [[ $val == \'*\' ]] || continue
+    val=${val:1:${#val}-2}
+    [[ $val != *\'* && -n $val ]] || continue
+    case "$name" in
+      DISTRO|TARGET_ARCH|DHCP_MODE|IFACE|HTTP_PORT)
+        [[ " $CLI_SET " == *" $name "* || -n ${PRE_ENV[$name]:-} ]] || printf -v "$name" '%s' "$val" ;;
+    esac
+  done < "$PROFILE"
+  return 0
+}
+note_serve() { printf '%s %s\n' "$(now_iso)" "$1" | atomic_write "$STATE/last-serve" 2>/dev/null || true; }
+
+F_LVL=(); F_TAG=(); F_MSG=(); F_FIX=()
+finding() { F_LVL+=("$1"); F_TAG+=("$2"); F_MSG+=("$3"); F_FIX+=("${4:-}"); }
+
+orphans_running() {
+  command -v pgrep >/dev/null 2>&1 || return 1
+  pgrep -f "$LIB/httpd.py" >/dev/null 2>&1 || pgrep -f "$DNSMASQ_CONF" >/dev/null 2>&1
+}
+
+diagnose() {
+  F_LVL=(); F_TAG=(); F_MSG=(); F_FIX=()
+  local other=0 cfg_ip cur n avail ft ma last age st f
+  # lock
+  if [[ -f $LOCK_DIR/owner ]] && lock_owner_alive; then
+    read -r n _ < "$LOCK_DIR/owner"
+    if [[ $n != "$BASHPID" ]]; then other=1; finding INFO LOCK "Another netboot-android command is running (pid $n)" ""; fi
+  fi
+  # leftovers from a crash
+  n=$(journal_count)
+  (( n == 0 )) || finding WARN JOURNAL "$n system change(s) from an earlier run were never undone (IP address, rules, Wi-Fi mode)" "$0 heal"
+  if (( ! other )) && orphans_running; then finding WARN ORPHAN "Server processes from an earlier run are still running" "$0 heal"; fi
+  if [[ -d $HTTP.new ]] || compgen -G "$HTTP.old.*" >/dev/null || compgen -G "$STATE/*.tmp" >/dev/null || compgen -G "$STATE/.conf.*" >/dev/null; then
+    finding WARN TMPFILES "Half-finished temporary files from an interrupted step" "$0 heal"
+  fi
+  if compgen -G "$ROOT/*.part" >/dev/null; then
+    finding INFO PARTIAL "A partial download is saved and will resume (run: $0 fetch)" ""
+  fi
+  if [[ -d $RUN && ! -O $RUN && $(id -u) -ne 0 ]]; then finding WARN PERMS "$RUN is owned by root from the last serve" "$0 heal"; fi
+  if [[ -f $DNSMASQ_CONF && ! -f $LIB/httpd.py ]]; then finding WARN LIBS "Helper programs are missing" "$0 heal"; fi
+  # storage and memory
+  mkdir -p "$ROOT" 2>/dev/null || true
+  avail=$(df -Pm "$ROOT" 2>/dev/null | awk 'NR==2{print $4}'); avail=${avail:-0}
+  if (( avail >= ${MIN_FREE_MB:-0} )); then finding OK DISK "Storage: $avail MB free" ""
+  elif [[ -f $MANIFEST ]]; then finding WARN DISK "Storage is low: $avail MB free (serving still works)" "$0 clean   (keeps ISOs and keys)"
+  else finding FAIL DISK "Storage: only $avail MB free, need ${MIN_FREE_MB:-?} MB for $DISTRO" "free space or set NETBOOT_HOME to a bigger drive"; fi
+  ft=$(fs_type "$ROOT")
+  case "$ft" in
+    msdos|vfat|exfat) finding FAIL FSTYPE "Folder is on a $ft drive: no files over 4 GB, no links. Move NETBOOT_HOME to internal storage" "NETBOOT_HOME=\$HOME/netboot" ;;
+    fuse*|sdcardfs)   finding WARN FSTYPE "Folder is on $ft storage (slow, may lack links). Internal storage is faster and safer" "" ;;
+  esac
+  ma=$(mem_avail_mb)
+  if (( ma > 0 && ma < 300 )); then finding WARN MEM "Only $ma MB of RAM free: close other apps so Android keeps the servers alive" ""
+  elif (( ma > 0 )); then finding OK MEM "Memory: $ma MB free"; fi
+  # trust chain
+  if [[ -z $(attest_fpr) ]]; then
+    last=$(ls -1t "$BACKUP_DIR"/netboot-*.tar.gz 2>/dev/null | head -n1 || true)
+    if [[ -n $last ]]; then finding FAIL ATTEST "No attestation identity here, but a backup exists" "$0 restore $(basename "$last")"
+    else finding FAIL ATTEST "No attestation identity yet" "$0 attest-init"; fi
+  else
+    st=$(self_status)
+    case "$st" in
+      ok)      finding OK SELF "Script matches its signed fingerprint" "" ;;
+      unset)   finding WARN SELF "Script fingerprint is not signed yet" "$0 self-sign" ;;
+      changed) finding FAIL SELF "Script changed since it was signed (updated? run self-sign)" "$0 self-sign" ;;
+      bad)     finding FAIL SELF "Signed script record failed verification (possible tampering)" "$0 fingerprints" ;;
+    esac
+  fi
+  [[ -s $TFTP/ipxe.efi ]] && finding OK IPXE "iPXE loader present" "" || finding FAIL IPXE "iPXE loader missing" "$0 build-ipxe   (or import-ipxe DIR)"
+  iso_is_verified && finding OK ISO "$P_LABEL image verified" "" || finding FAIL ISO "$P_LABEL image not downloaded/verified" "$0 --distro $DISTRO --arch $TARGET_ARCH fetch"
+  [[ -f $LAYOUT ]] && finding OK EXTRACT "Boot files extracted" "" || finding FAIL EXTRACT "Boot files not extracted" "$0 --distro $DISTRO --arch $TARGET_ARCH extract"
+  if [[ -f $MANIFEST && -f $TFTP/boot.ipxe ]]; then
+    finding OK CONFIG "Configured and signed" ""
+    cfg_ip=$(sed -n 's|^set base http://\([0-9.]*\):.*|\1|p' "$TFTP/boot.ipxe" | head -n1)
+    cur=$( ( LOG_QUIET=1; resolve_network 2>/dev/null; printf '%s %s' "$IFACE" "$PHONE_IP" ) 2>/dev/null || true )
+    if [[ -z $cur || $cur == " " ]]; then finding FAIL NET "No usable network connection" "connect Wi-Fi/Ethernet"
+    elif [[ ${cur#* } != "$cfg_ip" ]]; then finding WARN NETCHG "Phone address changed ($cfg_ip -> ${cur#* }); boot files must be re-signed" "$0 heal"
+    else finding OK NET "Network ${cur%% *} at ${cur#* } matches the boot files" ""; fi
+  else
+    finding FAIL CONFIG "Not configured yet" "$0 --distro $DISTRO --arch $TARGET_ARCH configure"
+  fi
+  # backups
+  last=$(ls -1t "$BACKUP_DIR"/netboot-*.tar.gz 2>/dev/null | head -n1 || true)
+  if [[ -z $last ]]; then finding INFO BACKUP "No backup yet (one is taken automatically before serve)" ""
+  else
+    age=$(( ( $(date +%s) - $(file_mtime "$last") ) / 3600 ))
+    (( age < 168 )) && finding OK BACKUP "Last backup $age h ago" "" || finding WARN BACKUP "Last backup is $((age/24)) days old" "$0 backup"
+  fi
+  [[ -s $STATE/offsite.status ]] && finding INFO OFFSITE "Offsite: $(cat "$STATE/offsite.status")" ""
+  [[ -s $STATE/last-serve ]] && finding INFO SERVE "Last serve: $(cat "$STATE/last-serve")" ""
+  return 0
+}
+
+print_findings() {
+  local i col tag
+  for i in "${!F_LVL[@]}"; do
+    case "${F_LVL[$i]}" in
+      OK)   col=$C_GREEN;  tag=" OK " ;;
+      WARN) col=$C_YELLOW; tag="WARN" ;;
+      FAIL) col=$C_RED;    tag="FAIL" ;;
+      *)    col=$C_CYAN;   tag=" .. " ;;
+    esac
+    printf '  %s[%s]%s %s\n' "$col" "$tag" "$C_RESET" "${F_MSG[$i]}"
+    if [[ -n ${F_FIX[$i]} && ${F_LVL[$i]} != OK ]]; then printf '         %sfix:%s %s\n' "$C_DIM" "$C_RESET" "${F_FIX[$i]}"; fi
+  done
+  return 0
+}
+
+verdict() {   # 0 ready, 1 attention
+  local i bad=0
+  for i in "${!F_LVL[@]}"; do [[ ${F_LVL[$i]} == FAIL ]] && bad=$((bad+1)); done
+  if (( bad == 0 )); then
+    printf '\n  %s%sREADY TO SERVE.%s Run: %s go\n\n' "$C_BOLD" "$C_GREEN" "$C_RESET" "$0"; return 0
+  fi
+  printf '\n  %s%sNEEDS ATTENTION (%d problem(s)).%s Run: %s heal   or follow the fixes above.\n\n' "$C_BOLD" "$C_RED" "$bad" "$C_RESET" "$0"; return 1
+}
+
+status() {
+  printf '%sStatus: %s / %s  (network mode %s)%s\n' "$C_BOLD" "$P_LABEL" "$TARGET_ARCH" "$DHCP_MODE" "$C_RESET"
+  diagnose; print_findings; verdict
+}
+
+doctor() { status; }
+
+# Safe repairs only. Everything here is idempotent and never touches keys, backups, or downloads.
+heal_safe() {
+  local did=0 d
+  if [[ $(journal_count) -gt 0 ]]; then journal_replay; did=1; fi
+  if orphans_running; then info "Stopping leftover server processes"; kill_servers; did=1; fi
+  for d in "$HTTP.new" "$STATE"/.conf.* "$MANIFEST.tmp" "$MANIFEST.fp.tmp" "$VERIFY_REC.tmp" "$VERIFY_REC.sha"; do
+    [[ -e $d ]] && { rm -rf -- "$d"; did=1; ok "Removed leftover: ${d#"$ROOT"/}"; }
+  done
+  for d in "$HTTP".old.*; do
+    [[ -e $d ]] || continue
+    if [[ ! -d $HTTP ]]; then mv -T "$d" "$HTTP" && ok "Restored the previous boot files (an update was interrupted)"
+    else rm -rf -- "$d"; ok "Removed leftover: ${d#"$ROOT"/}"; fi
+    did=1
+  done
+  if [[ -d $RUN && ! -O $RUN ]]; then run_root "chown -R $(id -u):$(id -g) '$RUN'" >/dev/null 2>&1 && { ok "Fixed ownership of $RUN"; did=1; }; fi
+  if [[ -f $DNSMASQ_CONF && ! -f $LIB/httpd.py ]]; then write_libs; ok "Rewrote helper programs"; did=1; fi
+  (( did )) || ok "Nothing needed fixing"
+  log_event INFO "heal_safe did=$did"
+  return 0
+}
+
+heal() {
+  info "Checking and repairing (safe fixes only; nothing is deleted that you cannot rebuild)"
+  heal_safe
+  diagnose
+  local i netchg=0
+  for i in "${!F_TAG[@]}"; do [[ ${F_TAG[$i]} == NETCHG ]] && netchg=1; done
+  if (( netchg )); then
+    info "The phone's address changed. Re-signing the boot files for the new address"
+    if ( configure ) >/dev/null 2>&1; then ok "Boot files updated for the new address"; else warn "Could not update automatically. Run: $0 configure"; fi
+    diagnose
+  fi
+  print_findings
+  verdict || {
+    if [[ -t 0 ]]; then
+      for i in "${!F_LVL[@]}"; do
+        [[ ${F_LVL[$i]} == FAIL && -n ${F_FIX[$i]} && ${F_FIX[$i]} == "$0 "* ]] || continue
+        ask_yn "Run now: ${F_FIX[$i]#"$0 "}?" n && { ( with_lock bash -c "${F_FIX[$i]}" ) || warn "That did not finish."; }
+      done
+    fi
+    return 1
+  }
+}
+
+go_cmd() {
+  load_profile && set_distro || true
+  info "go: $P_LABEL / $TARGET_ARCH, network mode $DHCP_MODE"
+  heal_safe
+  diagnose
+  local i hard=0
+  for i in "${!F_LVL[@]}"; do
+    if [[ ${F_TAG[$i]} == NETCHG ]]; then
+      info "Phone address changed; re-signing boot files"
+      ( configure ) >/dev/null 2>&1 && ok "Boot files updated" || die "$E_ENV" "Could not re-sign for the new address. Run: $0 configure"
+    elif [[ ${F_LVL[$i]} == FAIL && ${F_TAG[$i]} != SELF ]]; then
+      hard=1; err "${F_MSG[$i]}"; [[ -n ${F_FIX[$i]} ]] && next_step "${F_FIX[$i]}"
+    fi
+  done
+  (( hard == 0 )) || die "$E_ENV" "Not ready to serve. Run '$0 status' for the full picture."
+  serve
+}
+
+# =============================================================================
+# Guided mode: walks through everything, one plain step at a time
+# =============================================================================
+GSTEP=0; GTOTAL=13
+
+say()  { printf '%s\n' "$*"; }
+hint() { printf '%s    %s%s\n' "$C_DIM" "$*" "$C_RESET"; }
+
+# ask_yn "Question" y|n   (Enter takes the default; q quits safely)
+ask_yn() {
+  local q=$1 d=${2:-y} a h="[y/N]"
+  [[ $d == y ]] && h="[Y/n]"
+  while true; do
+    read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} $q $h " a || { echo; a=""; }
+    a=${a,,}
+    case "$a" in
+      "")     [[ $d == y ]]; return ;;
+      y|yes)  return 0 ;;
+      n|no)   return 1 ;;
+      q|quit) echo; info "Stopped. Nothing is half-done. Start the guide again any time."; exit 0 ;;
+      *)      warn "Please type y, n, or q to quit" ;;
+    esac
+  done
+}
+
+gstep_head() {
+  GSTEP=$((GSTEP+1))
+  printf '\n%s== Step %d of %d: %s ==%s\n' "${C_BOLD}${C_CYAN}" "$GSTEP" "$GTOTAL" "$1" "$C_RESET"
+  shift
+  local l; for l in "$@"; do say "$l"; done
+}
+
+# guided_run "Title" "Plain explanation" DONE_CHECK_FUNCTION|"" command args...
+guided_run() {
+  local title=$1 why=$2 donefn=$3 a; shift 3
+  gstep_head "$title" "$why"
+  if [[ -n $donefn ]] && "$donefn"; then
+    ok "Already done."
+    ask_yn "Do it again anyway?" n || return 0
+  else
+    ask_yn "Do this step now?" y || { warn "Skipped. Later steps may need it."; return 0; }
+  fi
+  while true; do
+    if ( with_lock "$@" ); then ok "Finished: $title"; return 0; fi
+    err "That step did not finish. Read the message above."
+    read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} [r]etry, [s]kip, or [q]uit? " a || a=s
+    case "${a,,}" in
+      r|retry) ;;
+      q|quit)  exit 0 ;;
+      *)       warn "Skipped. You can run it later from the menu."; return 0 ;;
+    esac
+  done
+}
+
+g_done_attest()  { [[ -n $(attest_fpr) ]]; }
+g_done_sign()    { [[ -s $ATTEST/script.sha256.asc ]]; }
+g_done_ipxe()    { [[ -s $TFTP/ipxe.efi ]]; }
+g_done_fetch()   { iso_is_verified; }
+g_done_extract() { [[ -f $LAYOUT ]]; }
+
+guided_ipxe() {
+  local host_cpu want c dir
+  gstep_head "Get the network-boot loader (iPXE)" \
+    "iPXE is the tiny program the PC runs first. It is built with YOUR key inside," \
+    "so it only boots files you signed."
+  if g_done_ipxe; then ok "Already done."; ask_yn "Do it again anyway?" n || return 0; fi
+  host_cpu=$(uname -m); [[ $host_cpu == aarch64 ]] && host_cpu=arm64
+  if [[ $host_cpu == "$TARGET_ARCH" ]]; then want=1
+    hint "This device matches the PC's CPU ($TARGET_ARCH), so building here works."
+  else want=2
+    hint "This device is $host_cpu but the PC is $TARGET_ARCH. Easiest: build on any x86_64 Linux"
+    hint "computer (see README, 'Building iPXE for a different CPU'), then choose 2."
+  fi
+  say "  1) Build it here (slow on a phone, but automatic)"
+  say "  2) I already built it on another computer: import it"
+  say "  3) Skip for now"
+  read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Choose 1, 2 or 3 [$want]: " c || c=""
+  c=${c:-$want}
+  case "$c" in
+    1) ( build_ipxe ) && ok "iPXE built" || warn "Build did not finish. Run it again from the menu." ;;
+    2) read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Folder holding ipxe.efi and undionly.kpxe: " dir || dir=""
+       ( import_ipxe "$dir" ) && ok "iPXE imported" || warn "Import did not finish. Check the folder and retry from the menu." ;;
+    *) warn "Skipped. configure will stop until iPXE is in place." ;;
+  esac
+}
+
+# ---- offsite backup wizard ---------------------------------------------------
+save_setting() {   # NAME value -> $STATE/backup.conf (plain text, mode 600)
+  local name=$1 val=$2 f="$STATE/backup.conf" tmp
+  [[ $val != *\'* && $val != *$'\n'* ]] || { warn "Not saving $name: unsupported character in the value"; return 1; }
+  mkdir -p "$STATE"
+  tmp=$(mktemp "$STATE/.conf.XXXXXX")
+  { [[ -f $f ]] && grep -v "^$name=" "$f" || true; printf "%s='%s'\n" "$name" "$val"; } > "$tmp"
+  chmod 600 "$tmp"; mv -f "$tmp" "$f"
+  printf -v "$name" '%s' "$val"
+}
+
+offsite_wizard() {
+  local pf r remotes pick cf
+  printf '\n%s== Offsite backups: Google One (Drive) and/or Terabox ==%s\n' "${C_BOLD}${C_CYAN}" "$C_RESET"
+  say "Every backup is already saved on this device. This adds a second, encrypted copy"
+  say "in the cloud, so losing the phone does not lose your keys. Totally optional."
+  hint "Your files are locked with a passphrase BEFORE they leave the device."
+  ask_yn "Set up cloud copies now?" y || { info "No problem. Run this again from the menu any time."; return 0; }
+
+  # 1. passphrase
+  pf=${BACKUP_GPG_PASSFILE:-$HOME/.netboot-backup-pass}
+  if [[ -s $pf ]]; then
+    ok "Passphrase file found: $pf"
+  else
+    say ""
+    say "${C_BOLD}Passphrase.${C_RESET} I will make a long random one and keep it in a private file."
+    warn "WRITE IT DOWN somewhere safe (a password manager). Without it the cloud copies cannot be opened."
+    if ask_yn "Create it now?" y; then
+      ( umask 077; head -c 32 /dev/urandom | base64 | tr -d '\n=' > "$pf" ) || { err "Could not write $pf"; return 1; }
+      chmod 600 "$pf"
+      box "YOUR BACKUP PASSPHRASE (save it now)" "" "$(cat "$pf")" ""
+      read -r -p "Press Enter once you have saved it... " _ || true
+    else
+      warn "Without a passphrase nothing is uploaded. Local backups still work."
+      return 0
+    fi
+  fi
+  save_setting BACKUP_GPG_PASSFILE "$pf"
+
+  # 2. Google Drive
+  say ""
+  say "${C_BOLD}Google One storage${C_RESET} (this is your Google Drive space; uses the official rclone tool)."
+  if ask_yn "Use Google One / Drive?" y; then
+    if ! command -v rclone >/dev/null 2>&1; then
+      if (( IS_TERMUX )); then
+        ask_yn "rclone is not installed. Install it now (pkg install rclone)?" y && { pkg install -y rclone || warn "Install failed"; }
+      else
+        warn "rclone is not installed. Install it with your package manager, then run this again."
+      fi
+    fi
+    if command -v rclone >/dev/null 2>&1; then
+      remotes=$(rclone listremotes 2>/dev/null || true)
+      if [[ -z $remotes ]]; then
+        say "No cloud account is linked yet. Next I will open rclone's setup:"
+        hint "Choose: n (new remote) > name it gdrive > type: drive > scope: drive.file > accept the defaults."
+        hint "No browser on this device? Answer 'n' to auto config and follow its instructions."
+        ask_yn "Open rclone setup now?" y && rclone config
+        remotes=$(rclone listremotes 2>/dev/null || true)
+      fi
+      if [[ -n $remotes ]]; then
+        say "Linked accounts:"; printf '  %s\n' $remotes
+        read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Which one? (name with the colon, e.g. gdrive:) " pick || pick=""
+        if grep -qxF "$pick" <<<"$remotes"; then
+          save_setting GDRIVE_REMOTE "${pick}netboot-backups" && ok "Google Drive will receive backups in the folder netboot-backups"
+        else
+          warn "Not a linked account. Skipping Google Drive."
+        fi
+      fi
+    fi
+  fi
+
+  # 3. Terabox
+  say ""
+  say "${C_BOLD}Terabox${C_RESET} (unofficial open-source tool; logs in with your 'ndus' cookie, like a password)."
+  if ask_yn "Use Terabox?" n; then
+    if [[ ! -x ${TBC_BIN:-$SRC_DIR/tbc-bin} ]]; then
+      if command -v go >/dev/null 2>&1; then
+        ask_yn "Build the Terabox tool now (pinned version)?" y && { ( terabox_install ) || warn "Build failed"; }
+      else
+        warn "Go 1.24+ is needed to build it. Install Go, then run this again."
+      fi
+    fi
+    cf=${TERABOX_COOKIE_FILE:-$HOME/.terabox-cookie}
+    if [[ ! -s $cf ]]; then
+      say "Log in at terabox.com in a browser, open developer tools > Storage/Cookies, copy the value of 'ndus'."
+      read -r -s -p "${C_BOLD}${C_BLUE}?${C_RESET} Paste it here (hidden), or press Enter to skip: " r || r=""; echo
+      if [[ -n $r ]]; then ( umask 077; printf 'ndus=%s\n' "${r#ndus=}" > "$cf" ); chmod 600 "$cf"; ok "Saved to $cf"; fi
+    fi
+    if [[ -s $cf && -x ${TBC_BIN:-$SRC_DIR/tbc-bin} ]]; then
+      save_setting TERABOX_COOKIE_FILE "$cf" && ok "Terabox will receive backups in /netboot-backups"
+    else
+      warn "Terabox is not fully set up, so it is skipped."
+    fi
+  fi
+
+  # 4. test
+  say ""
+  if ask_yn "Run a test backup now to try it out?" y; then
+    ( backup_create test ) || warn "The test did not finish. Your settings are saved; fix the issue and test again from the menu."
+  fi
+  ok "Settings saved in $STATE/backup.conf. serve and clean will use them automatically."
+}
+
+guided() {
+  [[ -t 0 ]] || die "Guided mode needs a terminal. Run it directly in Termux or a shell."
+  clear 2>/dev/null || true
+  printf '\n'
+  box \
+    "WELCOME. I will walk you through, one small step at a time." \
+    "" \
+    "- Every step says what it does, in plain words." \
+    "- Press Enter to accept the suggested answer (shown in capitals)." \
+    "- Type q at any question to stop safely." \
+    "- Nothing is deleted. A backup of your working folder is taken" \
+    "  before the server starts."
+  say ""
+  ask_yn "Ready to begin?" y || { info "OK. Come back any time."; return 0; }
+
+  gstep_head "Choose what to boot and how it connects" \
+    "Now: $P_LABEL on a $TARGET_ARCH PC, network mode '$DHCP_MODE'."
+  if ask_yn "Change that?" n; then choose_target; choose_mode; set_distro; fi
+
+  guided_run "Check this device" \
+    "Looks for root, tools, free space and network. Safe: it only reads things." "" check
+  guided_run "Install the tools needed" \
+    "Installs packages such as dnsmasq, python, gpg. Needs internet." "" deps
+  guided_run "Create your private keys" \
+    "Makes a signing key and a small certificate authority that live only on this device." g_done_attest attest_init
+  guided_run "Sign this script" \
+    "Records the script's fingerprint so any later tampering is noticed." g_done_sign self_sign
+  guided_run "Check the download servers" \
+    "Confirms each vendor's server identity against public logs before trusting it." "" pins_refresh
+  guided_ipxe
+  guided_run "Download and verify the Linux image" \
+    "Downloads $P_LABEL and checks the vendor's signature. Large download: use Wi-Fi." g_done_fetch fetch
+  guided_run "Unpack the boot files" \
+    "Pulls the kernel and files the PC needs out of the image." g_done_extract extract
+  guided_run "Sign and prepare everything" \
+    "Signs the boot files with your key and writes the server settings for your current network." "" configure
+
+  gstep_head "Cloud backups (optional)" \
+    "Adds an encrypted offsite copy of your keys and settings to Google One and/or Terabox."
+  offsite_wizard
+
+  guided_run "Write the signed report" \
+    "A signed record of everything above that you can re-check later." "" attest_report
+
+  gstep_head "Start the boot server" \
+    "Plug the PC into the same network (or cable), set it to network (PXE) boot," \
+    "Secure Boot off, then power it on. Press Ctrl+C here to stop the server."
+  hint "A backup of your working folder is taken first, automatically."
+  if ask_yn "Start the server now?" y; then
+    run_step serve
+  else
+    info "Whenever you are ready, choose 'Start the PXE server' in the menu."
+  fi
+}
+
+# =============================================================================
 # Interactive mode
 # =============================================================================
 run_step() {
-  if ( "$@" ); then echo; ok "Step complete"; else echo; warn "Step did not finish. Read the messages above, fix the issue, and retry."; fi
+  if ( with_lock "$@" ); then echo; ok "Step complete"; else echo; warn "Step did not finish. Read the messages above, fix the issue, and retry."; fi
   echo
 }
 
@@ -2263,9 +3543,18 @@ choose_mode() {
 
 interactive() {
   banner
-  info "Order: check, deps, attest-init, self-sign, pins refresh, build-ipxe, fetch, extract, configure, attest, serve."
-  echo
+  if [[ -z $(attest_fpr) ]]; then
+    printf '%sFirst time here? Choose 1: the guided setup does everything for you.%s\n\n' "$C_YELLOW" "$C_RESET"
+  fi
   local options=(
+    "GUIDED SETUP: walk me through everything (start here)"
+    "GO: fix small problems, then start the server"
+    "Status: is everything ready?"
+    "Heal: find and fix problems"
+    "Start the PXE server"
+    "Set up cloud backups (Google One / Terabox)"
+    "Back up the working folder now"
+    "Restore the working folder from a backup"
     "Pre-flight check"
     "Install dependencies"
     "Create attestation identity"
@@ -2277,7 +3566,6 @@ interactive() {
     "Extract boot files"
     "Configure (sign boot files, write dnsmasq)"
     "Write signed attestation report"
-    "Start the PXE server"
     "Change target"
     "Change network mode"
     "Show fingerprints for external comparison"
@@ -2289,33 +3577,40 @@ interactive() {
     "Quit"
   )
   local choice dir
-  PS3="Choose a step: "
+  PS3="Choose a number: "
   select choice in "${options[@]}"; do
-    case "$REPLY" in
-      1)  run_step check ;;
-      2)  run_step deps ;;
-      3)  run_step attest_init ;;
-      4)  run_step self_sign ;;
-      5)  run_step pins_refresh ;;
-      6)  run_step build_ipxe ;;
-      7)  read -r -p "Directory holding the iPXE binaries: " dir; run_step import_ipxe "$dir" ;;
-      8)  run_step fetch ;;
-      9)  run_step extract ;;
-      10) run_step configure ;;
-      11) run_step attest_report ;;
-      12) run_step serve ;;
-      13) choose_target ;;
-      14) choose_mode ;;
-      15) show_fingerprints ;;
-      16) run_step verify_attest ;;
-      17) tail -n 50 "$HTTP_LOG" 2>/dev/null || warn "No log yet" ;;
-      18) run_step clean ;;
-      19) run_step verify_upstream ;;
-      20) usage; echo ;;
-      21) break ;;
-      *)  warn "Enter a number from 1 to 21" ;;
+    case "$choice" in
+      GUIDED*)                      guided ;;
+      "GO:"*)                       run_step go_cmd ;;
+      "Status:"*)                   status || true ;;
+      "Heal:"*)                     run_step heal ;;
+      "Start the PXE server")       run_step serve ;;
+      "Set up cloud backups"*)      offsite_wizard ;;
+      "Back up the working"*)       run_step backup_create manual ;;
+      "Restore the working"*)       backup_list; read -r -p "Archive to restore: " dir; run_step restore "$dir" ;;
+      "Pre-flight check")           run_step check ;;
+      "Install dependencies")       run_step deps ;;
+      "Create attestation"*)        run_step attest_init ;;
+      "Self-sign"*)                 run_step self_sign ;;
+      "Refresh certificate"*)       run_step pins_refresh ;;
+      "Build iPXE"*)                run_step build_ipxe ;;
+      "Import iPXE"*)               read -r -p "Directory holding the iPXE binaries: " dir; run_step import_ipxe "$dir" ;;
+      "Download and verify"*)       run_step fetch ;;
+      "Extract boot files")         run_step extract ;;
+      "Configure"*)                 run_step configure ;;
+      "Write signed"*)              run_step attest_report ;;
+      "Change target")              choose_target ;;
+      "Change network mode")        choose_mode ;;
+      "Show fingerprints"*)         show_fingerprints ;;
+      "Verify latest"*)             run_step verify_attest ;;
+      "Show HTTP log"*)             tail -n 50 "$HTTP_LOG" 2>/dev/null || warn "No log yet" ;;
+      "Clean up")                   run_step clean ;;
+      "Verify this script"*)        run_step verify_upstream ;;
+      "Help")                       usage; echo ;;
+      "Quit")                       break ;;
+      *)                            warn "Enter a number from 1 to ${#options[@]}" ;;
     esac
-    PS3="Choose a step: "
+    PS3="Choose a number: "
   done
   ok "Goodbye"
 }
@@ -2338,7 +3633,14 @@ FIRST RUN, IN ORDER
   fetch, extract, configure, attest, serve
 
 COMMANDS
-  ui, interactive       Guided menu
+  go                    Heal, check, and start serving with your last settings (daily/emergency)
+  status                One-screen health report: what is ready, what needs attention
+  heal                  Fix safe problems automatically (stale locks, leftovers, address change)
+  doctor                Same report as status, with the exact fix command for each problem
+  verify [deep]         Re-check served files now (deep = full re-hash of everything)
+  guide                 Step-by-step guided setup (best for first time)
+  ui, interactive       Menu of every step (no arguments does this too)
+  backup-setup          Guided setup of Google One / Terabox cloud backups
   check                 Pre-flight: root, tools, ports 67/69/4011/$HTTP_PORT, storage,
                         network, pins, attestation, artifacts
   deps                  Install packages (Termux pkg, apt, dnf, pacman, or apk)
@@ -2361,11 +3663,16 @@ COMMANDS
   configure             Sign boot files, write boot.ipxe, dnsmasq.conf, and the manifest
   attest                Write a signed attestation report (also served to clients)
   verify-attest [FILE]  Check a report's signature and re-hash every listed file
-  serve                 Integrity gate, then HTTP + dnsmasq (DHCP/TFTP) as root
+  backup                Archive the working folder (SHA-256 sidecar) into $BACKUP_DIR
+  terabox-install       Build the unofficial Terabox CLI (fcr--/tbc, pinned) for offsite backups
+  backup-list           List backups, newest first
+  restore ARCHIVE       Verify a backup, save the current state, then restore it
+                        (add --dry-run to only list what would be replaced)
+  serve                 Backs up the working folder, integrity gate, then HTTP + dnsmasq (DHCP/TFTP) as root
   logs                  Follow the HTTP access log
   selinux {status|permissive|enforcing}
                         Android only. Permissive lowers device security.
-  clean                 Stop servers and remove generated files (keeps ISOs, keys, pins)
+  clean                 Back up, stop servers, remove generated files (keeps ISOs, keys, pins)
   all                   deps, attest-init, self-sign, pins refresh, build-ipxe, fetch,
                         extract, configure, attest, serve
 
@@ -2397,7 +3704,9 @@ ENVIRONMENT VARIABLES
   KEY_FPR               Override the vendor signing key fingerprint
   BOOT_ARGS             Replace kernel arguments. Placeholders: @BASE@ @ROOTFS@ @BASEDIR@ @ISO@
   VERIFIED_BOOT         1 (default): signed boot chain. 0: unsigned (stock iPXE)
-  DEEP_VERIFY           1 (default): full re-hash before serving. 0: hash files under 512 MB
+  DEEP_VERIFY           auto (default): small files fully hashed, big ones by signed fingerprint,
+                        then a low-priority full re-hash runs while serving. 1/full: re-hash
+                        everything first. 0: hash only files under 512 MB
   INCLUDE_UCODE         1 (default): load CPU microcode for Arch and SystemRescue
   IPXE_COMMIT           iPXE commit to build                      (default: $DEFAULT_IPXE_COMMIT)
   IPXE_CROSS            Cross-compiler prefix, e.g. x86_64-linux-gnu-
@@ -2409,6 +3718,15 @@ ENVIRONMENT VARIABLES
   ALLOW_UNPINNED=1      Fetch transport-trusted content without a pin (not recommended)
   ALLOW_UNVERIFIED=1    Accept an ISO with no verified signature (not recommended)
   ACCEPT_SCRIPT_CHANGE=1  Run even though the script changed since self-sign
+  AUTO_BACKUP           1 (default): back up before serve and clean. 0: skip
+  BACKUP_DIR            Where backups go                          (default: ~/netboot-backups)
+  BACKUP_KEEP           Newest backups kept                       (default: 5)
+  BACKUP_DL             1: include downloads/ (ISOs) in backups   (default: 0)
+  BACKUP_UPLOAD_CMD     Offsite hook, run as: CMD FILE.gpg after each backup
+  BACKUP_GPG_PASSFILE   Passphrase file; the archive is AES256-encrypted before upload
+  TERABOX_COOKIE_FILE   File with your Terabox ndus cookie (or export TERABOX_COOKIE)
+  TERABOX_DIR           Remote Terabox folder                     (default: /netboot-backups)
+  GDRIVE_REMOTE         rclone Drive remote:folder for Google One storage (needs rclone)
   UPSTREAM_REPO         Repo for verify-upstream    (default: $DEFAULT_UPSTREAM_REPO)
   UPSTREAM_BRANCH       Branch for verify-upstream                (default: main)
   EXPECT_CODE           Release code you recorded; verify-upstream must match it
@@ -2438,14 +3756,15 @@ parse_args() {
   while (( $# )); do
     case "$1" in
       -h|--help)  usage; exit 0 ;;
-      --distro)   [[ $# -ge 2 ]] || die "--distro requires a value"; DISTRO="$2"; shift ;;
-      --distro=*) DISTRO="${1#*=}" ;;
-      --arch)     [[ $# -ge 2 ]] || die "--arch requires a value"; TARGET_ARCH="$2"; shift ;;
-      --arch=*)   TARGET_ARCH="${1#*=}" ;;
-      --mode)     [[ $# -ge 2 ]] || die "--mode requires a value"; DHCP_MODE="$2"; shift ;;
-      --mode=*)   DHCP_MODE="${1#*=}" ;;
-      --iface)    [[ $# -ge 2 ]] || die "--iface requires a value"; IFACE="$2"; shift ;;
-      --iface=*)  IFACE="${1#*=}" ;;
+      --dry-run)  DRY_RUN=1 ;;
+      --distro)   [[ $# -ge 2 ]] || die "--distro requires a value"; DISTRO="$2"; CLI_SET+=" DISTRO"; shift ;;
+      --distro=*) DISTRO="${1#*=}"; CLI_SET+=" DISTRO" ;;
+      --arch)     [[ $# -ge 2 ]] || die "--arch requires a value"; TARGET_ARCH="$2"; CLI_SET+=" TARGET_ARCH"; shift ;;
+      --arch=*)   TARGET_ARCH="${1#*=}"; CLI_SET+=" TARGET_ARCH" ;;
+      --mode)     [[ $# -ge 2 ]] || die "--mode requires a value"; DHCP_MODE="$2"; CLI_SET+=" DHCP_MODE"; shift ;;
+      --mode=*)   DHCP_MODE="${1#*=}"; CLI_SET+=" DHCP_MODE" ;;
+      --iface)    [[ $# -ge 2 ]] || die "--iface requires a value"; IFACE="$2"; CLI_SET+=" IFACE"; shift ;;
+      --iface=*)  IFACE="${1#*=}"; CLI_SET+=" IFACE" ;;
       -*)         die "Unknown option: $1 (try --help)" ;;
       *)          if [[ -z $COMMAND ]]; then COMMAND="$1"; else POSITIONAL+=("$1"); fi ;;
     esac
@@ -2453,17 +3772,33 @@ parse_args() {
   done
 }
 
+if [[ ${NETBOOT_SOURCE_ONLY:-0} == 1 ]]; then return 0; fi   # lets tests source the functions
 parse_args "$@"
 COMMAND="${COMMAND:-ui}"
 set_distro
+case "$COMMAND" in
+  help|fingerprints|release-stamp|verify-upstream) ;;
+  *) guard_root; log_rotate ;;
+esac
+case "$COMMAND" in
+  deps|attest-init|self-sign|pins|build-ipxe|import-ipxe|fetch|extract|configure|attest|serve|clean|backup|restore|terabox-install|all)
+    acquire_lock ;;
+esac
 
 case "$COMMAND" in
-  help|attest-init|self-sign|fingerprints|deps|release-stamp|verify-upstream) ;;
+  help|attest-init|self-sign|fingerprints|deps|release-stamp|verify-upstream|status|doctor) ;;
   *) self_check ;;
 esac
 
 case "$COMMAND" in
   ui|interactive) interactive ;;
+  guide|guided)   guided ;;
+  go)             acquire_lock; go_cmd ;;
+  status)         status || exit 1 ;;
+  doctor)         doctor || exit 1 ;;
+  heal)           acquire_lock; heal || exit 1 ;;
+  verify)         resolve_network; load_layout; if [[ ${POSITIONAL[0]:-} == deep ]]; then DEEP_VERIFY=1; fi; verify_manifest ;;
+  backup-setup)   offsite_wizard ;;
   help)           usage ;;
   check)          check ;;
   deps)           deps ;;
@@ -2486,6 +3821,10 @@ case "$COMMAND" in
   configure)      configure ;;
   attest)         resolve_network; attest_report ;;
   verify-attest)  verify_attest "${POSITIONAL[0]:-}" ;;
+  backup)         backup_create manual ;;
+  backup-list)    backup_list ;;
+  terabox-install) terabox_install ;;
+  restore)        restore "${POSITIONAL[0]:-}" ;;
   serve)          serve ;;
   logs)           logs ;;
   selinux)        selinux_ctl "${POSITIONAL[0]:-status}" ;;
