@@ -169,6 +169,8 @@ U_MIN_FREE_MB="${MIN_FREE_MB:-}"
 
 # Runtime state
 SERVE_HTTP_PID=""
+DNS_WRAP_PID=""
+DNS_LOG=""
 DIRECT_ADDED=0
 JID_DIRECT=""
 JID_POWER=""
@@ -674,24 +676,169 @@ for key, (until, issuer) in sorted(pins.items(), key=lambda kv: kv[1][0], revers
 PYEOF
 
   cat > "$LIB/httpd.py" <<'PYEOF'
+import logging
+import logging.handlers
+import mimetypes
+import os
+import re
+import signal
+import socket
+import stat
 import sys
-from functools import partial
-from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote, urlsplit
 
-class Handler(SimpleHTTPRequestHandler):
-    def list_directory(self, path):
-        self.send_error(403, "Directory listing disabled")
-        return None
+bind, port, root = sys.argv[1], int(sys.argv[2]), os.path.realpath(sys.argv[3])
+allow = {os.path.realpath(p) for p in os.environ.get("HTTPD_ALLOW", "").split(os.pathsep) if p}
+max_conn = int(os.environ.get("HTTPD_MAX_CONN", "16"))
+log_path = os.environ.get("HTTPD_LOG")
+
+log = logging.getLogger("httpd")
+log.setLevel(logging.INFO)
+handler = (logging.handlers.RotatingFileHandler(log_path, maxBytes=1 << 20, backupCount=3)
+           if log_path else logging.StreamHandler(sys.stderr))
+handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%dT%H:%M:%S"))
+log.addHandler(handler)
+
+slots = threading.BoundedSemaphore(max_conn)
+stats_lock = threading.Lock()
+stats = {"requests": 0, "bytes": 0}
+RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "netboot-android"
+    timeout = 60
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("%s - [%s] %s\n" % (self.client_address[0],
-                         self.log_date_time_string(), fmt % args))
-        sys.stderr.flush()
+        pass
 
-bind, port, directory = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-ThreadingHTTPServer.daemon_threads = True
-ThreadingHTTPServer.allow_reuse_address = True
-server = ThreadingHTTPServer((bind, port), partial(Handler, directory=directory))
+    def _finish(self, status, sent, started):
+        log.info("%s %s %s %d %d %.2fs", self.client_address[0], self.command,
+                 self.path, status, sent, time.time() - started)
+        with stats_lock:
+            stats["requests"] += 1
+            stats["bytes"] += sent
+
+    def _simple(self, code, text, extra=None):
+        body = (text + "\n").encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        for key, value in (extra or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+        self.close_connection = True
+        return code
+
+    def _resolve(self):
+        path = unquote(urlsplit(self.path).path)
+        if "\x00" in path:
+            return None
+        fs = os.path.realpath(os.path.join(root, path.lstrip("/")))
+        if fs == root or fs.startswith(root + os.sep) or fs in allow:
+            return fs
+        return None
+
+    def _serve(self):
+        started = time.time()
+        if urlsplit(self.path).path == "/healthz":
+            with stats_lock:
+                text = "ok requests=%d bytes=%d" % (stats["requests"], stats["bytes"])
+            self._simple(200, text)
+            return
+        if not slots.acquire(blocking=False):
+            self._finish(self._simple(503, "busy, retry shortly", {"Retry-After": "2"}), 0, started)
+            return
+        try:
+            fs = self._resolve()
+            if fs is None:
+                self._finish(self._simple(403, "forbidden"), 0, started)
+                return
+            try:
+                f = open(fs, "rb")
+                st = os.fstat(f.fileno())
+            except OSError:
+                self._finish(self._simple(404, "not found"), 0, started)
+                return
+            with f:
+                if not stat.S_ISREG(st.st_mode):
+                    self._finish(self._simple(404, "not found"), 0, started)
+                    return
+                size = st.st_size
+                start, end, status = 0, size - 1, 200
+                match = RANGE_RE.match(self.headers.get("Range", "").strip())
+                if match and (match.group(1) or match.group(2)):
+                    first, last = match.groups()
+                    if first == "":
+                        count = int(last)
+                        start = max(size - count, 0)
+                        end = size - 1
+                        bad = count == 0
+                    else:
+                        start = int(first)
+                        end = min(int(last), size - 1) if last else size - 1
+                        bad = start >= size or start > end
+                    if bad:
+                        self._finish(self._simple(416, "range not satisfiable",
+                                                  {"Content-Range": "bytes */%d" % size}), 0, started)
+                        return
+                    status = 206
+                length = max(end - start + 1, 0)
+                ctype = "text/plain" if fs.endswith(".ipxe") else (
+                    mimetypes.guess_type(fs)[0] or "application/octet-stream")
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(length))
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Last-Modified", self.date_time_string(st.st_mtime))
+                if status == 206:
+                    self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                sent = 0
+                if self.command != "HEAD" and length > 0:
+                    try:
+                        sent = self.connection.sendfile(f, start, length)
+                    except (OSError, socket.timeout):
+                        sent = 0
+                self.close_connection = True
+                self._finish(status, sent, started)
+        finally:
+            slots.release()
+
+    do_GET = _serve
+    do_HEAD = _serve
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 64
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, socket.timeout)):
+            return
+        log.exception("error handling %s", client_address)
+
+
+server = Server((bind, port), Handler)
+
+
+def stop(*_):
+    threading.Thread(target=server.shutdown, daemon=True).start()
+
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+log.info("listening on %s:%d root=%s max_conn=%d", bind, port, root, max_conn)
 server.serve_forever()
 PYEOF
 
@@ -2553,12 +2700,10 @@ serve() {
   power_save_off
 
   mkdir -p "$RUN"
-  info "Starting the HTTP server on $PHONE_IP:$HTTP_PORT (log: $HTTP_LOG)"
+  DNS_LOG="$ROOT/dnsmasq.log"
   printf '\n--- server start %s ---\n' "$(now_iso)" >> "$HTTP_LOG"
-  "$PYTHON" "$LIB/httpd.py" "$PHONE_IP" "$HTTP_PORT" "$HTTP" >> "$HTTP_LOG" 2>&1 &
-  SERVE_HTTP_PID=$!
-  sleep 1
-  kill -0 "$SERVE_HTTP_PID" 2>/dev/null || die "HTTP server failed to start. See $HTTP_LOG"
+  info "Starting the HTTP server on $PHONE_IP:$HTTP_PORT (log: $HTTP_LOG)"
+  start_http || die "$E_ENV" "HTTP server failed to start. See $HTTP_LOG.err"
 
   local vb_text="ON (signed, client verifies)"
   [[ $VERIFIED_BOOT == 1 ]] || vb_text="OFF"
@@ -2574,6 +2719,7 @@ serve() {
     "Client URL     : $BASE_URL" \
     "Verified boot  : $vb_text" \
     "" \
+    "Watching itself: restarts a crashed server, follows an address change" \
     "Live HTTP log  : $0 logs" \
     "Press Ctrl+C to stop."
   echo
@@ -2585,11 +2731,138 @@ serve() {
   fi
 
   info "Starting dnsmasq ($MODE DHCP + TFTP) as root"
+  start_dns
+  sleep 1
+  dns_alive || die "$E_ENV" "dnsmasq exited. If it could not bind a port, check: $0 selinux status, and whether a hotspot or another DHCP/TFTP service holds ports 67/69."
+  protect_pid "$(run_root "cat '$RUN/dnsmasq.pid'" 2>/dev/null || true)"
+  ok "Ready. Boot the PC from the network now."
+  watchdog || true
+  serve_epilogue
+}
+
+# ---- server processes, supervised by watchdog() ------------------------------------
+start_http() {
+  HTTPD_LOG="$HTTP_LOG" HTTPD_ALLOW="$ISO" "$PYTHON" "$LIB/httpd.py" "$PHONE_IP" "$HTTP_PORT" "$HTTP" >> "$HTTP_LOG.err" 2>&1 &
+  SERVE_HTTP_PID=$!
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.3
+    kill -0 "$SERVE_HTTP_PID" 2>/dev/null || return 1
+    http_health && { protect_pid "$SERVE_HTTP_PID"; return 0; }
+  done
+  kill -0 "$SERVE_HTTP_PID" 2>/dev/null
+}
+
+http_health() { curl -fsS -m 2 -o /dev/null "http://$PHONE_IP:$HTTP_PORT/healthz" 2>/dev/null; }
+http_stats()  { curl -fsS -m 2 "http://$PHONE_IP:$HTTP_PORT/healthz" 2>/dev/null || true; }
+
+start_dns() {
   local ldp=""
   (( IS_TERMUX )) && ldp="LD_LIBRARY_PATH=$PREFIX/lib "
-  run_root "${ldp}$DNSMASQ --no-daemon --conf-file=$DNSMASQ_CONF" \
-    || [[ -f $RUN/DEEP_FAIL ]] || die "dnsmasq exited. If it could not bind a port, check: $0 selinux status, and whether a hotspot or another DHCP/TFTP service holds ports 67/69."
-  serve_epilogue
+  { run_root "${ldp}$DNSMASQ --no-daemon --conf-file=$DNSMASQ_CONF" || true; } > >(tee -a "$DNS_LOG") 2>&1 &
+  DNS_WRAP_PID=$!
+}
+
+dns_alive() {
+  run_root "p=\$(cat '$RUN/dnsmasq.pid' 2>/dev/null); [ -n \"\$p\" ] && kill -0 \"\$p\" 2>/dev/null" >/dev/null 2>&1
+}
+
+stop_dns() {
+  run_root "kill \$(cat '$RUN/dnsmasq.pid' 2>/dev/null) 2>/dev/null; rm -f '$RUN/dnsmasq.pid'; pkill -f '$DNSMASQ_CONF' 2>/dev/null; true" >/dev/null 2>&1 || true
+}
+
+# Android's low-memory killer kills the least important apps first; make ours important.
+protect_pid() {
+  (( IS_ANDROID )) || return 0
+  [[ ${1:-} =~ ^[0-9]+$ ]] || return 0
+  run_root "echo -500 > /proc/$1/oom_score_adj" >/dev/null 2>&1 || true
+}
+
+WD_TIMES=()
+wd_budget() {   # at most 5 restarts per 5 minutes; backs off a little each time
+  local now t keep=()
+  now=$(date +%s)
+  for t in "${WD_TIMES[@]}"; do (( now - t < 300 )) && keep+=("$t"); done
+  WD_TIMES=("${keep[@]}")
+  (( ${#WD_TIMES[@]} < 5 )) || return 1
+  sleep $(( ${#WD_TIMES[@]} * 2 ))
+  WD_TIMES+=("$now")
+  return 0
+}
+
+wd_restart() {   # http | dns
+  if [[ -f $RUN/DEEP_FAIL ]]; then return 0; fi
+  if ! wd_budget; then
+    err "The $1 server keeps crashing (5 restarts in 5 minutes). Stopping so you can look. Log: $LOG_FILE"
+    log_event ERROR "watchdog gave up on $1"
+    return 1
+  fi
+  case "$1" in
+    http) kill "$SERVE_HTTP_PID" 2>/dev/null || true
+          if start_http; then ok "HTTP server restarted"; log_event WARN "watchdog restarted http"; else warn "HTTP restart failed; will retry"; fi ;;
+    dns)  stop_dns; start_dns; sleep 1
+          if dns_alive; then ok "dnsmasq restarted"; log_event WARN "watchdog restarted dnsmasq"; protect_pid "$(run_root "cat '$RUN/dnsmasq.pid'" 2>/dev/null || true)"; else warn "dnsmasq restart failed; will retry"; fi ;;
+  esac
+  return 0
+}
+
+NET_LOST=0
+net_check() {
+  local cur
+  cur=$( ( LOG_QUIET=1; resolve_network >/dev/null 2>&1 && printf '%s %s' "$IFACE" "$PHONE_IP" ) 2>/dev/null || true )
+  if [[ -z $cur ]]; then
+    (( NET_LOST )) || warn "Network lost on $IFACE. The servers stay up and will carry on when it returns."
+    NET_LOST=1; return 0
+  fi
+  NET_LOST=0
+  [[ ${cur#* } != "$PHONE_IP" ]] || return 0
+  warn "Phone address changed ($PHONE_IP -> ${cur#* }). Re-signing boot files and restarting the servers."
+  log_event WARN "address change $PHONE_IP -> ${cur#* }"
+  resolve_network
+  if ( configure ) >/dev/null 2>&1; then
+    kill "$SERVE_HTTP_PID" 2>/dev/null || true; stop_dns
+    start_http && start_dns
+    sleep 1
+    if dns_alive; then ok "Serving again on $PHONE_IP"; else warn "Servers did not come back; the watchdog will retry."; fi
+  else
+    err "Could not update the boot files for the new address. Run: $0 heal"
+  fi
+}
+
+LAST_REQ=-1
+show_activity() {
+  local st req bytes
+  st=$(http_stats)
+  [[ $st =~ requests=([0-9]+)\ bytes=([0-9]+) ]] || return 0
+  req=${BASH_REMATCH[1]}; bytes=${BASH_REMATCH[2]}
+  if [[ $req != "$LAST_REQ" ]]; then
+    LAST_REQ=$req
+    printf '%s[%s]%s %s requests served, %s MB sent\n' "$C_DIM" "$(date +%H:%M:%S)" "$C_RESET" "$req" "$((bytes/1048576))"
+  fi
+  if [[ -f $DNS_LOG ]] && (( $(file_size "$DNS_LOG") > 5242880 )); then : > "$DNS_LOG"; fi
+}
+
+watchdog() {
+  local tick=0 bad=0
+  while :; do
+    sleep 2 & wait $! || true
+    tick=$((tick+2))
+    if [[ -f $RUN/DEEP_FAIL ]]; then return 0; fi
+    if ! kill -0 "$SERVE_HTTP_PID" 2>/dev/null; then
+      warn "HTTP server stopped unexpectedly"; wd_restart http || return 1
+    elif (( tick % 6 == 0 )); then
+      if http_health; then bad=0
+      else
+        bad=$((bad+1))
+        if (( bad >= 3 )); then warn "HTTP server is not answering"; bad=0; wd_restart http || return 1; fi
+      fi
+    fi
+    if (( tick % 4 == 0 )) && ! dns_alive && [[ ! -f $RUN/DEEP_FAIL ]]; then
+      warn "dnsmasq stopped unexpectedly"; wd_restart dns || return 1
+    fi
+    if (( tick % 6 == 0 )); then net_check; fi
+    if (( tick % 10 == 0 )); then show_activity; fi
+  done
 }
 
 serve_epilogue() {
