@@ -1734,7 +1734,7 @@ build_ipxe() {
     x86_64:x86_64|aarch64:arm64|arm64:arm64) native=1 ;;
   esac
   if (( ! native )) && [[ -z $IPXE_CROSS ]]; then
-    die "$E_ENV" "This device is $HOST_ARCH and the target is $TARGET_ARCH, so it cannot compile the loader. Easiest: run  $0 ipxe-cloud  (GitHub builds it free, no other computer). Or build on a $TARGET_ARCH Linux machine and copy it back with: $0 import-ipxe DIR"
+    die "$E_ENV" "This device is $HOST_ARCH and the target is $TARGET_ARCH, so it cannot compile the loader. Build it on a $TARGET_ARCH Linux computer you control and copy it back with: $0 import-ipxe DIR (the guide shows the steps). A weaker-trust cloud route exists: $0 ipxe-cloud"
   fi
 
   git_pin_opts
@@ -1909,6 +1909,17 @@ for rel in json.load(sys.stdin):
 }
 
 ipxe_cloud() {   # the whole thing as one friendly flow
+  echo
+  box \
+    "WEAKER TRUST: READ THIS FIRST" \
+    "" \
+    "The loader decides what your PC will boot. In this route it is" \
+    "compiled by GitHub's servers using a workflow file in your repo." \
+    "Anyone or anything able to change that file or that runner could" \
+    "put extra trust inside it, and this script cannot detect that." \
+    "A loader built on a computer you control does not have this gap."
+  echo
+  ask_yn "Use the cloud build anyway?" n || { info "Good. Build it on a computer you control, then: $0 import-ipxe DIR"; return 0; }
   ipxe_request
   local a
   while :; do
@@ -2533,6 +2544,7 @@ attest_report() {
     echo
     echo "[identity]"
     echo "script_sha256=$(sha256_of "$SELF")"
+    if [[ -f $IPXE_BUILT ]]; then echo "loader_record=$(tr '\n' ' ' < "$IPXE_BUILT" | cut -c1-240)"; fi
     echo "script_signed_sha256=$(awk '{print $1}' "$ATTEST/script.sha256" 2>/dev/null || echo none)"
     echo "attest_key=$(attest_fpr)"
     echo "boot_ca_sha256=$(ca_fpr_hex 2>/dev/null || echo none)"
@@ -3287,7 +3299,10 @@ diagnose() {
       bad)     finding FAIL SELF "Signed script record failed verification (possible tampering)" "$0 fingerprints" ;;
     esac
   fi
-  [[ -s $TFTP/ipxe.efi ]] && finding OK IPXE "iPXE loader present" "" || finding FAIL IPXE "iPXE loader missing (the guide can build it free on GitHub)" "$0 ipxe-cloud"
+  if [[ -s $TFTP/ipxe.efi && -f $IPXE_BUILT ]] && grep -q '^source=cloud' "$IPXE_BUILT"; then
+    finding WARN LOADERTRUST "The iPXE loader was built by GitHub's cloud runner, not on a device you control" "$0 import-ipxe DIR"
+  fi
+  [[ -s $TFTP/ipxe.efi ]] && finding OK IPXE "iPXE loader present" "" || finding FAIL IPXE "iPXE loader missing (build it on a computer you control, then import it)" "$0 build-ipxe"
   iso_is_verified && finding OK ISO "$P_LABEL image verified" "" || finding FAIL ISO "$P_LABEL image not downloaded/verified" "$0 --distro $DISTRO --arch $TARGET_ARCH fetch"
   [[ -f $LAYOUT ]] && finding OK EXTRACT "Boot files extracted" "" || finding FAIL EXTRACT "Boot files not extracted" "$0 --distro $DISTRO --arch $TARGET_ARCH extract"
   if [[ -f $MANIFEST && -f $TFTP/boot.ipxe ]]; then
@@ -3619,31 +3634,52 @@ guided_ipxe() {
   if g_done_ipxe; then ok "Already done."; ask_yn "Do it again anyway?" n || return 0; fi
   host_cpu=$(uname -m); [[ $host_cpu == aarch64 ]] && host_cpu=arm64
   if [[ $host_cpu == "$TARGET_ARCH" ]]; then
-    hint "This device matches the PC's CPU ($TARGET_ARCH), so building here works."
-    say "  1) Build it here (slow on a phone, but automatic)"
-    say "  2) Build it free in the cloud on GitHub"
-    say "  3) I already built it on another computer: import it"
+    hint "This device matches the PC's CPU ($TARGET_ARCH), so building here works and keeps everything on this device."
+    say "  1) Build it here (slow on a phone, but automatic)  ${C_GREEN}recommended${C_RESET}"
+    say "  2) I built it on another computer I control: import it"
+    say "  3) Build it in the cloud on GitHub  ${C_YELLOW}weaker trust, not recommended${C_RESET}"
     say "  4) Skip for now"
     read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Choose 1-4 [1]: " c || c=""
     case "${c:-1}" in
       1) ( build_ipxe ) && ok "iPXE built" || warn "Build did not finish. Run it again from the menu." ;;
-      2) ipxe_cloud ;;
-      3) guided_ipxe_import ;;
+      2) guided_ipxe_import ;;
+      3) ipxe_cloud ;;
       *) warn "Skipped. configure will stop until iPXE is in place." ;;
     esac
   else
     hint "This phone is $host_cpu but the PC is $TARGET_ARCH, so it cannot compile the loader itself."
-    hint "That is fine: GitHub can build it for you in about 5 minutes, free, with no other computer."
-    say "  1) Build it free in the cloud on GitHub (recommended)"
-    say "  2) I already built it on another computer: import it"
+    hint "The loader decides what your PC will boot, so it should be built on a computer YOU control."
+    say "  1) Build it on a $TARGET_ARCH Linux computer I control, then import it  ${C_GREEN}recommended${C_RESET}"
+    say "  2) Build it in the cloud on GitHub  ${C_YELLOW}weaker trust, not recommended${C_RESET}"
     say "  3) Skip for now"
     read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Choose 1, 2 or 3 [1]: " c || c=""
     case "${c:-1}" in
-      1) ipxe_cloud ;;
-      2) guided_ipxe_import ;;
+      1) ipxe_own_machine_help; guided_ipxe_import ;;
+      2) ipxe_cloud ;;
       *) warn "Skipped. configure will stop until iPXE is in place." ;;
     esac
   fi
+}
+
+ipxe_own_machine_help() {
+  echo
+  box \
+    "BUILD THE LOADER ON A COMPUTER YOU CONTROL" \
+    "" \
+    "On any $TARGET_ARCH Linux computer:" \
+    "1. Get this script there (same file as on the phone)." \
+    "2. Copy ONLY your public certificate from the phone:" \
+    "     $ATTEST/ca.crt" \
+    "   (never copy anything else from that folder)" \
+    "3. Check both copies match: run  ./netboot-android.sh fingerprints" \
+    "   on both and compare the lines." \
+    "4. On the computer run:" \
+    "     TRUST_CA=ca.crt ./netboot-android.sh --arch $TARGET_ARCH build-ipxe" \
+    "5. Copy ipxe.efi and undionly.kpxe from its ~/netboot/tftp back to" \
+    "   a folder on this phone."
+  echo
+  hint "Phone to computer tips: termux-setup-storage then copy into ~/storage/downloads, or use scp."
+  read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Press Enter when the two files are on this phone: " _ || true
 }
 
 guided_ipxe_import() {
@@ -4005,7 +4041,7 @@ COMMANDS
   build-ipxe            Build iPXE at IPXE_COMMIT with the boot CA and a
                         verify-first script embedded
   import-ipxe DIR       Use iPXE binaries built on another machine
-  ipxe-cloud            Build the loader free on GitHub (no other computer): request, wait, fetch
+  ipxe-cloud            Build the loader on GitHub instead (WEAKER trust; asks first)
   ipxe-request          Print what to paste into the GitHub build page
   ipxe-fetch            Download, verify, and install the loader GitHub built for you
   fetch                 Download the ISO and verify it against the vendor key

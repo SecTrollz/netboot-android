@@ -119,19 +119,16 @@ Run `./netboot-android.sh guide` (or choose **1, GUIDED SETUP** in `./netboot-an
 
 ---
 
-## Phone and PC have different CPUs? Let GitHub build the loader
+## Phone and PC have different CPUs?
 
-A phone is arm64 and most PCs are x86_64, so the phone cannot compile the network loader (iPXE) for the PC. You do not need another computer:
+A phone is arm64 and most PCs are x86_64, so the phone cannot compile the network loader (iPXE) for the PC. The loader decides what your PC will boot, so it should be built on a computer **you** control. The guide walks you through it:
 
-```sh
-./netboot-android.sh ipxe-cloud
-```
+1. Copy your **public** certificate (`~/netboot/attest/ca.crt`, nothing else from that folder) and this script to any x86_64 Linux computer.
+2. Run `./netboot-android.sh fingerprints` on both and compare the lines, so you know both copies of the script match.
+3. On the computer: `TRUST_CA=ca.crt ./netboot-android.sh --arch x86_64 build-ipxe`
+4. Copy `ipxe.efi` and `undionly.kpxe` back to the phone and run `./netboot-android.sh import-ipxe DIR`.
 
-1. It prints a short page address and copies your **public** certificate for you (the guide does this step too).
-2. On that GitHub page tap **Run workflow**, paste, choose the PC's CPU, and run. It takes about 5 minutes and is free.
-3. Back in the terminal press Enter. The loader is downloaded, its checksum is verified, and it is refused unless it contains **your** certificate.
-
-Honest trust note: this loader is compiled by GitHub's runner from the pinned iPXE commit (the build log is public), not on your own device. If you want the strictest chain, build it yourself on an x86_64 Linux computer (next section) and use `import-ipxe`. Your private key never leaves the phone either way.
+**Weaker option: cloud build.** `./netboot-android.sh ipxe-cloud` has GitHub's servers compile the loader from a workflow file in your repo. It is convenient but it puts GitHub's runner, and anyone who can change that workflow, inside the trust chain, and this script cannot detect extra trust placed inside the binary. It is off by default, asks for an informed yes (`--yes` never opts in), refuses a loader that lacks your certificate, and `status` keeps warning until you replace it with one built on your own computer. If you never want it, delete `.github/workflows/build-ipxe.yml`.
 
 ---
 
@@ -164,7 +161,7 @@ What it does for you while it runs:
 
 Honest limits: the fast check trusts a file's size, time, and inode for a few minutes until the background check finishes, so someone with root who forges those could briefly serve a changed root image (the kernel and initrd are signed and always fully checked). The root image is unsigned on the client for most distros; see the header of the script. Android features (root, `oom_score_adj`, Wi-Fi power mode) can only be proven on a real phone.
 
-Tests: `tests/run.sh` runs 44 checks (fault injection and the easy-mode screens) (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
+Tests: `tests/run.sh` runs 46 checks (fault injection and the easy-mode screens) (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
 
 ---
 

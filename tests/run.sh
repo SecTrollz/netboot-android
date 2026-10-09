@@ -575,7 +575,7 @@ test_workflow_file_is_present_and_safe() {
   assert "does not echo inputs inside run blocks" bash -c '! grep -E "run:|^ +[a-z]" "$1" | grep -E "\\$\\{\\{ *inputs\\." | grep -v "CA_B64\|TARGET:" | grep -q .' _ "$f"
 }
 
-test_guide_defaults_to_cloud_when_cpu_differs() {
+test_guide_recommends_own_machine_when_cpu_differs() {
   cat > "$T/ip.sh" <<EOF
 export NETBOOT_SOURCE_ONLY=1
 source "$SCRIPT"
@@ -583,12 +583,37 @@ TARGET_ARCH=arm64          # this machine is x86_64, so the CPUs differ
 set_distro
 g_done_ipxe() { return 1; }
 ipxe_cloud() { echo "CLOUD-RAN"; }
+ipxe_own_machine_help() { echo "OWN-MACHINE-HELP"; }
+guided_ipxe_import() { echo "IMPORT-ASKED"; }
 guided_ipxe
 EOF
-  pty_run "" bash "$T/ip.sh"
-  assert "recommends the cloud build" grep -q "free in the cloud on GitHub (recommended)" "$T/pty.out"
   python3 -I -c "$PTY_PY" "|" bash "$T/ip.sh" > "$T/pty.out" 2>&1
-  assert "Enter picks the cloud build" grep -q "CLOUD-RAN" "$T/pty.out"
+  assert "labels the cloud route as weaker trust" grep -q "weaker trust, not recommended" "$T/pty.out"
+  assert "Enter picks the computer you control" grep -q "OWN-MACHINE-HELP" "$T/pty.out"
+  assert "then asks for the files" grep -q "IMPORT-ASKED" "$T/pty.out"
+  assert "cloud is not run by default" bash -c '! grep -q CLOUD-RAN "$1"' _ "$T/pty.out"
+}
+
+test_cloud_route_needs_an_informed_yes() {
+  src
+  ipxe_request() { echo "REQUEST-RAN"; }
+  ASSUME_YES=1
+  out=$(ipxe_cloud 2>&1)
+  assert "warning shown" grep -q "WEAKER TRUST" <<<"$out"
+  assert "--yes never opts in" bash -c '! grep -q REQUEST-RAN <<<"$1"' _ "$out"
+}
+
+test_cloud_loader_is_flagged_in_status() {
+  src; mkroot
+  mkdir -p "$TFTP"; echo x > "$TFTP/ipxe.efi"
+  printf 'commit=abc\nsource=cloud:ipxe-x86_64-1\n' > "$IPXE_BUILT"
+  diagnose
+  hit=0; for i in "${!F_TAG[@]}"; do [[ ${F_TAG[$i]} == LOADERTRUST && ${F_LVL[$i]} == WARN ]] && hit=1; done
+  assert "cloud-built loader raises a warning" test $hit -eq 1
+  printf 'commit=imported\n' > "$IPXE_BUILT"
+  diagnose
+  hit=0; for i in "${!F_TAG[@]}"; do [[ ${F_TAG[$i]} == LOADERTRUST ]] && hit=1; done
+  assert "an imported loader clears it" test $hit -eq 0
 }
 
 # ---------------------------------------------------------------- run
