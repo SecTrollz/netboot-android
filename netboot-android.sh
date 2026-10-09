@@ -124,6 +124,25 @@ CT_BOOTSTRAP="${CT_BOOTSTRAP:-0}"
 UPSTREAM_REPO="${UPSTREAM_REPO:-$DEFAULT_UPSTREAM_REPO}"
 UPSTREAM_BRANCH="${UPSTREAM_BRANCH:-main}"
 EXPECT_CODE="${EXPECT_CODE:-}"
+# Settings saved by the guided offsite-backup setup. Read as plain NAME='value' lines
+# (never executed); a variable already set in the environment wins.
+load_saved_settings() {
+  local f="$STATE/backup.conf" line name val
+  [[ -r $f ]] || return 0
+  while IFS= read -r line; do
+    name=${line%%=*}; val=${line#*=}
+    case "$name" in
+      AUTO_BACKUP|BACKUP_DIR|BACKUP_KEEP|BACKUP_DL|BACKUP_GPG_PASSFILE|TERABOX_COOKIE_FILE|TERABOX_DIR|GDRIVE_REMOTE) ;;
+      *) continue ;;
+    esac
+    [[ $val == \'*\' ]] || continue
+    val=${val:1:${#val}-2}
+    [[ $val != *\'* ]] || continue
+    [[ -n ${!name:-} ]] || printf -v "$name" '%s' "$val"
+  done < "$f"
+}
+load_saved_settings
+
 AUTO_BACKUP="${AUTO_BACKUP:-1}"           # 1: back up the working folder before serve and clean
 BACKUP_DIR="${BACKUP_DIR:-$HOME/netboot-backups}"
 BACKUP_KEEP="${BACKUP_KEEP:-5}"           # newest archives kept after each backup
@@ -161,8 +180,9 @@ GIT_PIN_OPTS=()
 if [[ -t 1 ]]; then
   C_RED=$'\033[0;31m'; C_GREEN=$'\033[0;32m'; C_YELLOW=$'\033[0;33m'
   C_CYAN=$'\033[0;36m'; C_BOLD=$'\033[1m'; C_RESET=$'\033[0m'
+  C_DIM=$'\033[2m'; C_BLUE=$'\033[1;34m'
 else
-  C_RED=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_BOLD=""; C_RESET=""
+  C_RED=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_BOLD=""; C_RESET=""; C_DIM=""; C_BLUE=""
 fi
 
 info() { printf '%s[*]%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
@@ -2358,6 +2378,250 @@ clean() {
 }
 
 # =============================================================================
+# Guided mode: walks through everything, one plain step at a time
+# =============================================================================
+GSTEP=0; GTOTAL=13
+
+say()  { printf '%s\n' "$*"; }
+hint() { printf '%s    %s%s\n' "$C_DIM" "$*" "$C_RESET"; }
+
+# ask_yn "Question" y|n   (Enter takes the default; q quits safely)
+ask_yn() {
+  local q=$1 d=${2:-y} a h="[y/N]"
+  [[ $d == y ]] && h="[Y/n]"
+  while true; do
+    read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} $q $h " a || { echo; a=""; }
+    a=${a,,}
+    case "$a" in
+      "")     [[ $d == y ]]; return ;;
+      y|yes)  return 0 ;;
+      n|no)   return 1 ;;
+      q|quit) echo; info "Stopped. Nothing is half-done. Start the guide again any time."; exit 0 ;;
+      *)      warn "Please type y, n, or q to quit" ;;
+    esac
+  done
+}
+
+gstep_head() {
+  GSTEP=$((GSTEP+1))
+  printf '\n%s== Step %d of %d: %s ==%s\n' "${C_BOLD}${C_CYAN}" "$GSTEP" "$GTOTAL" "$1" "$C_RESET"
+  shift
+  local l; for l in "$@"; do say "$l"; done
+}
+
+# guided_run "Title" "Plain explanation" DONE_CHECK_FUNCTION|"" command args...
+guided_run() {
+  local title=$1 why=$2 donefn=$3 a; shift 3
+  gstep_head "$title" "$why"
+  if [[ -n $donefn ]] && "$donefn"; then
+    ok "Already done."
+    ask_yn "Do it again anyway?" n || return 0
+  else
+    ask_yn "Do this step now?" y || { warn "Skipped. Later steps may need it."; return 0; }
+  fi
+  while true; do
+    if ( "$@" ); then ok "Finished: $title"; return 0; fi
+    err "That step did not finish. Read the message above."
+    read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} [r]etry, [s]kip, or [q]uit? " a || a=s
+    case "${a,,}" in
+      r|retry) ;;
+      q|quit)  exit 0 ;;
+      *)       warn "Skipped. You can run it later from the menu."; return 0 ;;
+    esac
+  done
+}
+
+g_done_attest()  { [[ -n $(attest_fpr) ]]; }
+g_done_sign()    { [[ -s $ATTEST/script.sha256.asc ]]; }
+g_done_ipxe()    { [[ -s $TFTP/ipxe.efi ]]; }
+g_done_fetch()   { iso_is_verified; }
+g_done_extract() { [[ -f $LAYOUT ]]; }
+
+guided_ipxe() {
+  local host_cpu want c dir
+  gstep_head "Get the network-boot loader (iPXE)" \
+    "iPXE is the tiny program the PC runs first. It is built with YOUR key inside," \
+    "so it only boots files you signed."
+  if g_done_ipxe; then ok "Already done."; ask_yn "Do it again anyway?" n || return 0; fi
+  host_cpu=$(uname -m); [[ $host_cpu == aarch64 ]] && host_cpu=arm64
+  if [[ $host_cpu == "$TARGET_ARCH" ]]; then want=1
+    hint "This device matches the PC's CPU ($TARGET_ARCH), so building here works."
+  else want=2
+    hint "This device is $host_cpu but the PC is $TARGET_ARCH. Easiest: build on any x86_64 Linux"
+    hint "computer (see README, 'Building iPXE for a different CPU'), then choose 2."
+  fi
+  say "  1) Build it here (slow on a phone, but automatic)"
+  say "  2) I already built it on another computer: import it"
+  say "  3) Skip for now"
+  read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Choose 1, 2 or 3 [$want]: " c || c=""
+  c=${c:-$want}
+  case "$c" in
+    1) ( build_ipxe ) && ok "iPXE built" || warn "Build did not finish. Run it again from the menu." ;;
+    2) read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Folder holding ipxe.efi and undionly.kpxe: " dir || dir=""
+       ( import_ipxe "$dir" ) && ok "iPXE imported" || warn "Import did not finish. Check the folder and retry from the menu." ;;
+    *) warn "Skipped. configure will stop until iPXE is in place." ;;
+  esac
+}
+
+# ---- offsite backup wizard ---------------------------------------------------
+save_setting() {   # NAME value -> $STATE/backup.conf (plain text, mode 600)
+  local name=$1 val=$2 f="$STATE/backup.conf" tmp
+  [[ $val != *\'* && $val != *$'\n'* ]] || { warn "Not saving $name: unsupported character in the value"; return 1; }
+  mkdir -p "$STATE"
+  tmp=$(mktemp "$STATE/.conf.XXXXXX")
+  { [[ -f $f ]] && grep -v "^$name=" "$f" || true; printf "%s='%s'\n" "$name" "$val"; } > "$tmp"
+  chmod 600 "$tmp"; mv -f "$tmp" "$f"
+  printf -v "$name" '%s' "$val"
+}
+
+offsite_wizard() {
+  local pf r remotes pick cf
+  printf '\n%s== Offsite backups: Google One (Drive) and/or Terabox ==%s\n' "${C_BOLD}${C_CYAN}" "$C_RESET"
+  say "Every backup is already saved on this device. This adds a second, encrypted copy"
+  say "in the cloud, so losing the phone does not lose your keys. Totally optional."
+  hint "Your files are locked with a passphrase BEFORE they leave the device."
+  ask_yn "Set up cloud copies now?" y || { info "No problem. Run this again from the menu any time."; return 0; }
+
+  # 1. passphrase
+  pf=${BACKUP_GPG_PASSFILE:-$HOME/.netboot-backup-pass}
+  if [[ -s $pf ]]; then
+    ok "Passphrase file found: $pf"
+  else
+    say ""
+    say "${C_BOLD}Passphrase.${C_RESET} I will make a long random one and keep it in a private file."
+    warn "WRITE IT DOWN somewhere safe (a password manager). Without it the cloud copies cannot be opened."
+    if ask_yn "Create it now?" y; then
+      ( umask 077; head -c 32 /dev/urandom | base64 | tr -d '\n=' > "$pf" ) || { err "Could not write $pf"; return 1; }
+      chmod 600 "$pf"
+      box "YOUR BACKUP PASSPHRASE (save it now)" "" "$(cat "$pf")" ""
+      read -r -p "Press Enter once you have saved it... " _ || true
+    else
+      warn "Without a passphrase nothing is uploaded. Local backups still work."
+      return 0
+    fi
+  fi
+  save_setting BACKUP_GPG_PASSFILE "$pf"
+
+  # 2. Google Drive
+  say ""
+  say "${C_BOLD}Google One storage${C_RESET} (this is your Google Drive space; uses the official rclone tool)."
+  if ask_yn "Use Google One / Drive?" y; then
+    if ! command -v rclone >/dev/null 2>&1; then
+      if (( IS_TERMUX )); then
+        ask_yn "rclone is not installed. Install it now (pkg install rclone)?" y && { pkg install -y rclone || warn "Install failed"; }
+      else
+        warn "rclone is not installed. Install it with your package manager, then run this again."
+      fi
+    fi
+    if command -v rclone >/dev/null 2>&1; then
+      remotes=$(rclone listremotes 2>/dev/null || true)
+      if [[ -z $remotes ]]; then
+        say "No cloud account is linked yet. Next I will open rclone's setup:"
+        hint "Choose: n (new remote) > name it gdrive > type: drive > scope: drive.file > accept the defaults."
+        hint "No browser on this device? Answer 'n' to auto config and follow its instructions."
+        ask_yn "Open rclone setup now?" y && rclone config
+        remotes=$(rclone listremotes 2>/dev/null || true)
+      fi
+      if [[ -n $remotes ]]; then
+        say "Linked accounts:"; printf '  %s\n' $remotes
+        read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Which one? (name with the colon, e.g. gdrive:) " pick || pick=""
+        if grep -qxF "$pick" <<<"$remotes"; then
+          save_setting GDRIVE_REMOTE "${pick}netboot-backups" && ok "Google Drive will receive backups in the folder netboot-backups"
+        else
+          warn "Not a linked account. Skipping Google Drive."
+        fi
+      fi
+    fi
+  fi
+
+  # 3. Terabox
+  say ""
+  say "${C_BOLD}Terabox${C_RESET} (unofficial open-source tool; logs in with your 'ndus' cookie, like a password)."
+  if ask_yn "Use Terabox?" n; then
+    if [[ ! -x ${TBC_BIN:-$SRC_DIR/tbc-bin} ]]; then
+      if command -v go >/dev/null 2>&1; then
+        ask_yn "Build the Terabox tool now (pinned version)?" y && { ( terabox_install ) || warn "Build failed"; }
+      else
+        warn "Go 1.24+ is needed to build it. Install Go, then run this again."
+      fi
+    fi
+    cf=${TERABOX_COOKIE_FILE:-$HOME/.terabox-cookie}
+    if [[ ! -s $cf ]]; then
+      say "Log in at terabox.com in a browser, open developer tools > Storage/Cookies, copy the value of 'ndus'."
+      read -r -s -p "${C_BOLD}${C_BLUE}?${C_RESET} Paste it here (hidden), or press Enter to skip: " r || r=""; echo
+      if [[ -n $r ]]; then ( umask 077; printf 'ndus=%s\n' "${r#ndus=}" > "$cf" ); chmod 600 "$cf"; ok "Saved to $cf"; fi
+    fi
+    if [[ -s $cf && -x ${TBC_BIN:-$SRC_DIR/tbc-bin} ]]; then
+      save_setting TERABOX_COOKIE_FILE "$cf" && ok "Terabox will receive backups in /netboot-backups"
+    else
+      warn "Terabox is not fully set up, so it is skipped."
+    fi
+  fi
+
+  # 4. test
+  say ""
+  if ask_yn "Run a test backup now to try it out?" y; then
+    ( backup_create test ) || warn "The test did not finish. Your settings are saved; fix the issue and test again from the menu."
+  fi
+  ok "Settings saved in $STATE/backup.conf. serve and clean will use them automatically."
+}
+
+guided() {
+  [[ -t 0 ]] || die "Guided mode needs a terminal. Run it directly in Termux or a shell."
+  clear 2>/dev/null || true
+  printf '\n'
+  box \
+    "WELCOME. I will walk you through, one small step at a time." \
+    "" \
+    "- Every step says what it does, in plain words." \
+    "- Press Enter to accept the suggested answer (shown in capitals)." \
+    "- Type q at any question to stop safely." \
+    "- Nothing is deleted. A backup of your working folder is taken" \
+    "  before the server starts."
+  say ""
+  ask_yn "Ready to begin?" y || { info "OK. Come back any time."; return 0; }
+
+  gstep_head "Choose what to boot and how it connects" \
+    "Now: $P_LABEL on a $TARGET_ARCH PC, network mode '$DHCP_MODE'."
+  if ask_yn "Change that?" n; then choose_target; choose_mode; set_distro; fi
+
+  guided_run "Check this device" \
+    "Looks for root, tools, free space and network. Safe: it only reads things." "" check
+  guided_run "Install the tools needed" \
+    "Installs packages such as dnsmasq, python, gpg. Needs internet." "" deps
+  guided_run "Create your private keys" \
+    "Makes a signing key and a small certificate authority that live only on this device." g_done_attest attest_init
+  guided_run "Sign this script" \
+    "Records the script's fingerprint so any later tampering is noticed." g_done_sign self_sign
+  guided_run "Check the download servers" \
+    "Confirms each vendor's server identity against public logs before trusting it." "" pins_refresh
+  guided_ipxe
+  guided_run "Download and verify the Linux image" \
+    "Downloads $P_LABEL and checks the vendor's signature. Large download: use Wi-Fi." g_done_fetch fetch
+  guided_run "Unpack the boot files" \
+    "Pulls the kernel and files the PC needs out of the image." g_done_extract extract
+  guided_run "Sign and prepare everything" \
+    "Signs the boot files with your key and writes the server settings for your current network." "" configure
+
+  gstep_head "Cloud backups (optional)" \
+    "Adds an encrypted offsite copy of your keys and settings to Google One and/or Terabox."
+  offsite_wizard
+
+  guided_run "Write the signed report" \
+    "A signed record of everything above that you can re-check later." "" attest_report
+
+  gstep_head "Start the boot server" \
+    "Plug the PC into the same network (or cable), set it to network (PXE) boot," \
+    "Secure Boot off, then power it on. Press Ctrl+C here to stop the server."
+  hint "A backup of your working folder is taken first, automatically."
+  if ask_yn "Start the server now?" y; then
+    run_step serve
+  else
+    info "Whenever you are ready, choose 'Start the PXE server' in the menu."
+  fi
+}
+
+# =============================================================================
 # Interactive mode
 # =============================================================================
 run_step() {
@@ -2419,9 +2683,15 @@ choose_mode() {
 
 interactive() {
   banner
-  info "Order: check, deps, attest-init, self-sign, pins refresh, build-ipxe, fetch, extract, configure, attest, serve."
-  echo
+  if [[ -z $(attest_fpr) ]]; then
+    printf '%sFirst time here? Choose 1: the guided setup does everything for you.%s\n\n' "$C_YELLOW" "$C_RESET"
+  fi
   local options=(
+    "GUIDED SETUP: walk me through everything (start here)"
+    "Start the PXE server"
+    "Set up cloud backups (Google One / Terabox)"
+    "Back up the working folder now"
+    "Restore the working folder from a backup"
     "Pre-flight check"
     "Install dependencies"
     "Create attestation identity"
@@ -2433,7 +2703,6 @@ interactive() {
     "Extract boot files"
     "Configure (sign boot files, write dnsmasq)"
     "Write signed attestation report"
-    "Start the PXE server"
     "Change target"
     "Change network mode"
     "Show fingerprints for external comparison"
@@ -2441,41 +2710,41 @@ interactive() {
     "Show HTTP log (last 50 lines)"
     "Clean up"
     "Verify this script against GitHub"
-    "Back up the working folder now"
-    "Restore the working folder from a backup"
     "Help"
     "Quit"
   )
   local choice dir
-  PS3="Choose a step: "
+  PS3="Choose a number: "
   select choice in "${options[@]}"; do
-    case "$REPLY" in
-      1)  run_step check ;;
-      2)  run_step deps ;;
-      3)  run_step attest_init ;;
-      4)  run_step self_sign ;;
-      5)  run_step pins_refresh ;;
-      6)  run_step build_ipxe ;;
-      7)  read -r -p "Directory holding the iPXE binaries: " dir; run_step import_ipxe "$dir" ;;
-      8)  run_step fetch ;;
-      9)  run_step extract ;;
-      10) run_step configure ;;
-      11) run_step attest_report ;;
-      12) run_step serve ;;
-      13) choose_target ;;
-      14) choose_mode ;;
-      15) show_fingerprints ;;
-      16) run_step verify_attest ;;
-      17) tail -n 50 "$HTTP_LOG" 2>/dev/null || warn "No log yet" ;;
-      18) run_step clean ;;
-      19) run_step verify_upstream ;;
-      20) run_step backup_create manual ;;
-      21) backup_list; read -r -p "Archive to restore: " dir; run_step restore "$dir" ;;
-      22) usage; echo ;;
-      23) break ;;
-      *)  warn "Enter a number from 1 to 23" ;;
+    case "$choice" in
+      GUIDED*)                      guided ;;
+      "Start the PXE server")       run_step serve ;;
+      "Set up cloud backups"*)      offsite_wizard ;;
+      "Back up the working"*)       run_step backup_create manual ;;
+      "Restore the working"*)       backup_list; read -r -p "Archive to restore: " dir; run_step restore "$dir" ;;
+      "Pre-flight check")           run_step check ;;
+      "Install dependencies")       run_step deps ;;
+      "Create attestation"*)        run_step attest_init ;;
+      "Self-sign"*)                 run_step self_sign ;;
+      "Refresh certificate"*)       run_step pins_refresh ;;
+      "Build iPXE"*)                run_step build_ipxe ;;
+      "Import iPXE"*)               read -r -p "Directory holding the iPXE binaries: " dir; run_step import_ipxe "$dir" ;;
+      "Download and verify"*)       run_step fetch ;;
+      "Extract boot files")         run_step extract ;;
+      "Configure"*)                 run_step configure ;;
+      "Write signed"*)              run_step attest_report ;;
+      "Change target")              choose_target ;;
+      "Change network mode")        choose_mode ;;
+      "Show fingerprints"*)         show_fingerprints ;;
+      "Verify latest"*)             run_step verify_attest ;;
+      "Show HTTP log"*)             tail -n 50 "$HTTP_LOG" 2>/dev/null || warn "No log yet" ;;
+      "Clean up")                   run_step clean ;;
+      "Verify this script"*)        run_step verify_upstream ;;
+      "Help")                       usage; echo ;;
+      "Quit")                       break ;;
+      *)                            warn "Enter a number from 1 to ${#options[@]}" ;;
     esac
-    PS3="Choose a step: "
+    PS3="Choose a number: "
   done
   ok "Goodbye"
 }
@@ -2498,7 +2767,9 @@ FIRST RUN, IN ORDER
   fetch, extract, configure, attest, serve
 
 COMMANDS
-  ui, interactive       Guided menu
+  guide                 Step-by-step guided setup (best for first time)
+  ui, interactive       Menu of every step (no arguments does this too)
+  backup-setup          Guided setup of Google One / Terabox cloud backups
   check                 Pre-flight: root, tools, ports 67/69/4011/$HTTP_PORT, storage,
                         network, pins, attestation, artifacts
   deps                  Install packages (Termux pkg, apt, dnf, pacman, or apk)
@@ -2637,6 +2908,8 @@ esac
 
 case "$COMMAND" in
   ui|interactive) interactive ;;
+  guide|guided)   guided ;;
+  backup-setup)   offsite_wizard ;;
   help)           usage ;;
   check)          check ;;
   deps)           deps ;;

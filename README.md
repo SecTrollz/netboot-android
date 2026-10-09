@@ -91,6 +91,16 @@ This is a file-level archive, not a Clonezilla or Shadow Copy block image. To im
 
 ---
 
+## Easiest way: let it hold your hand
+
+```sh
+./netboot-android.sh
+```
+
+Choose **1, GUIDED SETUP**. It goes one small step at a time, says in plain words what each step does, and asks before it does anything. Press Enter to accept the suggested answer, type `q` to stop safely at any question. Steps you already finished are noticed and offered as "do it again?" with the answer No. If a step fails, you get retry, skip, or quit instead of a crash. The guide also covers the optional Google One and Terabox cloud backups. Run just that part with `./netboot-android.sh backup-setup`, or the guide alone with `./netboot-android.sh guide`.
+
+---
+
 ## How to run it
 
 The first time, do these in this order. The order matters. Do not do them in alphabetical order. Someone did once. We don't talk about it.
