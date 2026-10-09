@@ -67,6 +67,15 @@ find_bin() {
 DNSMASQ="${DNSMASQ:-$(find_bin dnsmasq || true)}"
 PYTHON="${PYTHON:-$(find_bin python3 || find_bin python || true)}"
 
+# Programs the whole flow needs. Prints the missing ones, space separated.
+missing_tools() {
+  local t m=""
+  for t in curl gpg openssl bsdtar; do command -v "$t" >/dev/null 2>&1 || m+="$t "; done
+  [[ -n ${DNSMASQ:-} && -x ${DNSMASQ:-} ]] || m+="dnsmasq "
+  [[ -n ${PYTHON:-} ]] || m+="python3 "
+  printf '%s' "${m% }"
+}
+
 # =============================================================================
 # Paths
 # =============================================================================
@@ -1487,7 +1496,7 @@ deps() {
   info "Installing packages"
   if (( IS_TERMUX )); then
     pkg update -y
-    pkg install -y dnsmasq python libarchive curl iproute2 procps openssl gnupg git \
+    pkg install -y dnsmasq python libarchive bsdtar curl iproute2 procps openssl openssl-tool gnupg git \
                    clang make perl binutils liblzma xz-utils coreutils
     termux-wake-lock 2>/dev/null || warn "termux-wake-lock unavailable (install Termux:API to keep the CPU awake)"
   elif command -v apt-get >/dev/null 2>&1; then
@@ -1501,9 +1510,17 @@ deps() {
   else
     die "Unknown package manager. Install manually: dnsmasq python3 bsdtar curl iproute2 openssl gnupg git gcc make perl liblzma headers"
   fi
+  hash -r 2>/dev/null || true
   DNSMASQ=$(find_bin dnsmasq || true)
   PYTHON=$(find_bin python3 || find_bin python || true)
-  ok "Packages installed"
+  local still; still=$(missing_tools)
+  if [[ -n $still ]]; then
+    if (( IS_TERMUX )); then
+      die "$E_ENV" "The install finished but these programs are still missing: $still. On Termux try: pkg install openssl-tool bsdtar dnsmasq gnupg curl python"
+    fi
+    die "$E_ENV" "The install finished but these programs are still missing: $still. Install them with your package manager and run again."
+  fi
+  ok "Packages installed and every required program is present"
 }
 
 # =============================================================================
@@ -3106,7 +3123,7 @@ orphans_running() {
 
 diagnose() {
   F_LVL=(); F_TAG=(); F_MSG=(); F_FIX=()
-  local other=0 cfg_ip cur n avail ft ma last age st f missing t
+  local other=0 cfg_ip cur n avail ft ma last age st f missing
   # lock
   if [[ -f $LOCK_DIR/owner ]] && lock_owner_alive; then
     read -r n _ < "$LOCK_DIR/owner"
@@ -3139,11 +3156,8 @@ diagnose() {
   if (( ma > 0 && ma < 300 )); then finding WARN MEM "Only $ma MB of RAM free: close other apps so Android keeps the servers alive" ""
   elif (( ma > 0 )); then finding OK MEM "Memory: $ma MB free"; fi
   # required programs (installed by the "deps" step)
-  missing=""
-  for t in curl gpg openssl bsdtar; do command -v "$t" >/dev/null 2>&1 || missing+="$t "; done
-  [[ -n ${DNSMASQ:-} && -x ${DNSMASQ:-} ]] || missing+="dnsmasq "
-  [[ -n ${PYTHON:-} ]] || missing+="python3 "
-  if [[ -n $missing ]]; then finding FAIL TOOLS "Missing programs: ${missing% }. Setup installs them" "$0 deps"
+  missing=$(missing_tools)
+  if [[ -n $missing ]]; then finding FAIL TOOLS "Missing programs: $missing. Setup installs them" "$0 deps"
   else finding OK TOOLS "Required programs are installed" ""; fi
   # trust chain
   if [[ -z $(attest_fpr) ]]; then

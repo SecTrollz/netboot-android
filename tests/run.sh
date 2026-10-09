@@ -464,6 +464,23 @@ test_missing_tools_reported_first() {
   assert "TOOLS finding is a FAIL" test $hit -eq 1
 }
 
+test_missing_tools_names_exactly_what_is_absent() {
+  src
+  mkdir -p "$T/bin"
+  for x in curl gpg; do printf '#!/bin/sh\n' > "$T/bin/$x"; chmod +x "$T/bin/$x"; done
+  printf '#!/bin/sh\n' > "$T/bin/dnsmasq"; chmod +x "$T/bin/dnsmasq"
+  DNSMASQ="$T/bin/dnsmasq"; PYTHON=python3
+  PATH="$T/bin"
+  got=$(missing_tools)
+  assert "reports openssl and bsdtar only" test "$got" = "openssl bsdtar"
+}
+
+test_termux_package_list_has_split_packages() {
+  assert "openssl-tool is installed (openssl binary)" grep -q 'openssl-tool' "$SCRIPT"
+  assert "bsdtar package is installed" grep -qE 'libarchive bsdtar' "$SCRIPT"
+  assert "deps verifies the result" grep -q 'still missing' "$SCRIPT"
+}
+
 # ---------------------------------------------------------------- run
 for t in $(declare -F | awk '{print $3}' | grep '^test_'); do run_test "$t"; done
 
