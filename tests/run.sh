@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+# Fault-injection tests for netboot-android.sh. No network, no real DHCP server.
+# Usage: tests/run.sh [name-filter]
+set -uo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SCRIPT="$HERE/../netboot-android.sh"
+FILTER=${1:-}
+PASS=0; FAIL=0; SKIP=0
+RESULTS=$(mktemp)
+trap 'rm -f "$RESULTS"' EXIT
+
+can_root() { [[ $(id -u) -eq 0 ]] || sudo -n true 2>/dev/null; }
+
+# Every test runs in its own subshell with its own HOME and NETBOOT_HOME.
+run_test() {
+  local name=$1 tmp rc
+  [[ -z $FILTER || $name == *"$FILTER"* ]] || return 0
+  tmp=$(mktemp -d)
+  (
+    export HOME=$tmp NETBOOT_HOME=$tmp/netboot BACKUP_DIR=$tmp/bk T=$tmp
+    cd "$HERE/.." || exit 99
+    "$name"
+  ) > "$tmp/out" 2>&1
+  rc=$?
+  if (( rc == 0 )); then echo "ok   - $name"; echo P >> "$RESULTS"
+  elif (( rc == 77 )); then echo "skip - $name ($(cat "$tmp/skip" 2>/dev/null))"; echo S >> "$RESULTS"
+  else echo "FAIL - $name (exit $rc)"; sed 's/^/       | /' "$tmp/out" | tail -25; echo F >> "$RESULTS"; fi
+  rm -rf "$tmp"
+}
+
+skip() { echo "$*" > "$T/skip"; exit 77; }
+assert() { # assert "description" command...
+  local d=$1; shift
+  if "$@"; then return 0; fi
+  echo "assertion failed: $d"; exit 1
+}
+src() {   # load the script's functions without running a command
+  export NETBOOT_SOURCE_ONLY=1
+  # shellcheck disable=SC1090
+  source "$SCRIPT"
+  set +e
+  set_distro
+}
+mkroot() { mkdir -p "$ROOT" "$STATE" "$TFTP" "$HTTP" "$LIB" "$ATTEST"; }
+
+# ---------------------------------------------------------------- tests
+test_syntax() { bash -n "$SCRIPT"; }
+
+test_root_guard() {
+  out=$(NETBOOT_HOME=/ "$SCRIPT" backup 2>&1); rc=$?
+  assert "refuses /" test $rc -eq 2
+  out=$(NETBOOT_HOME=$HOME "$SCRIPT" backup 2>&1); rc=$?
+  assert "refuses HOME" test $rc -eq 2
+}
+
+test_lock_live_and_stale() {
+  mkdir -p "$NETBOOT_HOME/state/lock.d"
+  sleep 30 & p=$!
+  echo "$p $(sed 's/.*) //' /proc/$p/stat | awk '{print $20}')" > "$NETBOOT_HOME/state/lock.d/owner"
+  "$SCRIPT" backup >/dev/null 2>&1; rc=$?
+  kill $p 2>/dev/null
+  assert "live lock gives exit 50" test $rc -eq 50
+  echo "999999 1" > "$NETBOOT_HOME/state/lock.d/owner"
+  mkdir -p "$NETBOOT_HOME/keys"; echo k > "$NETBOOT_HOME/keys/k"
+  "$SCRIPT" backup >/dev/null 2>&1; rc=$?
+  assert "stale lock is cleared and backup works" test $rc -eq 0
+  assert "lock released" test ! -d "$NETBOOT_HOME/state/lock.d"
+}
+
+test_atomic_write() {
+  src; mkroot
+  echo old > "$ROOT/f"
+  echo new | atomic_write "$ROOT/f"
+  assert "content replaced" test "$(cat "$ROOT/f")" = new
+  assert "no temp files left" test "$(ls "$ROOT" | grep -c 'f\.')" -eq 0
+}
+
+test_journal_replay() {
+  can_root || skip "needs root or sudo"
+  src; mkroot
+  journal_push "touch '$T/undone'" >/dev/null
+  assert "entry recorded" test "$(journal_count)" -eq 1
+  journal_replay >/dev/null 2>&1
+  assert "undo ran" test -f "$T/undone"
+  assert "entry removed" test "$(journal_count)" -eq 0
+}
+
+test_heal_leftovers() {
+  src; mkroot
+  mkdir -p "$HTTP.new" "$STATE/.conf.abc"; echo x > "$MANIFEST.tmp"
+  rmdir "$HTTP"; mkdir -p "$HTTP.old.123"; echo keep > "$HTTP.old.123/f"
+  heal_safe >/dev/null 2>&1
+  assert "staging removed" test ! -e "$HTTP.new"
+  assert "temp conf removed" test ! -e "$STATE/.conf.abc"
+  assert "manifest tmp removed" test ! -e "$MANIFEST.tmp"
+  assert "previous http restored" test "$(cat "$HTTP/f")" = keep
+}
+
+mk_gate_env() {
+  src; mkroot
+  ( attest_init ) >/dev/null 2>&1 || skip "gpg/openssl not usable"
+  BIG_BYTES=1000; VERIFIED_BOOT=0; FAMILY=squash
+  KERNEL_REL=k; INITRD_REL=i; ROOTFS_REL=r.img; SHA_REL=""; UCODE_RELS=""
+  echo b > "$TFTP/boot.ipxe"; echo e > "$TFTP/ipxe.efi"; echo u > "$TFTP/undionly.kpxe"
+  head -c 5000 /dev/urandom > "$HTTP/r.img"; echo k > "$HTTP/k"; echo i > "$HTTP/i"
+  echo c > "$DNSMASQ_CONF"; echo p > "$LIB/httpd.py"
+  write_manifest >/dev/null 2>&1
+}
+
+test_gate_fast_and_small_tamper() {
+  mk_gate_env
+  ( verify_manifest ) >/dev/null 2>&1 || { echo "clean gate failed"; exit 1; }
+  assert "big file checked by fingerprint" test "${#BIG_FAST[@]}" -ge 0
+  echo evil > "$HTTP/k"
+  ( verify_manifest ) >/dev/null 2>&1; rc=$?
+  assert "tampered small file refused with exit 30" test $rc -eq 30
+}
+
+test_gate_big_tamper_caught() {
+  mk_gate_env
+  sleep 1.1
+  printf 'Z' | dd of="$HTTP/r.img" bs=1 seek=7 conv=notrunc 2>/dev/null
+  ( verify_manifest ) >/dev/null 2>&1; rc=$?
+  assert "changed big file (new mtime) refused" test $rc -eq 30
+}
+
+test_gate_forged_mtime_caught_by_background() {
+  mk_gate_env
+  m=$(stat -c %Y "$HTTP/r.img")
+  printf 'Z' | dd of="$HTTP/r.img" bs=1 seek=7 conv=notrunc 2>/dev/null
+  touch -d "@$m" "$HTTP/r.img"
+  verify_manifest >/dev/null 2>&1 || { echo "fast tier should pass a forged mtime"; exit 1; }
+  mkdir -p "$RUN"; kill_servers() { :; }
+  deep_verify_bg >/dev/null 2>&1; rc=$?
+  assert "background verify fails" test $rc -ne 0
+  assert "failure flag written" test -s "$RUN/DEEP_FAIL"
+}
+
+test_manifest_reuses_big_hashes() {
+  mk_gate_env
+  out=$(write_manifest 2>&1)
+  assert "reuse message" grep -q "Reused hashes" <<<"$out"
+}
+
+test_hashfile_matches() {
+  src; mkroot; write_libs
+  head -c 3000000 /dev/urandom > "$T/b"
+  a=$(python3 "$LIB/hashfile.py" "$T/b" sha256,sha512)
+  assert "sha256" test "$(awk '$1=="sha256"{print $2}' <<<"$a")" = "$(sha256sum "$T/b" | cut -d' ' -f1)"
+  assert "sha512" test "$(awk '$1=="sha512"{print $2}' <<<"$a")" = "$(sha512sum "$T/b" | cut -d' ' -f1)"
+}
+
+test_extract_is_atomic() {
+  command -v bsdtar >/dev/null || skip "bsdtar missing"
+  export ALLOW_UNVERIFIED=1
+  src; mkroot
+  mkdir -p "$T/w/casper"; echo V1 > "$T/w/casper/vmlinuz"; echo I1 > "$T/w/casper/initrd"
+  tar -C "$T/w" -cf "$ISO" casper
+  ( extract ) >/dev/null 2>&1 || { echo "first extract failed"; exit 1; }
+  assert "v1 in place" test "$(cat "$HTTP/casper/vmlinuz")" = V1
+  echo V2 > "$T/w/casper/vmlinuz"; tar -C "$T/w" -cf "$ISO" casper
+  head -c 700 "$ISO" > "$ISO.bad"; mv "$ISO.bad" "$ISO"
+  ( extract ) >/dev/null 2>&1; rc=$?
+  assert "corrupt archive fails" test $rc -ne 0
+  assert "v1 untouched" test "$(cat "$HTTP/casper/vmlinuz")" = V1
+  assert "no staging left" test ! -e "$HTTP.new"
+}
+
+start_test_httpd() {
+  src; mkroot; write_libs
+  mkdir -p "$HTTP/casper" "$HTTP/iso"
+  head -c 3000000 /dev/urandom > "$HTTP/casper/big"; echo hi > "$HTTP/boot.ipxe"
+  head -c 1000 /dev/urandom > "$T/outside.iso"; ln -s "$T/outside.iso" "$HTTP/iso/x.iso"
+  echo secret > "$T/secret"
+  PHONE_IP=127.0.0.1; HTTP_PORT=$((20000 + RANDOM % 20000)); ISO="$T/outside.iso"
+  start_http || { echo "httpd did not start"; cat "$HTTP_LOG.err" 2>/dev/null; exit 1; }
+  B="http://127.0.0.1:$HTTP_PORT"
+}
+
+test_httpd_ranges_and_safety() {
+  start_test_httpd
+  code=$(curl -s -o "$T/r" -w '%{http_code}' -r 100-199 "$B/casper/big")
+  assert "206 for range" test "$code" = 206
+  assert "range bytes correct" cmp -s <(head -c 200 "$HTTP/casper/big" | tail -c 100) "$T/r"
+  code=$(curl -s -o "$T/r2" -w '%{http_code}' -r -50 "$B/casper/big")
+  assert "206 suffix" test "$code" = 206
+  assert "suffix bytes correct" cmp -s <(tail -c 50 "$HTTP/casper/big") "$T/r2"
+  assert "416 past end" test "$(curl -s -o /dev/null -w '%{http_code}' -r 9000000- "$B/casper/big")" = 416
+  assert "traversal blocked" test "$(curl -s --path-as-is -o /dev/null -w '%{http_code}' "$B/../secret")" = 403
+  assert "allowed symlink served" test "$(curl -s -o /dev/null -w '%{http_code}' "$B/iso/x.iso")" = 200
+  assert "missing is 404" test "$(curl -s -o /dev/null -w '%{http_code}' "$B/nope")" = 404
+  assert "healthz" curl -fsS "$B/healthz" >/dev/null
+  kill "$SERVE_HTTP_PID" 2>/dev/null
+}
+
+test_httpd_overload_returns_503() {
+  start_test_httpd
+  python3 - "$HTTP_PORT" <<'PY' || exit 1
+import socket, sys, time, urllib.request
+port = int(sys.argv[1]); socks = []
+for _ in range(20):
+    s = socket.create_connection(("127.0.0.1", port))
+    s.sendall(b"GET /casper/big HTTP/1.1\r\nHost: x\r\n\r\n"); socks.append(s)
+time.sleep(1)
+try:
+    urllib.request.urlopen("http://127.0.0.1:%d/boot.ipxe" % port, timeout=3); code = 200
+except Exception as e:
+    code = getattr(e, "code", 0)
+for s in socks: s.close()
+sys.exit(0 if code == 503 else 1)
+PY
+  kill "$SERVE_HTTP_PID" 2>/dev/null
+}
+
+test_watchdog_restarts_httpd() {
+  can_root || skip "needs root or sudo"
+  start_test_httpd
+  printf '#!/bin/sh\necho $$ > "$PIDFILE"\nexec sleep 600\n' > "$T/fake-dnsmasq"; chmod +x "$T/fake-dnsmasq"
+  export PIDFILE="$RUN/dnsmasq.pid"; mkdir -p "$RUN"
+  DNSMASQ="$T/fake-dnsmasq"; DNSMASQ_CONF="$T/dm.conf"; touch "$DNSMASQ_CONF"; DNS_LOG="$ROOT/dnsmasq.log"
+  net_check() { :; }
+  start_dns; sleep 1
+  watchdog >"$T/wd.out" 2>&1 & w=$!
+  sleep 3; kill -9 "$SERVE_HTTP_PID"; sleep 8
+  curl -fsS "$B/healthz" >/dev/null; rc=$?
+  stop_dns; kill "$SERVE_HTTP_PID" "$w" 2>/dev/null
+  assert "http answers again after kill -9" test $rc -eq 0
+}
+
+test_restart_budget_gives_up() {
+  src
+  sleep() { :; }
+  for _ in 1 2 3 4 5; do wd_budget || { echo "refused too early"; exit 1; }; done
+  wd_budget && { echo "sixth restart should be refused"; exit 1; }
+  exit 0
+}
+
+test_backup_restore_roundtrip() {
+  mkdir -p "$NETBOOT_HOME"/{keys,state,downloads,http}
+  echo K1 > "$NETBOOT_HOME/keys/k"; echo ISO > "$NETBOOT_HOME/downloads/a.iso"
+  "$SCRIPT" backup >/dev/null 2>&1 || { echo "backup failed"; exit 1; }
+  f=$(ls "$BACKUP_DIR"/netboot-manual-*.tar.gz | head -n1)
+  assert "checksum file" test -s "$f.sha256"
+  assert "meta file" test -s "$f.meta"
+  echo K2 > "$NETBOOT_HOME/keys/k"
+  "$SCRIPT" restore "$f" --dry-run >/dev/null 2>&1
+  assert "dry run changes nothing" test "$(cat "$NETBOOT_HOME/keys/k")" = K2
+  "$SCRIPT" restore "$f" >/dev/null 2>&1 || { echo "restore failed"; exit 1; }
+  assert "keys restored" test "$(cat "$NETBOOT_HOME/keys/k")" = K1
+  assert "downloads untouched" test "$(cat "$NETBOOT_HOME/downloads/a.iso")" = ISO
+  echo junk >> "$f"
+  "$SCRIPT" restore "$f" >/dev/null 2>&1; rc=$?
+  assert "tampered archive refused" test $rc -ne 0
+  assert "state not left half-restored" test ! -e "$NETBOOT_HOME.restore.NEW"
+}
+
+test_status_reports_problems() {
+  out=$("$SCRIPT" status 2>&1); rc=$?
+  assert "exit 1 when not ready" test $rc -eq 1
+  assert "names a fix" grep -q "fix:" <<<"$out"
+}
+
+test_diagnose_flags_fat() {
+  src; mkroot
+  fs_type() { echo vfat; }
+  diagnose
+  hit=0; for t in "${F_TAG[@]}"; do [[ $t == FSTYPE ]] && hit=1; done
+  assert "FAT drive is a FAIL finding" test $hit -eq 1
+}
+
+test_diagnose_detects_address_change() {
+  src; mkroot
+  mkdir -p "$STATE"; touch "$MANIFEST" "$LAYOUT"
+  printf 'set base http://10.0.0.5:8000\n' > "$TFTP/boot.ipxe"
+  resolve_network() { IFACE=eth9; PHONE_IP=10.0.0.9; }
+  diagnose
+  hit=0; for t in "${F_TAG[@]}"; do [[ $t == NETCHG ]] && hit=1; done
+  assert "address change detected" test $hit -eq 1
+}
+
+test_error_hint_and_log() {
+  mkdir -p "$NETBOOT_HOME/state/lock.d"
+  sleep 30 & p=$!
+  echo "$p $(sed 's/.*) //' /proc/$p/stat | awk '{print $20}')" > "$NETBOOT_HOME/state/lock.d/owner"
+  out=$("$SCRIPT" backup 2>&1); kill $p 2>/dev/null
+  assert "plain-English next step" grep -q "Next step" <<<"$out"
+  assert "event logged" grep -q "exit code=50" "$NETBOOT_HOME/state/netboot.log"
+}
+
+# ---------------------------------------------------------------- run
+for t in $(declare -F | awk '{print $3}' | grep '^test_'); do run_test "$t"; done
+
+PASS=$(grep -c P "$RESULTS" || true); FAIL=$(grep -c F "$RESULTS" || true); SKIP=$(grep -c S "$RESULTS" || true)
+echo
+echo "passed: $PASS   failed: $FAIL   skipped: $SKIP"
+(( FAIL == 0 ))

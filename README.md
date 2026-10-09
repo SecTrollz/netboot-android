@@ -101,6 +101,39 @@ Choose **1, GUIDED SETUP**. It goes one small step at a time, says in plain word
 
 ---
 
+## Daily use and emergencies
+
+Once set up, you only need three commands:
+
+```sh
+./netboot-android.sh go        # fix small problems, then start serving with your last settings
+./netboot-android.sh status    # one screen: what is ready, what needs attention, and the fix for each
+./netboot-android.sh heal      # repair leftovers from a crash, power loss, or an address change
+```
+
+**Emergency card.** Phone in hand, PC needs rescuing:
+
+1. Connect the phone to the same Wi-Fi (or cable it to the PC).
+2. Run `./netboot-android.sh go`. It needs no internet.
+3. Boot the PC from the network. Press Ctrl+C when done.
+
+What it does for you while it runs:
+
+- **Never half-writes.** Downloads, extractions, manifests, and your settings are written to a temporary name and renamed only when complete. If it is killed mid-way, the old files are still good and `heal` removes the leftovers.
+- **Undoes its own changes.** The IP address, routing rules, and Wi-Fi power mode it changes are recorded first. If the script dies, the next run puts them back.
+- **One at a time.** A lock stops two runs from corrupting each other. A lock left by a dead run clears itself.
+- **Starts in seconds.** Small boot files are always fully re-hashed. The multi-GB root image is checked by a signed fingerprint, then fully re-hashed in the background at low priority while it serves. If it ever changed, the servers stop with a red message. `./netboot-android.sh verify deep` (or `DEEP_VERIFY=1`) checks everything first instead.
+- **Watches itself.** A crashed HTTP server or dnsmasq is restarted (up to 5 times in 5 minutes, then it stops and tells you). If the phone's Wi-Fi address changes, it re-signs the boot files and carries on.
+- **Resumable file server.** Clients can resume downloads (HTTP Range), the server caps simultaneous connections, and it blocks path tricks.
+- **Plain errors.** Failures say what went wrong and the next command to run. Details go to `~/netboot/state/netboot.log`.
+- **Stays alive on Android.** On a rooted phone the servers are marked as important to the low-memory killer; keep Termux on unrestricted battery.
+
+Honest limits: the fast check trusts a file's size, time, and inode for a few minutes until the background check finishes, so someone with root who forges those could briefly serve a changed root image (the kernel and initrd are signed and always fully checked). The root image is unsigned on the client for most distros; see the header of the script. Android features (root, `oom_score_adj`, Wi-Fi power mode) can only be proven on a real phone.
+
+Tests: `tests/run.sh` runs 21 fault-injection checks (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
+
+---
+
 ## How to run it
 
 The first time, do these in this order. The order matters. Do not do them in alphabetical order. Someone did once. We don't talk about it.

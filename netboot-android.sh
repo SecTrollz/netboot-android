@@ -169,13 +169,13 @@ U_MIN_FREE_MB="${MIN_FREE_MB:-}"
 
 # Runtime state
 SERVE_HTTP_PID=""
-DNS_WRAP_PID=""
 DNS_LOG=""
 DIRECT_ADDED=0
 JID_DIRECT=""
 JID_POWER=""
 POWER_TWEAKED=0
 COMMAND=""
+DRY_RUN=0
 POSITIONAL=()
 SIG_SIGNER=""
 GIT_PIN_OPTS=()
@@ -1799,8 +1799,8 @@ import_ipxe() {
 # =============================================================================
 iso_is_verified() {
   [[ -s $ISO && -s $ISO_VERIFIED ]] || return 1
-  local sha size mtime
-  read -r sha size mtime < "$ISO_VERIFIED" || return 1
+  local size mtime
+  read -r _ size mtime < "$ISO_VERIFIED" || return 1
   [[ $size == "$(file_size "$ISO")" && $mtime == "$(file_mtime "$ISO")" ]]
 }
 
@@ -2480,6 +2480,8 @@ backup_create() {
   tar -tzf "$out.part" >/dev/null 2>&1 || { rm -f "$out.part"; die "Backup archive failed its read-back test"; }
   mv -f "$out.part" "$out"
   ( cd "$BACKUP_DIR" && sha256sum "$(basename "$out")" > "$(basename "$out").sha256" )
+  printf 'version=%s\ncreated=%s\ndistro=%s\narch=%s\nfiles=%s\n' "$SCRIPT_VERSION" "$(now_iso)" "$DISTRO" "$TARGET_ARCH" \
+    "$(tar -tzf "$out" | grep -vc '/$' || true)" > "$out.meta"
   chmod 600 "$out" "$out.sha256" 2>/dev/null || true
   ok "Backup written: $out ($(file_size "$out") bytes)"
   backup_prune
@@ -2545,12 +2547,17 @@ backup_upload() {
          --symmetric --cipher-algo AES256 --output "$enc" "$f" ) >/dev/null 2>&1; then
     rm -f "$enc"; warn "Encryption failed. Offsite upload skipped."; return 0
   fi
-  local i
+  local i good="" badl=""
   for i in "${!cmds[@]}"; do
     info "Uploading $(basename "$enc") to ${labels[$i]}"
-    if bash -c "${cmds[$i]}" _ "$enc"; then ok "${labels[$i]} upload done"; else warn "${labels[$i]} upload failed. Local backup is intact: $f"; fi
+    if bash -c "${cmds[$i]}" _ "$enc"; then
+      ok "${labels[$i]} upload done"; good+="${good:+, }${labels[$i]}"
+    else
+      warn "${labels[$i]} upload failed. Local backup is intact: $f"; badl+="${badl:+, }${labels[$i]}"
+    fi
   done
   rm -f "$enc"
+  printf '%s %s%s\n' "$(now_iso)" "${good:+OK: $good}" "${badl:+ FAILED: $badl}" | atomic_write "$STATE/offsite.status" || true
 }
 
 backup_prune() {
@@ -2558,7 +2565,7 @@ backup_prune() {
   local f n=0
   while IFS= read -r f; do
     n=$((n+1))
-    if (( n > BACKUP_KEEP )); then rm -f -- "$f" "$f.sha256"; fi
+    if (( n > BACKUP_KEEP )); then rm -f -- "$f" "$f.sha256" "$f.meta"; fi
   done < <(ls -1t "$BACKUP_DIR"/netboot-*.tar.gz 2>/dev/null || true)
   return 0
 }
@@ -2584,17 +2591,45 @@ auto_backup() {
 }
 
 restore() {
-  local f=${1:-}
-  [[ -n $f ]] || { backup_list; die "Usage: $0 restore ARCHIVE   (a file from the list above)"; }
+  local f=${1:-} stage base parent top n
+  [[ -n $f ]] || { backup_list; die "Usage: $0 restore ARCHIVE [--dry-run]   (a file from the list above)"; }
   [[ -f $f ]] || f="$BACKUP_DIR/$f"
   need tar
   backup_verify "$f"
+  base=$(basename "$ROOT"); parent=$(dirname "$ROOT")
+  if [[ ${DRY_RUN:-0} == 1 ]]; then
+    info "Dry run: restoring $(basename "$f") would replace these items in $ROOT (nothing is changed):"
+    tar -tzf "$f" | awk -F/ -v b="$base" 'NF>=2 && $1==b && $2!="" {print $2}' | sort -u | sed 's/^/    /'
+    [[ -f $f.meta ]] && sed 's/^/    /' "$f.meta"
+    return 0
+  fi
   kill_servers
   [[ -d $ROOT ]] && backup_create "pre-restore"
-  warn "Restoring $f over $ROOT (files in the backup replace current copies; others are left alone)"
+  stage="$ROOT.restore.NEW"
+  rm -rf "$stage"; mkdir -p "$stage"
+  if ! tar -C "$stage" -xzpf "$f"; then
+    rm -rf "$stage"; die "Restore archive could not be unpacked. Nothing was changed."
+  fi
+  [[ -d $stage/$base ]] || { rm -rf "$stage"; die "This archive was not made from a folder named '$base'. Nothing was changed."; }
+  warn "Restoring $(basename "$f") into $ROOT (downloads and extracted files stay as they are)"
   run_root "chown -R $(id -u):$(id -g) '$ROOT'" >/dev/null 2>&1 || true
-  tar -C "$(dirname "$ROOT")" -xzpf "$f" || die "Restore failed. The pre-restore backup is in $BACKUP_DIR"
-  ok "Restored. Run: $0 check, then $0 configure and $0 serve"
+  mkdir -p "$ROOT"
+  n=0
+  for top in "$stage/$base"/* "$stage/$base"/.[!.]*; do
+    [[ -e $top ]] || continue
+    if [[ $(basename "$top") == state ]]; then
+      # state holds the live lock and undo journal: copy over it instead of replacing the folder
+      rm -rf "$top/lock.d" "$top/undo.d"
+      mkdir -p "$ROOT/state"; cp -af "$top"/. "$ROOT/state"/
+    elif [[ -d $top ]]; then
+      atomic_dir_swap "$top" "$ROOT/$(basename "$top")" || { rm -rf "$stage"; die "Could not swap in $(basename "$top"). Your previous state is in the pre-restore backup in $BACKUP_DIR."; }
+    else
+      mv -f "$top" "$ROOT/$(basename "$top")"
+    fi
+    n=$((n+1))
+  done
+  rm -rf "$stage"
+  ok "Restored $n item(s). Run: $0 status, then $0 go"
 }
 
 # =============================================================================
@@ -2760,7 +2795,6 @@ start_dns() {
   local ldp=""
   (( IS_TERMUX )) && ldp="LD_LIBRARY_PATH=$PREFIX/lib "
   { run_root "${ldp}$DNSMASQ --no-daemon --conf-file=$DNSMASQ_CONF" || true; } > >(tee -a "$DNS_LOG") 2>&1 &
-  DNS_WRAP_PID=$!
 }
 
 dns_alive() {
@@ -3072,7 +3106,10 @@ diagnose() {
   if (( ma > 0 && ma < 300 )); then finding WARN MEM "Only $ma MB of RAM free: close other apps so Android keeps the servers alive" ""
   elif (( ma > 0 )); then finding OK MEM "Memory: $ma MB free"; fi
   # trust chain
-  if [[ -z $(attest_fpr) ]]; then finding FAIL ATTEST "No attestation identity yet" "$0 attest-init"
+  if [[ -z $(attest_fpr) ]]; then
+    last=$(ls -1t "$BACKUP_DIR"/netboot-*.tar.gz 2>/dev/null | head -n1 || true)
+    if [[ -n $last ]]; then finding FAIL ATTEST "No attestation identity here, but a backup exists" "$0 restore $(basename "$last")"
+    else finding FAIL ATTEST "No attestation identity yet" "$0 attest-init"; fi
   else
     st=$(self_status)
     case "$st" in
@@ -3630,6 +3667,7 @@ COMMANDS
   terabox-install       Build the unofficial Terabox CLI (fcr--/tbc, pinned) for offsite backups
   backup-list           List backups, newest first
   restore ARCHIVE       Verify a backup, save the current state, then restore it
+                        (add --dry-run to only list what would be replaced)
   serve                 Backs up the working folder, integrity gate, then HTTP + dnsmasq (DHCP/TFTP) as root
   logs                  Follow the HTTP access log
   selinux {status|permissive|enforcing}
@@ -3718,6 +3756,7 @@ parse_args() {
   while (( $# )); do
     case "$1" in
       -h|--help)  usage; exit 0 ;;
+      --dry-run)  DRY_RUN=1 ;;
       --distro)   [[ $# -ge 2 ]] || die "--distro requires a value"; DISTRO="$2"; CLI_SET+=" DISTRO"; shift ;;
       --distro=*) DISTRO="${1#*=}"; CLI_SET+=" DISTRO" ;;
       --arch)     [[ $# -ge 2 ]] || die "--arch requires a value"; TARGET_ARCH="$2"; CLI_SET+=" TARGET_ARCH"; shift ;;
