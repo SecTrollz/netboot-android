@@ -119,21 +119,27 @@ Run `./netboot-android.sh guide` (or choose **1, GUIDED SETUP** in `./netboot-an
 
 ---
 
-## Phone and PC have different CPUs? The phone builds the loader itself
+## Phone and PC have different CPUs? One safe GitHub build, then pinned
 
-A phone is arm64 and most PCs are x86_64. The network loader (iPXE) must be compiled for the PC's CPU, and it decides what your PC will boot, so it should be built on a device **you** control. A phone can do that with nothing else:
+A phone is arm64 and most PCs are x86_64. The network loader (iPXE) must be compiled for the PC's CPU, and it decides what your PC will boot. The guide's default for a phone is a **one-time build on GitHub that the script then pins forever**:
 
 ```sh
-./netboot-android.sh ipxe-phone
+./netboot-android.sh ipxe-cloud
 ```
 
-The first time it sets up a small Debian environment (Termux `proot-distro`, about 600 MB) containing an x86_64 cross-compiler that runs on your phone's arm64 CPU. Then it builds iPXE from the pinned source commit with your certificate inside. The build takes roughly 20 to 45 minutes. The guide offers this as the default.
+1. It prints a page address and copies your **public** certificate. On that page tap **Run workflow**, paste, pick the PC's CPU, run (about 5 minutes, free). GitHub only shows *Run workflow* for workflows on your default branch, so merge this branch to `main` first.
+2. Back in the terminal press Enter. The script downloads the build and checks, in this order:
+   - the checksums match;
+   - the build ran **exactly the workflow file you can read** in `.github/workflows/build-ipxe.yml` (its SHA-256 is baked into the script, and the script also fetches that file at the tagged commit and hashes it itself);
+   - the loader contains **your** certificate;
+   - **GitHub's signed build provenance** verifies, when the GitHub CLI is set up (`pkg install gh && gh auth login`). Without it the check is skipped and the default answer to the approval question becomes **No**.
+3. You approve once. From then on the script **pins those exact bytes** (a signed record in `~/netboot/state`). Every later run, `heal`, restore, or new distro reuses that same file, restores it automatically if it goes missing, and refuses any different file. `ipxe-fetch new` is the only way to replace it, and it asks.
 
-What is trusted: Debian's signed package repository for the compiler (the same kind of trust you place in any compiler on any PC), and the iPXE commit pinned by hash in the script. The Debian environment can only see the iPXE source folder: it never sees your keys. Only your **public** certificate is copied in.
+The workflow itself is hardened: actions are pinned to commit hashes (never movable tags), the iPXE source is pinned by hash, the release is tied to the building commit, inputs never reach a shell, and a pasted private key is rejected.
 
-Other routes, if you prefer: build on an x86_64 Linux computer you control (copy `ca.crt` over, run `TRUST_CA=ca.crt ./netboot-android.sh --arch x86_64 build-ipxe`, copy the files back, `import-ipxe DIR`), or the weaker cloud route below.
+**What this does not remove:** for that one run you still trust GitHub's build servers, and the first approval is trust-on-first-use of that file. A loader built on a computer you control has no such gap (`ipxe-phone` builds it on the phone itself with a Debian cross-compiler; or build on an x86_64 Linux computer and `import-ipxe DIR`). If you never want the GitHub route, delete the workflow file. `status` shows whether the pinned loader's provenance was verified.
 
-**Weaker option: cloud build.** `./netboot-android.sh ipxe-cloud` has GitHub's servers compile the loader from a workflow file in your repo. It puts GitHub's runner, and anyone who can change that workflow, inside the trust chain, and this script cannot detect extra trust placed inside the binary. It is off by default, asks for an informed yes (`--yes` never opts in), refuses a loader that lacks your certificate, and `status` keeps warning until you replace it. If you never want it, delete `.github/workflows/build-ipxe.yml`.
+Anyone can double-check a pinned build from any computer with `gh attestation verify ipxe.efi --repo OWNER/REPO`.
 
 ---
 
@@ -166,7 +172,7 @@ What it does for you while it runs:
 
 Honest limits: the fast check trusts a file's size, time, and inode for a few minutes until the background check finishes, so someone with root who forges those could briefly serve a changed root image (the kernel and initrd are signed and always fully checked). The root image is unsigned on the client for most distros; see the header of the script. Android features (root, `oom_score_adj`, Wi-Fi power mode) can only be proven on a real phone.
 
-Tests: `tests/run.sh` runs 48 checks (fault injection and the easy-mode screens) (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
+Tests: `tests/run.sh` runs 57 checks (fault injection and the easy-mode screens) (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
 
 ---
 

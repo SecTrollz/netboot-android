@@ -136,6 +136,12 @@ UPSTREAM_REPO="${UPSTREAM_REPO:-$DEFAULT_UPSTREAM_REPO}"
 UPSTREAM_BRANCH="${UPSTREAM_BRANCH:-main}"
 XBOX_NAME="${XBOX_NAME:-debian}"          # proot-distro container used to cross-compile on a phone
 GITHUB_API_BASE="${GITHUB_API_BASE:-https://api.github.com}"
+GITHUB_RAW_BASE="${GITHUB_RAW_BASE:-https://raw.githubusercontent.com}"
+# SHA-256 of .github/workflows/build-ipxe.yml as reviewed. A cloud build is accepted only if it
+# ran exactly this file. Change the workflow => update this value (tests enforce it).
+WORKFLOW_SHA256="8e3f75dcea2216b7d189e35255588bf6d1245d3d044b49384b352d9430df155b"
+IPXE_CLOUD_OK="${IPXE_CLOUD_OK:-0}"            # 1 lets --yes run the one-time cloud approval unattended
+IPXE_ALLOW_UNATTESTED="${IPXE_ALLOW_UNATTESTED:-0}"
 IPXE_CURL_OPTS="${IPXE_CURL_OPTS---proto =https --tlsv1.2}"   # tests may set this empty to talk to a local server
 EXPECT_CODE="${EXPECT_CODE:-}"
 # Settings saved by the guided offsite-backup setup. Read as plain NAME='value' lines
@@ -1876,6 +1882,20 @@ upstream_slug() {   # https://github.com/Owner/Repo.git -> Owner/Repo
   printf '%s' "${u#*github.com/}"
 }
 
+loader_pin_path() { printf '%s/loader-%s.pin' "$STATE" "$TARGET_ARCH"; }
+pin_get() { sed -n "s/^$1=//p" "$(loader_pin_path)" 2>/dev/null | head -n1; }
+curl_api() { # curl_api URL  (JSON from GitHub; honours IPXE_CURL_OPTS so tests can use a local server)
+  # shellcheck disable=SC2086
+  curl -fsS $IPXE_CURL_OPTS --connect-timeout 20 --max-time 60 -H 'Accept: application/vnd.github+json' "$1"
+}
+json_get() { "$PYTHON" -I -c '
+import json, sys
+d = json.load(sys.stdin)
+for part in sys.argv[1].split("."):
+    d = d[int(part)] if isinstance(d, list) else d.get(part, "")
+print(d if d is not None else "")
+' "$1"; }
+
 ipxe_request() {
   [[ -s $ATTEST/ca.crt ]] || die "$E_ENV" "Your boot certificate does not exist yet. Run the guide first (it creates your keys)."
   local b64 slug fp url
@@ -1888,7 +1908,7 @@ ipxe_request() {
   if command -v termux-clipboard-set >/dev/null 2>&1 && printf '%s' "$b64" | termux-clipboard-set 2>/dev/null; then copied=1; fi
   echo
   box \
-    "BUILD THE LOADER FREE ON GITHUB (about 5 minutes)" \
+    "ONE-TIME LOADER BUILD ON GITHUB (about 5 minutes)" \
     "" \
     "1. Open the page below and sign in to GitHub." \
     "2. Tap 'Run workflow'." \
@@ -1900,6 +1920,7 @@ ipxe_request() {
   say "${C_BOLD}The page:${C_RESET}"
   say "$url"
   echo
+  hint "No 'Run workflow' button? GitHub only shows it for workflows on your default branch: merge this branch to main first."
   hint "The text is only your PUBLIC certificate. Your private key never leaves this device."
   hint "Certificate fingerprint: ${fp:0:47}..."
   if (( ! copied )); then
@@ -1909,72 +1930,182 @@ ipxe_request() {
   fi
 }
 
+# Does GitHub's signed provenance say these files came from this repo's build workflow?
+# Result in LOADER_ATTEST: yes | no (verification ran and FAILED) | skipped (gh missing or not logged in)
+LOADER_ATTEST="skipped"
+loader_attest() {   # loader_attest DIR
+  local dir=$1 slug f
+  LOADER_ATTEST="skipped"
+  command -v gh >/dev/null 2>&1 || return 0
+  gh auth status >/dev/null 2>&1 || return 0
+  slug=$(upstream_slug)
+  for f in "$dir"/*.efi "$dir"/*.kpxe; do
+    [[ -f $f ]] || continue
+    if ! gh attestation verify "$f" --repo "$slug" --signer-workflow "$slug/.github/workflows/build-ipxe.yml" >/dev/null 2>&1; then
+      LOADER_ATTEST="no"; return 0
+    fi
+  done
+  LOADER_ATTEST="yes"
+}
+
+loader_pin_matches() {   # the files in TFTP are exactly the ones you approved
+  local pin line name want
+  pin=$(loader_pin_path)
+  [[ -s $pin ]] || return 1
+  gpg_verify_file "$pin" || return 1
+  while IFS= read -r line; do
+    [[ $line == file=* ]] || continue
+    name=${line#file=}; name=${name%% *}; want=${line##*sha256=}
+    [[ -s $TFTP/$name && $(sha256_of "$TFTP/$name") == "$want" ]] || return 1
+  done < "$pin"
+  return 0
+}
+
 ipxe_fetch() {
   need curl
   [[ -n $PYTHON ]] || die "$E_ENV" "python3 is required. Run: $0 deps"
-  local slug api json tag lines name url dir f
+  local mode=${1:-} slug tag lines name url dir f json pinned=0 relurl commit wfhash body fp
   slug=$(upstream_slug)
-  api="$GITHUB_API_BASE/repos/$slug/releases?per_page=30"
-  info "Looking for a loader built for your certificate"
-  # shellcheck disable=SC2086
-  json=$(curl -fsS $IPXE_CURL_OPTS --connect-timeout 20 --max-time 60 -H 'Accept: application/vnd.github+json' "$api") \
-    || die "$E_NET" "Could not reach GitHub. Check your internet and try again."
-  lines=$("$PYTHON" -I -c '
+  mkdir -p "$STATE" "$DL"
+
+  if [[ -s $(loader_pin_path) && $mode != new ]]; then
+    gpg_verify_file "$(loader_pin_path)" || die "$E_INTEGRITY" "The saved loader approval failed its signature check. Not trusting it."
+    pinned=1; tag=$(pin_get tag)
+    info "Restoring the exact loader you approved ($tag)"
+    relurl="$GITHUB_API_BASE/repos/$slug/releases/tags/$tag"
+    json=$(curl_api "$relurl") || die "$E_NET" "Could not reach GitHub, or that build no longer exists. Check your internet."
+  else
+    if [[ $mode == new && -s $(loader_pin_path) ]]; then
+      ask_yn "Replace the loader you approved earlier with a newer build?" n || { info "Kept the approved loader."; return 0; }
+    fi
+    info "Looking for a loader built for your certificate"
+    json=$(curl_api "$GITHUB_API_BASE/repos/$slug/releases?per_page=30") \
+      || die "$E_NET" "Could not reach GitHub. Check your internet and try again."
+    fp=$(openssl x509 -in "$ATTEST/ca.crt" -noout -fingerprint -sha256 | cut -d= -f2)
+    tag=$("$PYTHON" -I -c '
 import json, sys
 arch, want = sys.argv[1], sys.argv[2]
 for rel in json.load(sys.stdin):
-    tag = rel.get("tag_name", "")
-    if not tag.startswith("ipxe-" + arch + "-") or rel.get("draft"):
-        continue
-    if want not in (rel.get("name") or ""):
-        continue
-    print("TAG", tag)
-    for a in rel.get("assets", []):
-        print("ASSET", a["name"], a["browser_download_url"])
-    break
-' "$TARGET_ARCH" "$(openssl x509 -in "$ATTEST/ca.crt" -noout -fingerprint -sha256 | cut -d= -f2)" <<<"$json")
-  tag=$(awk '$1=="TAG"{print $2}' <<<"$lines")
-  if [[ -z $tag ]]; then
-    err "No loader for THIS certificate and CPU ($TARGET_ARCH) has been built yet."
-    next_step "run '$0 ipxe-request', follow the 5 steps, wait for the green check, then run '$0 ipxe-fetch'."
-    return 1
+    t = rel.get("tag_name", "")
+    if t.startswith("ipxe-" + arch + "-") and not rel.get("draft") and want in (rel.get("name") or ""):
+        print(t); break
+' "$TARGET_ARCH" "$fp" <<<"$json")
+    if [[ -z $tag ]]; then
+      err "No loader for THIS certificate and CPU ($TARGET_ARCH) has been built yet."
+      next_step "run '$0 ipxe-request', follow the steps, wait for the green check, then run '$0 ipxe-fetch'."
+      return 1
+    fi
+    json=$(curl_api "$GITHUB_API_BASE/repos/$slug/releases/tags/$tag") || die "$E_NET" "Could not read build $tag."
   fi
-  ok "Found build $tag"
-  mkdir -p "$DL"; dir=$(mktemp -d "$DL/ipxe-cloud.XXXXXX")
-  while read -r _ name url; do
+  ok "Using build $tag"
+
+  lines=$("$PYTHON" -I -c '
+import json, sys
+for a in json.load(sys.stdin).get("assets", []):
+    print(a["name"], a["browser_download_url"])
+' <<<"$json")
+  dir=$(mktemp -d "$DL/ipxe-cloud.XXXXXX")
+  while read -r name url; do
     case "$name" in ipxe.efi|undionly.kpxe|ipxe-arm64.efi|SHA256SUMS) ;; *) continue ;; esac
     # shellcheck disable=SC2086
     curl -fsSL $IPXE_CURL_OPTS --connect-timeout 20 --max-time 600 -o "$dir/$name" "$url" \
       || { rm -rf "$dir"; die "$E_NET" "Download of $name failed. Try again."; }
-  done < <(awk '$1=="ASSET"' <<<"$lines")
+  done <<<"$lines"
   [[ -s $dir/SHA256SUMS ]] || { rm -rf "$dir"; die "$E_INTEGRITY" "The build has no checksum list. Not using it."; }
   ( cd "$dir" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ) || { rm -rf "$dir"; die "$E_INTEGRITY" "Downloaded files do not match their checksums. Not using them."; }
   ok "Checksums match"
   f=$(ipxe_files_for_arch | head -n1)
-  # strict for downloads: the loader must contain YOUR certificate or it is refused
-  check_ca_embedded "$dir/$f" "$ATTEST/ca.crt" strict \
-    || { rm -rf "$dir"; die "$E_INTEGRITY" "The loader does not contain YOUR certificate, so it was refused. Run ipxe-request again and paste the right certificate."; }
-  ( import_ipxe "$dir" ) || { rm -rf "$dir"; die "$E_INTEGRITY" "The loader does not contain YOUR certificate, so it was refused. Run ipxe-request again with the right certificate."; }
-  f=$(ipxe_files_for_arch | head -n1)
+
+  if (( pinned )); then
+    # exactly the bytes you approved, or nothing
+    while IFS= read -r line; do
+      [[ $line == file=* ]] || continue
+      name=${line#file=}; name=${name%% *}; want=${line##*sha256=}
+      [[ -s $dir/$name && $(sha256_of "$dir/$name") == "$want" ]] \
+        || { rm -rf "$dir"; die "$E_INTEGRITY" "$name is NOT the file you approved. The release was changed. Refusing to use it."; }
+    done < "$(loader_pin_path)"
+    ok "Matches the loader you approved"
+  else
+    # 1. the build must have run exactly the reviewed workflow file
+    body=$(printf '%s' "$json" | json_get body)
+    wfhash=$(sed -n 's/^workflow-sha256: *//p' <<<"$body" | head -n1)
+    [[ $wfhash == "$WORKFLOW_SHA256" ]] \
+      || { rm -rf "$dir"; die "$E_INTEGRITY" "This build did not run the reviewed workflow (hash mismatch). Not using it."; }
+    commit=$(curl_api "$GITHUB_API_BASE/repos/$slug/git/ref/tags/$tag" | json_get object.sha) \
+      || { rm -rf "$dir"; die "$E_NET" "Could not read which commit built $tag."; }
+    # shellcheck disable=SC2086
+    [[ $(curl -fsSL $IPXE_CURL_OPTS --connect-timeout 20 --max-time 60 "$GITHUB_RAW_BASE/$slug/$commit/.github/workflows/build-ipxe.yml" | sha256sum | cut -d' ' -f1) == "$WORKFLOW_SHA256" ]] \
+      || { rm -rf "$dir"; die "$E_INTEGRITY" "The workflow file at commit ${commit:0:10} is not the reviewed one. Not using this build."; }
+    ok "Built by the reviewed workflow (commit ${commit:0:10})"
+    # 2. the loader must contain YOUR certificate
+    check_ca_embedded "$dir/$f" "$ATTEST/ca.crt" strict \
+      || { rm -rf "$dir"; die "$E_INTEGRITY" "The loader does not contain YOUR certificate, so it was refused. Run ipxe-request again and paste the right certificate."; }
+    # 3. GitHub's signed provenance, when the GitHub CLI is set up
+    loader_attest "$dir"
+    case $LOADER_ATTEST in
+      yes) ok "GitHub's signed build provenance verified" ;;
+      no)
+        if [[ $IPXE_ALLOW_UNATTESTED != 1 ]]; then
+          rm -rf "$dir"; die "$E_INTEGRITY" "GitHub's signed provenance does NOT match these files. They were not built by the workflow. Refusing."
+        fi
+        warn "Provenance check failed but IPXE_ALLOW_UNATTESTED=1 is set." ;;
+      *) warn "Build provenance was NOT checked (GitHub CLI missing or not logged in)."
+         hint "Stronger: pkg install gh && gh auth login, then run ipxe-fetch again." ;;
+    esac
+    echo
+    box \
+      "APPROVE THIS LOADER (one time)" \
+      "" \
+      "Build : $tag" \
+      "Commit: ${commit:0:40}" \
+      "Cert  : yours (checked inside the file)" \
+      "Proof : provenance $LOADER_ATTEST (yes = verified, skipped = not checked)" \
+      "" \
+      "Once approved, this exact file is pinned. From now on the script" \
+      "only ever restores THIS file and refuses any different one."
+    echo
+    if [[ $ASSUME_YES == 1 && $IPXE_CLOUD_OK != 1 ]]; then
+      rm -rf "$dir"; die "$E_USAGE" "Approval needs a human. Run it yourself, or set IPXE_CLOUD_OK=1 knowingly."
+    fi
+    ask_yn "Approve and pin this loader?" "$([[ $LOADER_ATTEST == yes ]] && echo y || echo n)" \
+      || { rm -rf "$dir"; info "Not approved. Nothing was installed."; return 1; }
+  fi
+
+  # the files verified above are the ones installed
+  ( import_ipxe "$dir" ) || { rm -rf "$dir"; die "$E_INTEGRITY" "Import refused the files."; }
   { echo "source=cloud:$tag"; echo "fetched=$(now_iso)"; } >> "$IPXE_BUILT"
+  if (( ! pinned )); then
+    {
+      echo "tag=$tag"; echo "arch=$TARGET_ARCH"; echo "workflow_sha256=$WORKFLOW_SHA256"
+      echo "commit=$commit"; echo "attested=$LOADER_ATTEST"; echo "approved=$(now_iso)"
+      for name in $(ipxe_files_for_arch); do echo "file=$name sha256=$(sha256_of "$TFTP/$name")"; done
+    } | atomic_write "$(loader_pin_path)"
+    rm -f "$(loader_pin_path).asc"
+    gpg_sign_file "$(loader_pin_path)" || warn "Could not sign the approval record (attestation key missing?)."
+    ok "Approved and pinned. This is now the only cloud loader the script will use."
+  fi
   rm -rf "$dir"
-  ok "Loader installed ($f). It was checked to contain your certificate."
-  hint "Trust note: this loader was compiled by GitHub's runner from the pinned iPXE commit, not on your device."
-  hint "For the strictest chain, build it yourself on an x86_64 Linux computer instead (README)."
+  ok "Loader installed ($f)."
 }
 
-ipxe_cloud() {   # the whole thing as one friendly flow
+ipxe_cloud() {   # one-time GitHub build, then pinned forever
+  if [[ -s $(loader_pin_path) ]]; then
+    ok "You already approved a GitHub-built loader. Restoring exactly that one."
+    ipxe_fetch; return
+  fi
   echo
   box \
-    "WEAKER TRUST: READ THIS FIRST" \
+    "ONE-TIME GITHUB BUILD: WHAT IS CHECKED, WHAT IS NOT" \
     "" \
-    "The loader decides what your PC will boot. In this route it is" \
-    "compiled by GitHub's servers using a workflow file in your repo." \
-    "Anyone or anything able to change that file or that runner could" \
-    "put extra trust inside it, and this script cannot detect that." \
-    "A loader built on a computer you control does not have this gap."
+    "Checked: the build ran the exact workflow file you can read in" \
+    "your repo (hash pinned in this script), the loader contains YOUR" \
+    "certificate, checksums match, and (with the GitHub CLI set up)" \
+    "GitHub's signed provenance matches. Then that one file is pinned." \
+    "" \
+    "Still trusted: GitHub's build servers for that single run." \
+    "A loader built on a computer you control avoids even that."
   echo
-  ask_yn "Use the cloud build anyway?" n || { info "Good. Build it on a computer you control, then: $0 import-ipxe DIR"; return 0; }
+  ask_yn "Do the one-time GitHub build?" y || { info "OK. Other routes: $0 ipxe-phone, or build on a computer you control."; return 0; }
   ipxe_request
   local a
   while :; do
@@ -3354,8 +3485,15 @@ diagnose() {
       bad)     finding FAIL SELF "Signed script record failed verification (possible tampering)" "$0 fingerprints" ;;
     esac
   fi
-  if [[ -s $TFTP/ipxe.efi && -f $IPXE_BUILT ]] && grep -q '^source=cloud' "$IPXE_BUILT"; then
-    finding WARN LOADERTRUST "The iPXE loader was built by GitHub's cloud runner, not on a device you control" "$0 import-ipxe DIR"
+  if [[ -s $(loader_pin_path) ]]; then
+    if loader_pin_matches; then
+      if [[ $(pin_get attested) == yes ]]; then finding INFO LOADERPIN "Loader is the GitHub build you approved (provenance verified)" ""
+      else finding WARN LOADERPIN "Loader is the GitHub build you approved, but its build provenance was never checked" "$0 ipxe-fetch new"; fi
+    else
+      finding FAIL LOADERPIN "The loader on disk is NOT the one you approved" "$0 ipxe-fetch"
+    fi
+  elif [[ -s $TFTP/ipxe.efi && -f $IPXE_BUILT ]] && grep -q '^source=cloud' "$IPXE_BUILT"; then
+    finding WARN LOADERTRUST "The iPXE loader came from GitHub without a saved approval" "$0 ipxe-fetch new"
   fi
   [[ -s $TFTP/ipxe.efi ]] && finding OK IPXE "iPXE loader present" "" || finding FAIL IPXE "iPXE loader missing (this phone can build it itself)" "$([[ $HOST_ARCH == aarch64 && $TARGET_ARCH == x86_64 ]] && echo "$0 ipxe-phone" || echo "$0 build-ipxe")"
   iso_is_verified && finding OK ISO "$P_LABEL image verified" "" || finding FAIL ISO "$P_LABEL image not downloaded/verified" "$0 --distro $DISTRO --arch $TARGET_ARCH fetch"
@@ -3429,6 +3567,10 @@ heal_safe() {
   done
   if [[ -d $RUN && ! -O $RUN ]]; then run_root "chown -R $(id -u):$(id -g) '$RUN'" >/dev/null 2>&1 && { ok "Fixed ownership of $RUN"; did=1; }; fi
   if [[ -f $DNSMASQ_CONF && ! -f $LIB/httpd.py ]]; then write_libs; ok "Rewrote helper programs"; did=1; fi
+  if [[ -s $(loader_pin_path) ]] && ! loader_pin_matches; then
+    info "The loader is missing or changed. Restoring the exact one you approved."
+    if ( ipxe_fetch ) >/dev/null 2>&1; then ok "Approved loader restored"; did=1; else warn "Could not restore it now (offline?). Run: $0 ipxe-fetch"; fi
+  fi
   (( did )) || ok "Nothing needed fixing"
   log_event INFO "heal_safe did=$did"
   return 0
@@ -3450,7 +3592,7 @@ heal() {
     local setup_bad=0
     for i in "${!F_LVL[@]}"; do
       [[ ${F_LVL[$i]} == FAIL ]] || continue
-      case "${F_TAG[$i]}" in TOOLS|ATTEST|IPXE|ISO|EXTRACT|CONFIG) setup_bad=1 ;; esac
+      case "${F_TAG[$i]}" in TOOLS|ATTEST|IPXE|LOADERPIN|ISO|EXTRACT|CONFIG) setup_bad=1 ;; esac
     done
     if (( setup_bad )) && [[ -t 0 ]]; then
       say "The missing pieces are setup steps. The guide does them in the right order and skips what is done."
@@ -3562,7 +3704,7 @@ easy_home() {
   for i in "${!F_LVL[@]}"; do
     [[ ${F_LVL[$i]} == FAIL ]] || continue
     case "${F_TAG[$i]}" in
-      TOOLS|ATTEST|IPXE|ISO|EXTRACT|CONFIG) setup_bad=1; note=${note:-${F_MSG[$i]}} ;;
+      TOOLS|ATTEST|IPXE|LOADERPIN|ISO|EXTRACT|CONFIG) setup_bad=1; note=${note:-${F_MSG[$i]}} ;;
       SELF) note=${F_MSG[$i]}; fixcmd=self ;;
       *) note=${note:-${F_MSG[$i]}}; fixcmd=${fixcmd:-heal} ;;
     esac
@@ -3692,7 +3834,7 @@ guided_ipxe() {
     hint "This device matches the PC's CPU ($TARGET_ARCH), so building here works and keeps everything on this device."
     say "  1) Build it here (slow on a phone, but automatic)  ${C_GREEN}recommended${C_RESET}"
     say "  2) I built it on another computer I control: import it"
-    say "  3) Build it in the cloud on GitHub  ${C_YELLOW}weaker trust, not recommended${C_RESET}"
+    say "  3) One-time build on GitHub, then pinned and verified"
     say "  4) Skip for now"
     read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Choose 1-4 [1]: " c || c=""
     case "${c:-1}" in
@@ -3702,17 +3844,16 @@ guided_ipxe() {
       *) warn "Skipped. configure will stop until iPXE is in place." ;;
     esac
   else
-    hint "This phone is $host_cpu and the PC is $TARGET_ARCH. The phone can still build it itself using"
-    hint "a small x86_64 compiler in a Debian environment. Nothing leaves this device."
-    say "  1) Build it on this phone with the x86_64 compiler  ${C_GREEN}recommended, no other computer${C_RESET}"
-    say "  2) Build it on a $TARGET_ARCH Linux computer I control, then import it"
-    say "  3) Build it in the cloud on GitHub  ${C_YELLOW}weaker trust, not recommended${C_RESET}"
+    hint "This phone is $host_cpu and the PC is $TARGET_ARCH, so it cannot compile the loader the normal way."
+    say "  1) One-time build on GitHub, then pinned and verified  ${C_GREEN}default, about 5 minutes${C_RESET}"
+    say "  2) Build it on this phone with an x86_64 compiler (slow, nothing leaves the phone)"
+    say "  3) Build it on a $TARGET_ARCH Linux computer I control, then import it"
     say "  4) Skip for now"
     read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Choose 1-4 [1]: " c || c=""
     case "${c:-1}" in
-      1) ipxe_phone ;;
-      2) ipxe_own_machine_help; guided_ipxe_import ;;
-      3) ipxe_cloud ;;
+      1) ipxe_cloud ;;
+      2) ipxe_phone ;;
+      3) ipxe_own_machine_help; guided_ipxe_import ;;
       *) warn "Skipped. configure will stop until iPXE is in place." ;;
     esac
   fi
@@ -4113,7 +4254,7 @@ COMMANDS
   xbuild-setup          Only set up that on-phone compiler (Debian via proot-distro)
   ipxe-cloud            Build the loader on GitHub instead (WEAKER trust; asks first)
   ipxe-request          Print what to paste into the GitHub build page
-  ipxe-fetch            Download, verify, and install the loader GitHub built for you
+  ipxe-fetch [new]      Download, verify, pin, and install the GitHub-built loader (new = replace the pinned one)
   fetch                 Download the ISO and verify it against the vendor key
   extract               Pull kernel, initrd, root image (and microcode) from the ISO
   configure             Sign boot files, write boot.ipxe, dnsmasq.conf, and the manifest
@@ -4279,7 +4420,7 @@ case "$COMMAND" in
   ipxe-phone)     ipxe_phone ;;
   xbuild-setup)   xbox_setup ;;
   ipxe-request)   ipxe_request ;;
-  ipxe-fetch)     ipxe_fetch ;;
+  ipxe-fetch)     ipxe_fetch "${POSITIONAL[0]:-}" ;;
   ipxe-cloud)     ipxe_cloud ;;
   fetch)          fetch ;;
   extract)        extract ;;

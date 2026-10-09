@@ -481,75 +481,230 @@ test_termux_package_list_has_split_packages() {
   assert "deps verifies the result" grep -q 'still missing' "$SCRIPT"
 }
 
-# ---- cloud-built iPXE (phone gets the loader from a GitHub release) ----
-mk_fake_github() {   # serves /repos/o/r/releases and the asset files on localhost
+# ---- one-time GitHub build, pinned (a local fake GitHub stands in for the real one) ----
+mk_fake_github() {
   src; mkroot
   ( attest_init ) >/dev/null 2>&1 || skip "gpg/openssl not usable"
   TARGET_ARCH=x86_64; set_distro
-  PORT=$((20000 + RANDOM % 20000)); WEB="$T/web"; mkdir -p "$WEB"
-  # a "built" loader that contains the CA fingerprint, like the real one
+  WEB="$T/web"; mkdir -p "$WEB/files"; PORT=$((20000 + RANDOM % 20000))
+  SLUG=SecTrollz/netboot-android; COMMIT=0123456789abcdef0123456789abcdef01234567; TAG=ipxe-x86_64-111
   fp=$(ca_fpr_hex "$ATTEST/ca.crt")
-  { printf 'MZ'; head -c 200 /dev/urandom; printf '%s' "$fp" | xxd -r -p 2>/dev/null || python3 -c "import sys;sys.stdout.buffer.write(bytes.fromhex('$fp'))"; } > "$WEB/ipxe.efi"
-  head -c 5000 /dev/urandom > "$WEB/undionly.kpxe"
-  ( cd "$WEB" && sha256sum ipxe.efi undionly.kpxe > SHA256SUMS )
+  { printf 'MZ'; head -c 200 /dev/urandom; python3 -c "import sys;sys.stdout.buffer.write(bytes.fromhex('$fp'))"; } > "$WEB/files/ipxe.efi"
+  head -c 5000 /dev/urandom > "$WEB/files/undionly.kpxe"
+  ( cd "$WEB/files" && sha256sum ipxe.efi undionly.kpxe > SHA256SUMS )
+  cp "$HERE/../.github/workflows/build-ipxe.yml" "$WEB/files/workflow.yml"
   cafp=$(openssl x509 -in "$ATTEST/ca.crt" -noout -fingerprint -sha256 | cut -d= -f2)
-  python3 - "$WEB" "$PORT" "$cafp" <<'PY'
-import json, sys
-web, port, cafp = sys.argv[1], sys.argv[2], sys.argv[3]
-assets = [{"name": n, "browser_download_url": "http://127.0.0.1:%s/%s" % (port, n)}
-          for n in ("ipxe.efi", "undionly.kpxe", "SHA256SUMS")]
-rels = [{"tag_name": "ipxe-x86_64-111", "draft": False, "name": "iPXE loader (x86_64) for CA " + cafp, "assets": assets},
-        {"tag_name": "ipxe-x86_64-100", "draft": False, "name": "iPXE loader (x86_64) for CA 00:11", "assets": []}]
-import os
-os.makedirs(web + "/repos/SecTrollz/netboot-android", exist_ok=True)
-json.dump(rels, open(web + "/repos/SecTrollz/netboot-android/releases", "w"))
+  write_fake_github "$WORKFLOW_SHA256" "$cafp"
+  cat > "$WEB/server.py" <<'PY'
+import http.server, json, sys
+port, routes_file = int(sys.argv[1]), sys.argv[2]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        routes = json.load(open(routes_file))
+        f = routes.get(self.path.split("?")[0])
+        if not f:
+            self.send_response(404); self.end_headers(); return
+        data = open(f, "rb").read()
+        self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+    def log_message(self, *a): pass
+http.server.ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
 PY
-  ( cd "$WEB" && python3 -m http.server "$PORT" --bind 127.0.0.1 >/dev/null 2>&1 ) & WEBPID=$!
+  python3 "$WEB/server.py" "$PORT" "$WEB/routes.json" & WEBPID=$!
   sleep 1
-  export GITHUB_API_BASE="http://127.0.0.1:$PORT" IPXE_CURL_OPTS=""
+  export GITHUB_API_BASE="http://127.0.0.1:$PORT" GITHUB_RAW_BASE="http://127.0.0.1:$PORT" IPXE_CURL_OPTS=""
 }
 
-test_ipxe_fetch_installs_matching_loader() {
+write_fake_github() {   # write_fake_github WORKFLOW_HASH_IN_NOTES CA_FINGERPRINT_IN_NAME
+  python3 - "$WEB" "$PORT" "$SLUG" "$TAG" "$COMMIT" "$1" "$2" <<'PY'
+import json, os, sys
+web, port, slug, tag, commit, wfhash, cafp = sys.argv[1:8]
+files = web + "/files/"
+assets = [{"name": n, "browser_download_url": "http://127.0.0.1:%s/dl/%s" % (port, n)}
+          for n in ("ipxe.efi", "undionly.kpxe", "SHA256SUMS")]
+rel = {"tag_name": tag, "draft": False, "name": "iPXE loader (x86_64) for CA " + cafp,
+       "body": "workflow-sha256: %s\ncommit: %s\n" % (wfhash, commit), "assets": assets}
+def dump(name, obj):
+    path = web + "/" + name
+    json.dump(obj, open(path, "w")); return path
+base = "/repos/" + slug
+routes = {
+    base + "/releases": dump("rel_list.json", [rel]),
+    base + "/releases/tags/" + tag: dump("rel_one.json", rel),
+    base + "/git/ref/tags/" + tag: dump("ref.json", {"object": {"type": "commit", "sha": commit}}),
+    "/%s/%s/.github/workflows/build-ipxe.yml" % (slug, commit): files + "workflow.yml",
+}
+for n in ("ipxe.efi", "undionly.kpxe", "SHA256SUMS"):
+    routes["/dl/" + n] = files + n
+json.dump(routes, open(web + "/routes.json", "w"))
+PY
+}
+
+stop_fake_github() { kill "$WEBPID" 2>/dev/null; }
+
+test_first_approval_pins_and_installs() {
   mk_fake_github
-  ( ipxe_fetch ) >"$T/f.out" 2>&1; rc=$?
-  kill $WEBPID 2>/dev/null
-  [[ $rc -eq 0 ]] || sed 's/^/    fetch said: /' "$T/f.out"
-  assert "fetch succeeds" test $rc -eq 0
+  ( ipxe_fetch <<<"y" ) >"$T/f.out" 2>&1; rc=$?
+  stop_fake_github
+  [[ $rc -eq 0 ]] || sed 's/^/    fetch said: /' "$T/f.out" | tail -12
+  assert "approval succeeds" test $rc -eq 0
   assert "loader installed" test -s "$TFTP/ipxe.efi"
-  assert "note records the cloud source" grep -q 'source=cloud:ipxe-x86_64-111' "$STATE/ipxe-x86_64.built-from"
+  assert "pin written" test -s "$STATE/loader-x86_64.pin"
+  assert "pin is signed" test -s "$STATE/loader-x86_64.pin.asc"
+  assert "pin records the tag" grep -q "^tag=$TAG" "$STATE/loader-x86_64.pin"
+  assert "pin is verifiable" loader_pin_matches
 }
 
-test_ipxe_fetch_refuses_bad_checksum() {
+test_without_approval_nothing_is_installed() {
   mk_fake_github
-  printf 'tamper' >> "$WEB/ipxe.efi"
+  ( ipxe_fetch <<<"n" ) >"$T/f.out" 2>&1; rc=$?
+  stop_fake_github
+  assert "declined" test $rc -ne 0
+  assert "nothing installed" test ! -s "$TFTP/ipxe.efi"
+  assert "no pin" test ! -s "$STATE/loader-x86_64.pin"
+}
+
+test_pinned_loader_is_always_the_one_restored() {
+  mk_fake_github
+  ( ipxe_fetch <<<"y" ) >/dev/null 2>&1
+  good=$(sha256sum "$TFTP/ipxe.efi" | cut -d' ' -f1)
+  rm -f "$TFTP/ipxe.efi" "$TFTP/undionly.kpxe"
   ( ipxe_fetch ) >"$T/f.out" 2>&1; rc=$?
-  kill $WEBPID 2>/dev/null
+  stop_fake_github
+  assert "restore works with no prompt" test $rc -eq 0
+  assert "restored bytes are the approved ones" test "$(sha256sum "$TFTP/ipxe.efi" | cut -d' ' -f1)" = "$good"
+}
+
+test_pinned_refuses_a_swapped_release() {
+  mk_fake_github
+  ( ipxe_fetch <<<"y" ) >/dev/null 2>&1
+  # an attacker re-uploads different bytes to the same release, with matching checksums
+  { printf 'MZ'; head -c 300 /dev/urandom; } > "$WEB/files/ipxe.efi"
+  ( cd "$WEB/files" && sha256sum ipxe.efi undionly.kpxe > SHA256SUMS )
+  rm -f "$TFTP/ipxe.efi"
+  ( ipxe_fetch ) >"$T/f.out" 2>&1; rc=$?
+  stop_fake_github
+  assert "swapped release refused with exit 30" test $rc -eq 30
+  assert "nothing installed" test ! -s "$TFTP/ipxe.efi"
+}
+
+test_build_that_ran_another_workflow_is_refused() {
+  mk_fake_github
+  write_fake_github "$(printf 'x' | sha256sum | cut -d' ' -f1)" "$cafp"
+  ( ipxe_fetch <<<"y" ) >"$T/f.out" 2>&1; rc=$?
+  stop_fake_github
+  assert "notes with a different workflow hash refused (30)" test $rc -eq 30
+  assert "nothing installed" test ! -s "$TFTP/ipxe.efi"
+}
+
+test_workflow_changed_at_the_built_commit_is_refused() {
+  mk_fake_github
+  echo "# tampered" >> "$WEB/files/workflow.yml"     # notes still claim the reviewed hash
+  ( ipxe_fetch <<<"y" ) >"$T/f.out" 2>&1; rc=$?
+  stop_fake_github
+  assert "tampered workflow at that commit refused (30)" test $rc -eq 30
+  assert "nothing installed" test ! -s "$TFTP/ipxe.efi"
+}
+
+test_bad_checksum_is_refused() {
+  mk_fake_github
+  printf 'tamper' >> "$WEB/files/ipxe.efi"
+  ( ipxe_fetch <<<"y" ) >"$T/f.out" 2>&1; rc=$?
+  stop_fake_github
   assert "tampered download refused with exit 30" test $rc -eq 30
   assert "nothing installed" test ! -s "$TFTP/ipxe.efi"
 }
 
-test_ipxe_fetch_refuses_loader_without_my_ca() {
+test_loader_without_my_ca_is_refused() {
   mk_fake_github
-  { printf 'MZ'; head -c 400 /dev/urandom; } > "$WEB/ipxe.efi"
-  ( cd "$WEB" && sha256sum ipxe.efi undionly.kpxe > SHA256SUMS )
-  ( ipxe_fetch ) >"$T/f.out" 2>&1; rc=$?
-  kill $WEBPID 2>/dev/null
+  { printf 'MZ'; head -c 400 /dev/urandom; } > "$WEB/files/ipxe.efi"
+  ( cd "$WEB/files" && sha256sum ipxe.efi undionly.kpxe > SHA256SUMS )
+  ( ipxe_fetch <<<"y" ) >"$T/f.out" 2>&1; rc=$?
+  stop_fake_github
   assert "foreign loader refused with exit 30" test $rc -eq 30
   assert "nothing installed" test ! -s "$TFTP/ipxe.efi"
 }
 
-test_ipxe_fetch_ignores_builds_for_other_certificates() {
+test_builds_for_other_certificates_are_ignored() {
   mk_fake_github
-  python3 - "$WEB" <<'PY'
-import json, sys
-f = sys.argv[1] + "/repos/SecTrollz/netboot-android/releases"
-rels = json.load(open(f)); rels[0]["name"] = "iPXE loader (x86_64) for CA AA:BB"
-json.dump(rels, open(f, "w"))
-PY
-  ( ipxe_fetch ) >"$T/f.out" 2>&1; rc=$?
-  kill $WEBPID 2>/dev/null
-  assert "no loader for my certificate: not installed" test $rc -ne 0
+  write_fake_github "$WORKFLOW_SHA256" "AA:BB:CC"
+  ( ipxe_fetch <<<"y" ) >"$T/f.out" 2>&1; rc=$?
+  stop_fake_github
+  assert "no loader for my certificate" test $rc -ne 0
   assert "tells what to do" grep -q "ipxe-request" "$T/f.out"
+}
+
+test_failed_provenance_is_refused_and_good_provenance_is_recorded() {
+  mk_fake_github
+  mkdir -p "$T/gh"
+  cat > "$T/gh/gh" <<'EOS'
+#!/bin/sh
+[ "$1" = auth ] && exit 0
+[ "$1" = attestation ] && exit "${FAKE_GH_VERIFY_RC:-0}"
+exit 0
+EOS
+  chmod +x "$T/gh/gh"
+  PATH="$T/gh:$PATH"
+  ( export FAKE_GH_VERIFY_RC=1; ipxe_fetch <<<"y" ) >"$T/f.out" 2>&1; rc=$?
+  assert "provenance mismatch refused (30)" test $rc -eq 30
+  assert "nothing installed" test ! -s "$TFTP/ipxe.efi"
+  ( export FAKE_GH_VERIFY_RC=0; ipxe_fetch <<<"y" ) >"$T/f2.out" 2>&1; rc=$?
+  stop_fake_github
+  assert "good provenance accepted" test $rc -eq 0
+  assert "pin records attested=yes" grep -q '^attested=yes' "$STATE/loader-x86_64.pin"
+}
+
+test_unattested_default_is_no() {
+  mk_fake_github
+  ( ipxe_fetch </dev/null ) >"$T/f.out" 2>&1; rc=$?     # Enter/default only
+  stop_fake_github
+  assert "without provenance the default answer is NOT to approve" test $rc -ne 0
+  assert "nothing installed" test ! -s "$TFTP/ipxe.efi"
+}
+
+test_yes_flag_cannot_approve_a_loader() {
+  mk_fake_github
+  ASSUME_YES=1 IPXE_CLOUD_OK=0; ( ipxe_fetch ) >"$T/f.out" 2>&1; rc=$?
+  stop_fake_github
+  assert "--yes refused (exit 2)" test $rc -eq 2
+  assert "nothing installed" test ! -s "$TFTP/ipxe.efi"
+}
+
+test_heal_restores_the_approved_loader() {
+  mk_fake_github
+  ( ipxe_fetch <<<"y" ) >/dev/null 2>&1
+  good=$(sha256sum "$TFTP/ipxe.efi" | cut -d' ' -f1)
+  echo corrupt > "$TFTP/ipxe.efi"
+  diagnose
+  hit=0; for i in "${!F_TAG[@]}"; do [[ ${F_TAG[$i]} == LOADERPIN && ${F_LVL[$i]} == FAIL ]] && hit=1; done
+  assert "status flags the changed loader" test $hit -eq 1
+  heal_safe >/dev/null 2>&1
+  stop_fake_github
+  assert "heal put the approved bytes back" test "$(sha256sum "$TFTP/ipxe.efi" | cut -d' ' -f1)" = "$good"
+}
+
+test_cloud_flow_reuses_the_pin_without_questions() {
+  mk_fake_github
+  ( ipxe_fetch <<<"y" ) >/dev/null 2>&1
+  rm -f "$TFTP/ipxe.efi"
+  ( ipxe_cloud </dev/null ) >"$T/f.out" 2>&1; rc=$?
+  stop_fake_github
+  assert "no questions, success" test $rc -eq 0
+  assert "loader back" test -s "$TFTP/ipxe.efi"
+  assert "did not ask for a new build" bash -c '! grep -q "Do the one-time GitHub build" "$1"' _ "$T/f.out"
+}
+
+test_workflow_hash_constant_and_pins_are_current() {
+  f="$HERE/../.github/workflows/build-ipxe.yml"
+  src
+  assert "script pins the reviewed workflow hash" test "$WORKFLOW_SHA256" = "$(sha256sum "$f" | cut -d' ' -f1)"
+  assert "checkout pinned to a commit hash" grep -qE 'actions/checkout@[0-9a-f]{40}' "$f"
+  assert "attestation action pinned to a commit hash" grep -qE 'actions/attest-build-provenance@[0-9a-f]{40}' "$f"
+  assert "no movable action tags" bash -c '! grep -E "uses: .*@(v[0-9]|main|master|latest)" "$1" | grep -q .' _ "$f"
+  assert "release is tied to the building commit" grep -q -- '--target "$GITHUB_SHA"' "$f"
+  assert "records the workflow hash" grep -q 'workflow-sha256' "$f"
+  assert "rejects private keys" grep -q 'PRIVATE KEY' "$f"
+  assert "inputs go through env (no script injection)" grep -q 'CA_B64: ${{ inputs.ca_pem_b64 }}' "$f"
+  assert "no input is expanded inside run blocks" bash -c '! grep -E "^ +[a-z]" "$1" | grep -E "\\$\\{\\{ *inputs\\." | grep -v "CA_B64:\|TARGET:" | grep -q .' _ "$f"
 }
 
 test_ipxe_request_prints_public_cert_only() {
@@ -557,6 +712,7 @@ test_ipxe_request_prints_public_cert_only() {
   ( attest_init ) >/dev/null 2>&1 || skip "gpg/openssl not usable"
   out=$(ipxe_request 2>&1)
   assert "has the workflow page link" grep -q 'actions/workflows/build-ipxe.yml' <<<"$out"
+  assert "warns about the default-branch requirement" grep -q 'default branch' <<<"$out"
   assert "request file written" test -s "$HOME/ipxe-request.txt"
   dec=$(base64 -d < "$HOME/ipxe-request.txt")
   assert "request is a certificate" grep -q 'BEGIN CERTIFICATE' <<<"$dec"
@@ -566,36 +722,6 @@ test_ipxe_request_prints_public_cert_only() {
 test_cross_cpu_build_error_points_to_phone_build() {
   body=$(sed -n "/^build_ipxe() {/,/^}/p" "$SCRIPT")
   grep -q 'ipxe-phone' <<<"$body"
-}
-
-test_workflow_file_is_present_and_safe() {
-  f="$HERE/../.github/workflows/build-ipxe.yml"
-  assert "workflow exists" test -s "$f"
-  assert "inputs go through env (no script injection)" grep -q 'CA_B64: ${{ inputs.ca_pem_b64 }}' "$f"
-  assert "rejects private keys" grep -q 'PRIVATE KEY' "$f"
-  assert "does not echo inputs inside run blocks" bash -c '! grep -E "run:|^ +[a-z]" "$1" | grep -E "\\$\\{\\{ *inputs\\." | grep -v "CA_B64\|TARGET:" | grep -q .' _ "$f"
-}
-
-test_cloud_route_needs_an_informed_yes() {
-  src
-  ipxe_request() { echo "REQUEST-RAN"; }
-  ASSUME_YES=1
-  out=$(ipxe_cloud 2>&1)
-  assert "warning shown" grep -q "WEAKER TRUST" <<<"$out"
-  assert "--yes never opts in" bash -c '! grep -q REQUEST-RAN <<<"$1"' _ "$out"
-}
-
-test_cloud_loader_is_flagged_in_status() {
-  src; mkroot
-  mkdir -p "$TFTP"; echo x > "$TFTP/ipxe.efi"
-  printf 'commit=abc\nsource=cloud:ipxe-x86_64-1\n' > "$IPXE_BUILT"
-  diagnose
-  hit=0; for i in "${!F_TAG[@]}"; do [[ ${F_TAG[$i]} == LOADERTRUST && ${F_LVL[$i]} == WARN ]] && hit=1; done
-  assert "cloud-built loader raises a warning" test $hit -eq 1
-  printf 'commit=imported\n' > "$IPXE_BUILT"
-  diagnose
-  hit=0; for i in "${!F_TAG[@]}"; do [[ ${F_TAG[$i]} == LOADERTRUST ]] && hit=1; done
-  assert "an imported loader clears it" test $hit -eq 0
 }
 
 # ---- on-phone cross build (Termux + proot-distro Debian), simulated ----
@@ -667,7 +793,7 @@ test_phone_without_box_is_told_the_one_command() {
   assert "names ipxe-phone" grep -q 'ipxe-phone' "$T/b.out"
 }
 
-test_guide_recommends_phone_build_when_cpu_differs() {
+test_guide_defaults_to_the_one_time_pinned_github_build() {
   cat > "$T/ip.sh" <<EOF
 export NETBOOT_SOURCE_ONLY=1
 source "$SCRIPT"
@@ -679,9 +805,9 @@ ipxe_cloud() { echo "CLOUD-RAN"; }
 guided_ipxe
 EOF
   python3 -I -c "$PTY_PY" "|" bash "$T/ip.sh" > "$T/pty.out" 2>&1
-  assert "Enter picks the on-phone build" grep -q "PHONE-BUILD-RAN" "$T/pty.out"
-  assert "cloud still labelled weaker" grep -q "weaker trust, not recommended" "$T/pty.out"
-  assert "cloud not run by default" bash -c '! grep -q CLOUD-RAN "$1"' _ "$T/pty.out"
+  assert "Enter picks the one-time GitHub build" grep -q "CLOUD-RAN" "$T/pty.out"
+  assert "on-phone build is still offered" grep -q "x86_64 compiler" "$T/pty.out"
+  assert "phone build not run by default" bash -c '! grep -q PHONE-BUILD-RAN "$1"' _ "$T/pty.out"
 }
 
 # ---------------------------------------------------------------- run
