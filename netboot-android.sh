@@ -26,15 +26,29 @@
 #       Its built-in script refuses to run boot.ipxe, the kernel, or any initrd
 #       unless the signature verifies against that CA.
 #    6. Integrity gate. Every served file is re-hashed against the manifest
-#       before the servers start.
+#       before the servers start, and the manifest itself must carry a valid
+#       signature from the attestation key.
 #    7. Signed attestation reports tie all of the above together and can be
 #       re-verified at any time.
 #
-#  LIMITS
+#  LIMITS (read these; they are real)
+#    - The first-stage iPXE binary is loaded by the PC's firmware over TFTP,
+#      which has no authentication, with Secure Boot off. Someone on the
+#      network between phone and PC can hand the PC a rogue iPXE that skips
+#      every signature check. The signed chain protects you only on a network
+#      you trust. A direct cable (--mode direct) is the strongest option here.
 #    - The large root image that the initrd downloads after boot (the Ubuntu
 #      ISO, the Debian or Parrot squashfs, the Fedora squashfs) is not
-#      signature-checked on the client. Arch and SystemRescue verify theirs
-#      with checksum=y.
+#      authenticated on the client for any distro. Arch and SystemRescue's
+#      checksum=y reads a checksum file served over the same plain HTTP, so it
+#      catches corruption, not tampering.
+#    - The CA private key lives on this device. The chain protects against the
+#      network, not against a compromised phone.
+#    - Quick mode (stock iPXE) turns all boot-time checks off. check, serve,
+#      the menu and the attestation report say so whenever it is active.
+#    - Downloads that are verified afterwards (signatures, key fingerprints)
+#      may follow redirects to unpinned mirrors. The signature check is what
+#      protects them, not the transport.
 #    - Self-verification is tamper evidence. Someone who can edit this script
 #      can also edit the check. Compare the `fingerprints` output against a copy
 #      kept on another device for real assurance.
@@ -96,7 +110,8 @@ CT_API="https://api.certspotter.com/v1/issuances"
 CT_HOST="api.certspotter.com"
 KEYSERVER_UBUNTU="https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x"
 KEYSERVER_OPENPGP="https://keys.openpgp.org/vks/v1/by-fingerprint/"
-INFRA_HOSTS=(api.certspotter.com keyserver.ubuntu.com keys.openpgp.org github.com)
+KEYSERVER_PGPKEYS="https://pgpkeys.eu/pks/lookup?op=get&options=mr&search=0x"
+INFRA_HOSTS=(api.certspotter.com keyserver.ubuntu.com keys.openpgp.org pgpkeys.eu github.com boot.ipxe.org)
 DEFAULT_UPSTREAM_REPO="https://github.com/SecTrollz/netboot-android.git"
 UPSTREAM_PATH="netboot-android.sh"
 
@@ -105,11 +120,27 @@ UPSTREAM_PATH="netboot-android.sh"
 # =============================================================================
 IFACE="${IFACE:-}"
 HTTP_PORT="${HTTP_PORT:-8000}"
+
+# Choices saved by the setup wizard are used when neither the environment nor
+# the command line sets them. Only known keys with plain values are read.
+SAVED_DEFAULTS="$STATE/defaults"
+if [[ -f $SAVED_DEFAULTS ]]; then
+  while IFS='=' read -r _k _v; do
+    [[ $_v =~ ^[a-z0-9_]+$ ]] || continue
+    case $_k in
+      DISTRO)      [[ -n ${DISTRO:-} ]]      || DISTRO=$_v ;;
+      TARGET_ARCH) [[ -n ${TARGET_ARCH:-} ]] || TARGET_ARCH=$_v ;;
+      DHCP_MODE)   [[ -n ${DHCP_MODE:-} ]]   || DHCP_MODE=$_v ;;
+    esac
+  done < "$SAVED_DEFAULTS"
+  unset _k _v
+fi
 DISTRO="${DISTRO:-ubuntu}"
 TARGET_ARCH="${TARGET_ARCH:-x86_64}"
 DHCP_MODE="${DHCP_MODE:-auto}"            # auto | proxy | direct
 DIRECT_CIDR="${DIRECT_CIDR:-10.42.0.1/24}"
 VERIFIED_BOOT="${VERIFIED_BOOT:-1}"
+VERIFIED_BOOT_REQ=$VERIFIED_BOOT          # what was asked for; quick mode overrides it to 0
 DEEP_VERIFY="${DEEP_VERIFY:-1}"
 INCLUDE_UCODE="${INCLUDE_UCODE:-1}"
 IPXE_COMMIT="${IPXE_COMMIT:-$DEFAULT_IPXE_COMMIT}"
@@ -121,6 +152,7 @@ ALLOW_UNPINNED="${ALLOW_UNPINNED:-0}"
 ALLOW_UNVERIFIED="${ALLOW_UNVERIFIED:-0}"
 ACCEPT_SCRIPT_CHANGE="${ACCEPT_SCRIPT_CHANGE:-0}"
 CT_BOOTSTRAP="${CT_BOOTSTRAP:-0}"
+PIN_STRICT_ISSUER="${PIN_STRICT_ISSUER:-0}"
 UPSTREAM_REPO="${UPSTREAM_REPO:-$DEFAULT_UPSTREAM_REPO}"
 UPSTREAM_BRANCH="${UPSTREAM_BRANCH:-main}"
 EXPECT_CODE="${EXPECT_CODE:-}"
@@ -131,6 +163,7 @@ U_SUMS_URL="${SUMS_URL:-}"
 U_SUMS_SIG_URL="${SUMS_SIG_URL:-}"
 U_ISO_SIG_URL="${ISO_SIG_URL:-}"
 U_KEY_FPR="${KEY_FPR:-}"
+U_KEY_EXTRA_URL="${KEY_EXTRA_URL:-}"
 U_BOOT_ARGS="${BOOT_ARGS:-}"
 U_MIN_FREE_MB="${MIN_FREE_MB:-}"
 
@@ -163,14 +196,25 @@ banner() {
   printf '%s  netboot-android %s  -  verified PXE live boot%s\n\n' "$C_BOLD" "$SCRIPT_VERSION" "$C_RESET"
 }
 
+# Lines wider than the box are printed in full and push the right border out,
+# so hashes and fingerprints are never truncated
 box() {
-  local width=64 line dashes
+  local width=76 line dashes
   printf -v dashes '%*s' "$width" ''
   dashes=${dashes// /-}
   printf '+%s+\n' "$dashes"
-  for line in "$@"; do printf '| %-62.62s |\n' "$line"; done
+  for line in "$@"; do printf '| %-74s |\n' "$line"; done
   printf '+%s+\n' "$dashes"
 }
+
+# 64 hex chars -> xxxx-xxxx-xxxx-xxxx, for comparing values by eye across devices
+short_code() {
+  local h=${1,,}
+  printf '%s-%s-%s-%s\n' "${h:0:4}" "${h:4:4}" "${h:8:4}" "${h:12:4}"
+}
+
+# Quotes one value for safe use inside a run_root command string
+q() { printf '%q' "$1"; }
 
 # =============================================================================
 # Small helpers
@@ -206,7 +250,9 @@ run_root() {
 # ip, falling back to root when SELinux blocks netlink for apps
 ip_q() {
   ip "$@" 2>/dev/null && return 0
-  run_root "ip $*" 2>/dev/null || true
+  local a cmd=ip
+  for a in "$@"; do cmd+=" $(q "$a")"; done
+  run_root "$cmd" 2>/dev/null || true
 }
 
 int_to_ip() {
@@ -423,7 +469,7 @@ set_distro() {
   [[ -n $U_SUMS_SIG_URL ]] && SUMS_CLEARSIGNED=0
   SUMS_ALGO=$P_SUMS_ALGO
   ISO_SIG_URL=${U_ISO_SIG_URL:-$P_ISO_SIG_URL}
-  KEY_EXTRA_URL=$P_KEY_EXTRA_URL
+  KEY_EXTRA_URL=${U_KEY_EXTRA_URL:-$P_KEY_EXTRA_URL}
   KEY_FPR=$(norm_fpr "${U_KEY_FPR:-$(vendor_fpr "$DISTRO")}")
   MIN_FREE_MB=${U_MIN_FREE_MB:-$P_MIN_MB}
   CLIENT_RAM_GB=$P_RAM_GB
@@ -562,6 +608,8 @@ auto_iface() {
 resolve_network() {
   [[ -n $IFACE ]] || IFACE=$(auto_iface)
   [[ -n $IFACE ]] || die "No usable network interface. Connect to Wi-Fi or Ethernet, or set IFACE=..."
+  [[ $IFACE =~ ^[A-Za-z0-9._@-]+$ ]] || die "Invalid interface name '$IFACE'"
+  [[ $DIRECT_CIDR =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || die "DIRECT_CIDR must look like 10.42.0.1/24"
 
   local cidr
   cidr=$(iface_cidr "$IFACE")
@@ -679,7 +727,8 @@ vfetch() {
     if [[ -n $pins ]]; then
       popt=(--pinnedpubkey "$pins")
     elif [[ $mode == protected ]]; then
-      info "No pin for $host; using CA-validated TLS (content is verified afterwards)"
+      warn "No valid pin for $host; using CA-validated TLS. The content is still checked by signature or fingerprint. Run: $0 pins refresh $host"
+      audit "$host UNPINNED-PROTECTED url=$url"
     elif [[ $ALLOW_UNPINNED == 1 ]]; then
       warn "No pin for $host. Fetching unpinned because ALLOW_UNPINNED=1"
     else
@@ -716,25 +765,38 @@ vfetch() {
   die "Too many redirects for $1"
 }
 
-# GET against the CT API, pinned
+# GET against the CT API, pinned. Rate limits (429) and server errors (5xx)
+# are retried with backoff; anything else fails at once.
 ct_get() {
-  local url=$1 dest=$2 pins rc=0
+  local url=$1 dest=$2 pins rc code attempt=0
+  local -a popt=() waits=(10 30 60)
   pins=$(pins_curl_arg "$CT_HOST")
   if [[ -n $pins ]]; then
-    curl -fsS --proto '=https' --tlsv1.2 --connect-timeout 20 --max-time 120 \
-         --pinnedpubkey "$pins" -o "$dest" "$url" || rc=$?
+    popt=(--pinnedpubkey "$pins")
   elif [[ $CT_BOOTSTRAP == 1 ]]; then
     warn "No valid pin for $CT_HOST. Bootstrapping over CA-validated TLS (CT_BOOTSTRAP=1)."
-    curl -fsS --proto '=https' --tlsv1.2 --connect-timeout 20 --max-time 120 -o "$dest" "$url" || rc=$?
   else
     die "No valid pin for $CT_HOST (embedded pins expired). Run once with CT_BOOTSTRAP=1 on a network you trust."
   fi
-  case $rc in
-    0)  return 0 ;;
-    90) audit "$CT_HOST PIN-MISMATCH"; die "PIN MISMATCH for $CT_HOST. Possible TLS interception." ;;
-    22) err "CT API refused the request (rate limit or HTTP error). Wait a few minutes and retry."; return 1 ;;
-    *)  err "CT API request failed (curl error $rc)"; return 1 ;;
-  esac
+  while :; do
+    rc=0
+    code=$(curl -sS --proto '=https' --tlsv1.2 --connect-timeout 20 --max-time 120 \
+                "${popt[@]+"${popt[@]}"}" -o "$dest" -w '%{http_code}' "$url") || rc=$?
+    case $rc in
+      0)  ;;
+      90) audit "$CT_HOST PIN-MISMATCH"; die "PIN MISMATCH for $CT_HOST. Possible TLS interception." ;;
+      *)  err "CT API request failed (curl error $rc)"; return 1 ;;
+    esac
+    [[ $code == 2?? ]] && return 0
+    if [[ $code == 429 || $code == 5?? ]] && (( attempt < ${#waits[@]} )); then
+      warn "CT API returned HTTP $code. Retrying in ${waits[$attempt]}s"
+      sleep "${waits[$attempt]}"
+      attempt=$((attempt+1))
+      continue
+    fi
+    err "CT API returned HTTP $code. Wait a few minutes and retry."
+    return 1
+  done
 }
 
 # Prints "spki until issuer" lines for all current, unrevoked certs covering HOST
@@ -781,8 +843,9 @@ pins_refresh() {
   local -a hosts=("$@")
   if (( ${#hosts[@]} == 0 )); then mapfile -t hosts < <(pin_hosts_for_target); fi
 
-  local tmp h served fails=0 n
-  tmp=$(mktemp -d)
+  # Fixed scratch dir, wiped at the start of every run, so an early exit can't leave stale data around
+  local tmp="$STATE/ct-tmp" h served fails=0 n issuer old_issuers
+  rm -rf "$tmp"; mkdir -p "$tmp"
   for h in "${hosts[@]}"; do
     info "Checking $h against Certificate Transparency"
     if ! ct_current "$h" "$tmp" > "$tmp/$h.pins"; then
@@ -799,9 +862,23 @@ pins_refresh() {
     fi
 
     if awk '{print $1}' "$tmp/$h.pins" | grep -qxF "$served"; then
-      awk -v src="ct:$(today)" '{print $1, $2, src}' "$tmp/$h.pins" > "$PIN_DIR/$h"
-      ok "$h: served key is in CT ($n current keys pinned)"
-      audit "$h OK served=$served ct_keys=$n"
+      # Issuer of the served key, compared with the issuers pinned last time.
+      # A new CA for a host is how a mis-issued certificate would show up.
+      issuer=$(awk -v k="$served" '$1==k {print $3; exit}' "$tmp/$h.pins")
+      if [[ -s $PIN_DIR/$h ]]; then
+        old_issuers=$(awk 'NF>=4 {print $4}' "$PIN_DIR/$h" | sort -u)
+        if [[ -n $old_issuers ]] && ! grep -qxF "$issuer" <<<"$old_issuers"; then
+          warn "$h: ISSUER CHANGED. The served key is from $issuer; previous pins were from: $(tr '\n' ' ' <<<"$old_issuers")"
+          audit "$h ISSUER-CHANGED served_issuer=$issuer"
+          if [[ $PIN_STRICT_ISSUER == 1 ]]; then
+            err "    Pins for $h were NOT updated (PIN_STRICT_ISSUER=1)."
+            fails=$((fails+1)); continue
+          fi
+        fi
+      fi
+      awk -v src="ct:$(today)" '{print $1, $2, src, $3}' "$tmp/$h.pins" > "$PIN_DIR/$h"
+      ok "$h: served key is in CT ($n current keys pinned, issuer $issuer)"
+      audit "$h OK served=$served issuer=$issuer ct_keys=$n"
     else
       err "$h: INTERCEPTION SUSPECTED. Served key sha256//$served is not in the CT log set."
       err "    Pins for $h were NOT updated. Do not download over this network."
@@ -848,8 +925,9 @@ prepare_keyring() {
   scratch=$(mktemp -d); chmod 700 "$scratch"
   : > "$GNUPG_HOME/source-fprs"
 
-  local -a srcs=("${KEYSERVER_UBUNTU}${KEY_FPR}" "${KEYSERVER_OPENPGP}${KEY_FPR}")
+  local -a srcs=("${KEYSERVER_UBUNTU}${KEY_FPR}" "${KEYSERVER_OPENPGP}${KEY_FPR}" "${KEYSERVER_PGPKEYS}${KEY_FPR}")
   [[ -n $KEY_EXTRA_URL ]] && srcs+=("$KEY_EXTRA_URL")
+  local -a answered=()
 
   for src in "${srcs[@]}"; do
     i=$((i+1))
@@ -860,6 +938,7 @@ prepare_keyring() {
         agree=$((agree+1))
         printf '%s %s\n' "$i" "$(tr '\n' ' ' <<<"$fprs")" >> "$GNUPG_HOME/source-fprs"
         gpg --homedir "$GNUPG_HOME" --batch --no-tty --quiet --import "$f" 2>/dev/null || true
+        answered+=("$(url_host "$src")")
         ok "Source $i ($(url_host "$src")) has key $KEY_FPR"
       else
         warn "Source $i ($(url_host "$src")) did not return key $KEY_FPR"
@@ -870,7 +949,7 @@ prepare_keyring() {
   done
   rm -rf "$scratch"
 
-  (( agree >= 2 )) || die "Key $KEY_FPR was confirmed by only $agree source(s). Need at least 2."
+  (( agree >= 2 )) || die "Key $KEY_FPR was confirmed by only $agree source(s) (${answered[*]:-none}). Need at least 2. Set KEY_EXTRA_URL to a key URL from the vendor's own site to add one."
   gpg --homedir "$GNUPG_HOME" --batch --no-tty --list-keys "$KEY_FPR" >/dev/null 2>&1 \
     || die "Key $KEY_FPR could not be imported into the keyring"
   touch "$GNUPG_HOME/.ready-$KEY_FPR"
@@ -951,8 +1030,9 @@ ca_fpr_hex() {
   openssl x509 -in "${1:-$ATTEST/ca.crt}" -outform DER | sha256sum | awk '{print $1}'
 }
 
+# openssl_has_not_before req|x509: whether that subcommand accepts -not_before/-not_after
 openssl_has_not_before() {
-  openssl x509 -help 2>&1 | grep -q -- '-not_before'
+  openssl "$1" -help 2>&1 | grep -q -- '-not_before'
 }
 
 attest_init() {
@@ -975,10 +1055,15 @@ attest_init() {
 
   if [[ ! -s $ATTEST/ca.crt ]]; then
     info "Generating the boot code-signing CA (RSA 3072)"
-    local -a validity=(-days 7300)
-    if openssl_has_not_before; then
-      # Backdated start so a client with a wrong clock still accepts it
+    # Backdated start, where openssl supports it, so a client with a wrong clock still accepts it
+    local -a validity=(-days 7300) cvalidity=(-days 7300)
+    if openssl_has_not_before req; then
       validity=(-not_before 20200101000000Z -not_after 20450101000000Z)
+    else
+      warn "This openssl cannot backdate certificates; a PC with its clock set before today will reject them"
+    fi
+    if openssl_has_not_before x509; then
+      cvalidity=(-not_before 20200101000000Z -not_after 20450101000000Z)
     fi
     openssl req -x509 -newkey rsa:3072 -nodes -sha256 "${validity[@]}" \
       -subj "/CN=netboot-android attestation CA" \
@@ -992,7 +1077,7 @@ attest_init() {
     printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=codeSigning\n' \
       > "$ATTEST/codesign.ext"
     openssl x509 -req -in "$ATTEST/codesign.csr" -CA "$ATTEST/ca.crt" -CAkey "$ATTEST/ca.key" \
-      -CAcreateserial -sha256 "${validity[@]}" -extfile "$ATTEST/codesign.ext" \
+      -CAcreateserial -sha256 "${cvalidity[@]}" -extfile "$ATTEST/codesign.ext" \
       -out "$ATTEST/codesign.crt" 2>/dev/null || die "Code-signing certificate failed"
     openssl verify -CAfile "$ATTEST/ca.crt" "$ATTEST/codesign.crt" >/dev/null \
       || die "Code-signing certificate does not chain to the CA"
@@ -1071,7 +1156,7 @@ show_fingerprints() {
     "Release time:" \
     "  $( [[ -n $RELEASE_TIME ]] && epoch_to_iso "$RELEASE_TIME" || echo 'not stamped')" \
     "Release code:" \
-    "  $( [[ -n $RELEASE_TIME ]] && release_code "$SELF" "$RELEASE_TIME" | awk '{print $2}' || echo 'not stamped')"
+    "  $( [[ -n $RELEASE_TIME ]] && release_hash "$SELF" "$RELEASE_TIME" | awk '{print $2}' || echo 'not stamped')"
   echo
 }
 
@@ -1121,8 +1206,12 @@ git_pin_opts() {
 # =============================================================================
 # Release stamp and upstream verification
 # =============================================================================
-# HMAC-SHA256 of FILE keyed by the exact upload time. Prints "fullhex shortcode".
-release_code() {
+# SHA-256 of FILE bound to the exact upload time. Prints "fullhex shortcode".
+# Built with openssl's HMAC construction, but the "key" is the public upload
+# time, so this is NOT authentication: anyone can recompute it. It is only a
+# value to compare against the copy on GitHub and against a code recorded
+# somewhere other than this device.
+release_hash() {
   local file=$1 epoch=$2 hex
   hex=$(openssl dgst -sha256 -hmac "netboot-android-v1:$epoch" -r "$file" | awk '{print $1}')
   [[ ${#hex} -eq 64 ]] || return 1
@@ -1152,7 +1241,7 @@ release_stamp() {
   grep -q "^RELEASE_TIME=\"$epoch\"" "$SELF" || die "Could not write RELEASE_TIME into $SELF"
   RELEASE_TIME=$epoch
 
-  read -r _ code < <(release_code "$SELF" "$epoch") || die "Could not compute the release code"
+  read -r _ code < <(release_hash "$SELF" "$epoch") || die "Could not compute the release code"
   ok "RELEASE_TIME set to $epoch ($(epoch_to_iso "$epoch"))"
   [[ -n $(attest_fpr) ]] && self_sign
 
@@ -1206,8 +1295,8 @@ verify_upstream() {
   fi
 
   local lhex lcode uhex ucode
-  read -r lhex lcode < <(release_code "$SELF" "$RELEASE_TIME") || die "Could not hash $SELF"
-  read -r uhex ucode < <(release_code "$up" "$ctime") || die "Could not hash the upstream copy"
+  read -r lhex lcode < <(release_hash "$SELF" "$RELEASE_TIME") || die "Could not hash $SELF"
+  read -r uhex ucode < <(release_hash "$up" "$ctime") || die "Could not hash the upstream copy"
 
   local bad=0
   [[ $lhex == "$uhex" ]] || bad=1
@@ -1374,6 +1463,7 @@ build_ipxe() {
   [[ $VERIFIED_BOOT == 1 ]] && check_ca_embedded "$efi" "$ca"
 
   {
+    if [[ $VERIFIED_BOOT == 1 ]]; then echo "mode=signed"; else echo "mode=unsigned"; fi
     echo "commit=$head"
     echo "built=$(now_iso)"
     echo "host=$(uname -srm)"
@@ -1386,9 +1476,43 @@ build_ipxe() {
   ok "iPXE installed to $TFTP (record: $IPXE_BUILT)"
 }
 
+# mode= line of the iPXE record: signed | unsigned | quick (empty if none)
+ipxe_mode() {
+  [[ -s ${IPXE_BUILT:-} ]] || return 0
+  awk -F= '$1=="mode"{print $2; exit}' "$IPXE_BUILT"
+}
+
+# Pulls iPXE binaries over the LAN from a PC running "setup.sh --pc-helper".
+# The transfer is plain HTTP, so the person compares the short codes shown on
+# both screens before anything is used.
+fetch_ipxe_from_url() {
+  local url=${1%/} dir=$2 f code ans
+  mkdir -p "$dir"
+  for f in $(ipxe_files_for_arch); do
+    curl -fsS --connect-timeout 10 --max-time 300 -o "$dir/$f" "$url/$f" || die "Could not download $url/$f"
+  done
+  echo
+  info "Compare these codes with the ones on the PC screen:"
+  for f in $(ipxe_files_for_arch); do
+    code=$(short_code "$(sha256_of "$dir/$f")")
+    printf '    %-16s %s\n' "$f" "$code"
+  done
+  echo
+  read -r -p "Do ALL of them match the PC screen exactly? [y/N] " ans
+  [[ $ans == [yY]* ]] || die "Codes not confirmed. Nothing was imported."
+}
+
 import_ipxe() {
-  local dir=${1:-}
-  [[ -n $dir && -d $dir ]] || die "Usage: $0 import-ipxe DIR   (DIR holds ipxe.efi / undionly.kpxe / ipxe-arm64.efi)"
+  local dir=${1:-} src
+  [[ -n $dir ]] || die "Usage: $0 import-ipxe DIR|http://PC:PORT   (holds ipxe.efi / undionly.kpxe / ipxe-arm64.efi)"
+  src=$dir
+  if [[ $dir == http://* ]]; then
+    local tmp="$STATE/ipxe-download"
+    rm -rf "$tmp"
+    fetch_ipxe_from_url "$dir" "$tmp"
+    dir=$tmp
+  fi
+  [[ -d $dir ]] || die "No such directory: $dir"
   mkdir -p "$TFTP" "$STATE"
   local f n=0
   for f in $(ipxe_files_for_arch); do
@@ -1410,8 +1534,9 @@ import_ipxe() {
     warn "VERIFIED_BOOT=0: imported binaries are trusted as-is"
   fi
   {
+    if [[ $VERIFIED_BOOT == 1 ]]; then echo "mode=signed"; else echo "mode=unsigned"; fi
     echo "commit=imported"
-    echo "source_dir=$dir"
+    echo "source=$src"
     echo "imported=$(now_iso)"
     echo "verified_boot=$VERIFIED_BOOT"
     [[ $VERIFIED_BOOT == 1 ]] && echo "ca_sha256=$(ca_fpr_hex)"
@@ -1419,6 +1544,58 @@ import_ipxe() {
       [[ -s $TFTP/$f ]] && echo "file=$f sha256=$(sha256_of "$TFTP/$f")"
     done
   } > "$IPXE_BUILT"
+}
+
+# Quick mode: stock iPXE from boot.ipxe.org. Nothing on the boot path is signed.
+# Only reachable after the person types YES.
+quick_ipxe() {
+  echo
+  box \
+    "QUICK MODE: UNSIGNED BOOT" \
+    "" \
+    "This downloads stock iPXE from boot.ipxe.org. It has no trust anchor," \
+    "so the PC will boot whatever kernel it is handed, signed or not." \
+    "Anyone on the network between the phone and the PC could swap it." \
+    "" \
+    "You can upgrade to signed boot later from the menu (PC helper)."
+  echo
+  local ans
+  read -r -p "Type YES to use quick mode: " ans
+  [[ $ans == YES ]] || die "Quick mode not confirmed"
+
+  # Nothing checks these files afterwards, so the transport is all there is:
+  # HTTPS only, no redirects off https, pinned when a pin exists
+  local base=https://boot.ipxe.org tmp="$STATE/ipxe-quick" f pins
+  local -a popt=()
+  rm -rf "$tmp"; mkdir -p "$tmp" "$TFTP"
+  pins=$(pins_curl_arg boot.ipxe.org)
+  if [[ -n $pins ]]; then popt=(--pinnedpubkey "$pins"); else warn "No pin for boot.ipxe.org; relying on ordinary HTTPS certificate checks"; fi
+  local -a pairs
+  if [[ $TARGET_ARCH == x86_64 ]]; then
+    pairs=("ipxe.efi ipxe.efi" "undionly.kpxe undionly.kpxe")
+  else
+    pairs=("arm64-efi/ipxe.efi ipxe-arm64.efi")
+  fi
+  local p
+  for p in "${pairs[@]}"; do
+    curl -fsS --proto '=https' --proto-redir '=https' --tlsv1.2 -L --max-redirs 3 --connect-timeout 20 --max-time 300 \
+         "${popt[@]+"${popt[@]}"}" -o "$tmp/${p#* }" "$base/${p%% *}" \
+      || die "Download of $base/${p%% *} failed"
+  done
+  for f in $(ipxe_files_for_arch); do
+    [[ -s $tmp/$f ]] || die "Download of $f failed"
+    head -c 2 "$tmp/$f" | grep -q 'MZ' || [[ $f == *.kpxe ]] || die "$f is not a PE/EFI binary"
+    cp "$tmp/$f" "$TFTP/$f"
+  done
+  {
+    echo "mode=quick"
+    echo "commit=stock-boot.ipxe.org"
+    echo "imported=$(now_iso)"
+    echo "verified_boot=0"
+    for f in $(ipxe_files_for_arch); do echo "file=$f sha256=$(sha256_of "$TFTP/$f")"; done
+  } > "$IPXE_BUILT"
+  VERIFIED_BOOT=0
+  warn "Quick mode is set for $TARGET_ARCH. Boots from this phone are UNSIGNED until you upgrade."
 }
 
 # =============================================================================
@@ -1661,17 +1838,51 @@ kernel_args() {
   printf '%s' "$t"
 }
 
+# Every directory from / down to DIR is world-searchable
+path_world_traversable() {
+  local d=$1
+  while [[ -n $d && $d != / ]]; do
+    [[ $(stat -c %A "$d" 2>/dev/null) == ?????????[xt] ]] || return 1
+    d=$(dirname "$d")
+  done
+}
+
+# dnsmasq binds its ports as root and then drops to this user. On Linux it
+# drops to nobody when that account can reach the TFTP files. Android has no
+# nobody account and gates dnsmasq with SELinux, so it stays root there.
+dnsmasq_user_lines() {
+  local grp=""
+  if (( ! IS_ANDROID )) && id nobody >/dev/null 2>&1 && path_world_traversable "$TFTP"; then
+    if getent group nogroup >/dev/null 2>&1; then grp=nogroup
+    elif getent group nobody >/dev/null 2>&1; then grp=nobody; fi
+    if [[ -n $grp ]]; then
+      echo "user=nobody"
+      echo "group=$grp"
+      return
+    fi
+  fi
+  echo "user=root"
+  echo "group=root"
+}
+
 require_ipxe_matches_ca() {
   local f
   for f in $(ipxe_files_for_arch); do
     [[ -s $TFTP/$f ]] || die "Missing $f. Run: $0 build-ipxe (or import-ipxe DIR)"
   done
-  [[ $VERIFIED_BOOT == 1 ]] || return 0
   [[ -s $IPXE_BUILT ]] || die "No iPXE build record. Run: $0 build-ipxe"
+  # The binaries must still be the ones recorded at build or import time
+  local rec_file rec_sha
+  while read -r rec_file rec_sha; do
+    [[ -s $TFTP/$rec_file ]] || continue
+    [[ $(sha256_of "$TFTP/$rec_file") == "$rec_sha" ]] \
+      || die "$rec_file changed since it was built or imported. Rebuild or re-import iPXE."
+  done < <(sed -n 's/^file=\([^ ]*\) sha256=\([0-9a-f]*\)$/\1 \2/p' "$IPXE_BUILT")
+  [[ $VERIFIED_BOOT == 1 ]] || return 0
   local want have
   want=$(ca_fpr_hex) || die "No boot CA. Run: $0 attest-init"
   have=$(awk -F= '$1=="ca_sha256"{print $2}' "$IPXE_BUILT")
-  [[ $have == "$want" ]] || die "iPXE was built with a different CA ($have). Rebuild: $0 build-ipxe"
+  [[ $have == "$want" ]] || die "iPXE was built with a different CA (${have:-none}). Rebuild: $0 build-ipxe"
 }
 
 configure() {
@@ -1733,8 +1944,7 @@ configure() {
     echo "except-interface=lo"
     echo "log-dhcp"
     echo "log-facility=-"
-    echo "user=root"
-    echo "group=root"
+    dnsmasq_user_lines
     echo "pid-file=$RUN/dnsmasq.pid"
     echo "dhcp-leasefile=$RUN/dnsmasq.leases"
     echo "enable-tftp"
@@ -1777,6 +1987,7 @@ configure() {
 
   info "Recording the integrity manifest (hashes every served file)"
   write_manifest
+  sign_manifest
   {
     echo "configured=$(now_iso)"
     echo "iface=$IFACE mode=$MODE net=$NET/$PREFIX_LEN phone=$PHONE_IP port=$HTTP_PORT"
@@ -1830,9 +2041,37 @@ write_manifest() {
   mv -f "$tmp" "$MANIFEST"
 }
 
+# Detached signature over the manifest with the attestation key, so the
+# serve-time gate can tell a tampered manifest from a genuine one
+sign_manifest() {
+  rm -f "$MANIFEST.asc"
+  if [[ -z $(attest_fpr) ]]; then
+    warn "No attestation key, so the manifest is unsigned. Run: $0 attest-init, then configure again"
+    return 0
+  fi
+  gpg --homedir "$ATTEST_GNUPG" --batch --no-tty --yes --local-user "$(attest_fpr)" \
+      --armor --detach-sign --output "$MANIFEST.asc" "$MANIFEST" || die "Signing the manifest failed"
+  ok "Manifest signed with the attestation key"
+}
+
 verify_manifest() {
   [[ -f $MANIFEST ]] || die "No manifest. Run: $0 configure"
-  local h s rel f cur bad=0 checked=0
+  local h s rel f cur bad=0 checked=0 st
+  if [[ -n $(attest_fpr) ]]; then
+    [[ -s $MANIFEST.asc ]] || die "The manifest has no signature. Run: $0 configure"
+    st=$(mktemp)
+    gpg --homedir "$ATTEST_GNUPG" --batch --no-tty --status-file "$st" \
+        --verify "$MANIFEST.asc" "$MANIFEST" >/dev/null 2>&1 || true
+    if ! awk -v f="$(attest_fpr)" '$2=="VALIDSIG" && $NF==f {x=1} END{exit !x}' "$st"; then
+      rm -f "$st"
+      audit "MANIFEST SIGNATURE-INVALID"
+      die "The manifest signature is INVALID. Someone changed it, or the files it lists. Refusing to serve. Re-run extract and configure."
+    fi
+    rm -f "$st"
+    ok "Manifest signature valid"
+  else
+    warn "No attestation key: the manifest is unsigned, so this gate only catches accidental changes"
+  fi
   info "Integrity gate: checking every served file (DEEP_VERIFY=$DEEP_VERIFY)"
   while read -r h s rel; do
     f="$ROOT/$rel"
@@ -1879,7 +2118,7 @@ attest_report() {
     echo "boot_ca_sha256=$(ca_fpr_hex 2>/dev/null || echo none)"
     if [[ -n $RELEASE_TIME ]]; then
       echo "release_time=$(epoch_to_iso "$RELEASE_TIME")"
-      echo "release_code=$(release_code "$SELF" "$RELEASE_TIME" | awk '{print $2}')"
+      echo "release_code=$(release_hash "$SELF" "$RELEASE_TIME" | awk '{print $2}')"
     else
       echo "release_time=none"
     fi
@@ -1911,6 +2150,7 @@ attest_report() {
     echo "[boot]"
     cat "$STATE/$DISTRO-$TARGET_ARCH.config" 2>/dev/null || echo "not configured"
     echo "verified_boot=$VERIFIED_BOOT"
+    [[ $(ipxe_mode) == quick ]] && echo "WARNING=UNSIGNED BOOT (quick mode, stock iPXE)"
     echo
     echo "[files]"
     awk '{print "FILE", $1, $2, $3}' "$MANIFEST"
@@ -1974,25 +2214,26 @@ setup_direct() {
   local ip=${DIRECT_CIDR%/*}
   if ! ip_q -4 -o addr show dev "$IFACE" | grep -q "inet $ip/"; then
     info "Assigning $DIRECT_CIDR to $IFACE"
-    run_root "ip link set $IFACE up && ip addr add $DIRECT_CIDR dev $IFACE" || die "Could not assign $DIRECT_CIDR to $IFACE"
+    run_root "ip link set $(q "$IFACE") up && ip addr add $(q "$DIRECT_CIDR") dev $(q "$IFACE")" \
+      || die "Could not assign $DIRECT_CIDR to $IFACE"
     DIRECT_ADDED=1
   fi
   if (( IS_ANDROID )); then
     # Android uses policy routing; keep replies to the direct link on that link
-    run_root "ip rule add from $ip lookup main pref 9000 2>/dev/null; ip rule add to $NET/$PREFIX_LEN lookup main pref 9001 2>/dev/null; true" || true
+    run_root "ip rule add from $(q "$ip") lookup main pref 9000 2>/dev/null; ip rule add to $(q "$NET/$PREFIX_LEN") lookup main pref 9001 2>/dev/null; true" || true
   fi
 }
 
 teardown_direct() {
   (( DIRECT_ADDED )) || return 0
   local ip=${DIRECT_CIDR%/*}
-  run_root "ip addr del $DIRECT_CIDR dev $IFACE 2>/dev/null; ip rule del from $ip lookup main pref 9000 2>/dev/null; ip rule del to $NET/$PREFIX_LEN lookup main pref 9001 2>/dev/null; true" || true
+  run_root "ip addr del $(q "$DIRECT_CIDR") dev $(q "$IFACE") 2>/dev/null; ip rule del from $(q "$ip") lookup main pref 9000 2>/dev/null; ip rule del to $(q "$NET/$PREFIX_LEN") lookup main pref 9001 2>/dev/null; true" || true
   DIRECT_ADDED=0
 }
 
 power_save_off() {
   if (( IS_ANDROID )); then
-    if run_root "command -v iw >/dev/null 2>&1 && iw dev $IFACE set power_save off" >/dev/null 2>&1; then
+    if run_root "command -v iw >/dev/null 2>&1 && iw dev $(q "$IFACE") set power_save off" >/dev/null 2>&1; then
       ok "Wi-Fi power save disabled on $IFACE (iw)"; POWER_TWEAKED=1; return 0
     fi
     if run_root "cmd wifi force-hi-perf-mode enabled" >/dev/null 2>&1; then
@@ -2012,9 +2253,9 @@ kill_servers() {
   if [[ -n $SERVE_HTTP_PID ]]; then kill "$SERVE_HTTP_PID" 2>/dev/null || true; fi
   pkill -f "$LIB/httpd.py" 2>/dev/null || true
   if [[ -s $RUN/dnsmasq.pid ]]; then
-    run_root "kill \$(cat '$RUN/dnsmasq.pid') 2>/dev/null; rm -f '$RUN/dnsmasq.pid'" >/dev/null 2>&1 || true
+    run_root "kill \$(cat $(q "$RUN/dnsmasq.pid")) 2>/dev/null; rm -f $(q "$RUN/dnsmasq.pid")" >/dev/null 2>&1 || true
   fi
-  run_root "pkill -f '$DNSMASQ_CONF'" >/dev/null 2>&1 || true
+  run_root "pkill -f -- $(q "$DNSMASQ_CONF")" >/dev/null 2>&1 || true
 }
 
 cleanup() {
@@ -2023,7 +2264,7 @@ cleanup() {
   teardown_direct
   power_save_restore
   (( IS_TERMUX )) && termux-wake-unlock 2>/dev/null || true
-  run_root "chown -R $(id -u):$(id -g) '$RUN'" >/dev/null 2>&1 || true
+  run_root "chown -R $(id -u):$(id -g) $(q "$RUN")" >/dev/null 2>&1 || true
   echo
   info "Servers stopped"
 }
@@ -2034,7 +2275,7 @@ serve() {
   [[ $MODE == direct ]] && setup_direct
   resolve_network
 
-  grep -q "^interface=$IFACE$" "$DNSMASQ_CONF" && grep -q "$PHONE_IP:$HTTP_PORT" "$TFTP/boot.ipxe" \
+  grep -qxF "interface=$IFACE" "$DNSMASQ_CONF" && grep -qF "http://$PHONE_IP:$HTTP_PORT" "$TFTP/boot.ipxe" \
     || die "Network changed since configure (now $IFACE $PHONE_IP). Run: $0 configure"
 
   verify_manifest
@@ -2058,7 +2299,8 @@ serve() {
   kill -0 "$SERVE_HTTP_PID" 2>/dev/null || die "HTTP server failed to start. See $HTTP_LOG"
 
   local vb_text="ON (signed, client verifies)"
-  [[ $VERIFIED_BOOT == 1 ]] || vb_text="OFF"
+  [[ $VERIFIED_BOOT == 1 ]] || vb_text="OFF - UNSIGNED BOOT"
+  [[ $(ipxe_mode) == quick ]] && vb_text="OFF - UNSIGNED BOOT (quick mode)"
   echo
   box \
     "PXE SERVER STATUS: RUNNING" \
@@ -2068,17 +2310,19 @@ serve() {
     "Interface      : $IFACE ($MODE DHCP)" \
     "Subnet         : $NET/$PREFIX_LEN" \
     "Server IP      : $PHONE_IP" \
-    "Client URL     : $BASE_URL" \
     "Verified boot  : $vb_text" \
     "" \
-    "Live HTTP log  : $0 logs" \
+    "On the PC: enable network (PXE) boot, disable Secure Boot," \
+    "then pick 'network boot' from its boot menu." \
     "Press Ctrl+C to stop."
   echo
+  info "Client URL: $BASE_URL"
+  info "Live HTTP log: $0 logs"
 
   info "Starting dnsmasq ($MODE DHCP + TFTP) as root"
   local ldp=""
-  (( IS_TERMUX )) && ldp="LD_LIBRARY_PATH=$PREFIX/lib "
-  run_root "${ldp}$DNSMASQ --no-daemon --conf-file=$DNSMASQ_CONF" \
+  (( IS_TERMUX )) && ldp="LD_LIBRARY_PATH=$(q "$PREFIX/lib") "
+  run_root "${ldp}$(q "$DNSMASQ") --no-daemon --conf-file=$(q "$DNSMASQ_CONF")" \
     || die "dnsmasq exited. If it could not bind a port, check: $0 selinux status, and whether a hotspot or another DHCP/TFTP service holds ports 67/69."
 }
 
@@ -2174,7 +2418,15 @@ check() {
   (( expired == 0 )) && ok "Valid pins for all hosts in use"
   [[ -s $PIN_AUDIT ]] && grep -q INTERCEPTION "$PIN_AUDIT" && warn "Pin audit log contains INTERCEPTION entries: $PIN_AUDIT"
 
-  if [[ -s $IPXE_BUILT ]]; then ok "iPXE: $(head -n1 "$IPXE_BUILT")"; else warn "iPXE not built or imported yet"; fi
+  if [[ -s $IPXE_BUILT ]]; then
+    case $(ipxe_mode) in
+      signed) ok "iPXE: signed boot chain ($(awk -F= '$1=="commit"{print $2}' "$IPXE_BUILT"))" ;;
+      quick)  warn "iPXE: UNSIGNED BOOT (quick mode). Upgrade with: $0 pc-helper" ;;
+      *)      warn "iPXE: unsigned (built with VERIFIED_BOOT=0)" ;;
+    esac
+  else
+    warn "iPXE not built or imported yet"
+  fi
   if iso_is_verified; then ok "ISO present and verified"; elif [[ -s $ISO ]]; then warn "ISO present but not verified"; else warn "ISO not downloaded"; fi
   if [[ -f $LAYOUT ]]; then ok "Boot files extracted"; else warn "Not extracted yet"; fi
   if [[ -f $MANIFEST ]]; then ok "Configured (manifest present)"; else warn "Not configured yet"; fi
@@ -2190,12 +2442,12 @@ clean() {
   ok "Servers stopped"
 
   if [[ -d $HTTP ]]; then
-    run_root "chown -R $(id -u):$(id -g) '$HTTP' '$RUN'" >/dev/null 2>&1 || true
+    run_root "chown -R $(id -u):$(id -g) $(q "$HTTP") $(q "$RUN")" >/dev/null 2>&1 || true
     rm -rf -- "${HTTP:?}"/*
     ok "Extracted and served files removed"
   fi
   rm -f -- "$TFTP/boot.ipxe" "$TFTP/boot.ipxe.sig" "$TFTP/undionly.0" "$DNSMASQ_CONF" "$HTTP_LOG"
-  rm -f -- "$STATE"/*.layout "$STATE"/*.manifest "$STATE"/*.config
+  rm -f -- "$STATE"/*.layout "$STATE"/*.manifest "$STATE"/*.manifest.asc "$STATE"/*.config
   rm -rf -- "${RUN:?}"
   ok "Generated configs and manifests removed"
   info "Kept: ISOs and their verification records, iPXE binaries and source, pins, keyrings, attestation identity and reports"
@@ -2204,9 +2456,67 @@ clean() {
 # =============================================================================
 # Interactive mode
 # =============================================================================
+# Steps run in a subshell so a failure doesn't end the session. Anything a
+# step changes that the parent needs (tool paths, quick mode) is re-read after.
 run_step() {
   if ( "$@" ); then echo; ok "Step complete"; else echo; warn "Step did not finish. Read the messages above, fix the issue, and retry."; fi
+  refresh_state
   echo
+}
+
+# Re-reads state that steps can change: tool paths after deps, and whether
+# iPXE is in quick mode (which forces unsigned boot files)
+refresh_state() {
+  [[ -n $DNSMASQ && -x $DNSMASQ ]] || DNSMASQ=$(find_bin dnsmasq || true)
+  [[ -n $PYTHON ]] || PYTHON=$(find_bin python3 || find_bin python || true)
+  if [[ $(ipxe_mode) == quick ]]; then VERIFIED_BOOT=0; else VERIFIED_BOOT=$VERIFIED_BOOT_REQ; fi
+  return 0
+}
+
+save_defaults() {
+  mkdir -p "$STATE"
+  printf 'DISTRO=%s\nTARGET_ARCH=%s\nDHCP_MODE=%s\n' "$DISTRO" "$TARGET_ARCH" "$DHCP_MODE" > "$SAVED_DEFAULTS"
+}
+
+# Phone side of the PC helper: shares the boot CA on the LAN, then pulls the
+# signed iPXE that the PC builds with it
+pc_helper_phone() {
+  [[ -s $ATTEST/ca.crt ]] || die "No boot CA yet. Run: $0 attest-init"
+  [[ -n $PYTHON ]] || die "python3 is required. Run: $0 deps"
+  resolve_network
+  write_libs
+  local share="$STATE/ca-share" port=$HTTP_PORT pid code addr
+  rm -rf "$share"; mkdir -p "$share"
+  cp "$ATTEST/ca.crt" "$share/attest-ca.crt"
+  chmod -R a+rX "$share"
+  port_in_use tcp "$port" && die "TCP $port is in use. Set HTTP_PORT=... or run: $0 clean"
+  "$PYTHON" "$LIB/httpd.py" "$PHONE_IP" "$port" "$share" >/dev/null 2>&1 &
+  pid=$!
+  trap 'kill '"$pid"' 2>/dev/null' EXIT
+  sleep 1
+  kill -0 "$pid" 2>/dev/null || die "Could not start the temporary share on $PHONE_IP:$port"
+  code=$(short_code "$(ca_fpr_hex)")
+  echo
+  box \
+    "PC HELPER: BUILD SIGNED iPXE ON A LINUX PC" \
+    "" \
+    "1. On any Linux PC on this same network, get setup.sh from" \
+    "   github.com/SecTrollz/netboot-android and run:" \
+    "" \
+    "   bash setup.sh --pc-helper $PHONE_IP:$port" \
+    "" \
+    "2. The PC shows a CA code. It must be exactly:  $code" \
+    "3. When the PC says READY, it shows an address. Type it below."
+  echo
+  while :; do
+    read -r -p "Address the PC shows (like 192.168.1.20:8090): " addr
+    [[ $addr =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$ ]] && break
+    warn "That doesn't look like IP:PORT. Try again."
+  done
+  kill "$pid" 2>/dev/null || true
+  trap - EXIT
+  VERIFIED_BOOT=1 import_ipxe "http://$addr"
+  ok "Signed iPXE installed. Boots from this phone are verified again."
 }
 
 choose_target() {
@@ -2261,63 +2571,251 @@ choose_mode() {
   ok "Network mode: $DHCP_MODE"
 }
 
+# =============================================================================
+# Guided setup (first run)
+# =============================================================================
+wiz_title() { printf '\n%s== %s ==%s\n' "$C_BOLD" "$*" "$C_RESET"; }
+
+# Runs one wizard step; on failure offers retry, skip or quit
+wiz_run() {
+  local a
+  while :; do
+    if ( "$@" ); then refresh_state; return 0; fi
+    refresh_state
+    echo
+    read -r -p "That step did not finish (see above). [R]etry, [s]kip, or [q]uit? " a
+    case $a in
+      ""|r|R) continue ;;
+      s|S)    warn "Skipped"; return 1 ;;
+      *)      info "Stopped. Run $0 again to pick up where you left off."; exit 1 ;;
+    esac
+  done
+}
+
+wiz_ask() {   # wiz_ask "question" default -> REPLY_VAL
+  local a
+  read -r -p "$1 " a
+  REPLY_VAL=${a:-$2}
+}
+
+wiz_tools_missing() {
+  local t
+  [[ -n $DNSMASQ && -x $DNSMASQ && -n $PYTHON ]] || return 0
+  for t in bsdtar curl gpg openssl git; do command -v "$t" >/dev/null 2>&1 || return 0; done
+  return 1
+}
+
+wiz_identity() {
+  attest_init
+  if [[ ! -s $ATTEST/script.sha256.asc ]]; then
+    self_sign
+  elif [[ $(sha256_of "$SELF") != "$(awk '{print $1}' "$ATTEST/script.sha256")" ]]; then
+    local a
+    warn "This script changed since you last signed it."
+    read -r -p "Did you update it yourself (for example with setup.sh --update)? [y/N] " a
+    [[ $a == [yY]* ]] || die "Stopping. If you did not change the script, someone else did. Get a fresh copy with setup.sh."
+    self_sign
+  fi
+  echo
+  box \
+    "TAKE A PHOTO OF THIS BOX WITH ANOTHER DEVICE" \
+    "These identify your setup. If they ever change unexpectedly, stop." \
+    "" \
+    "Attestation key : $(attest_fpr)" \
+    "Boot CA code    : $(short_code "$(ca_fpr_hex)")" \
+    "Script code     : $(short_code "$(sha256_of "$SELF")")"
+}
+
+wiz_target() {
+  local cpu ram d line n=0 rec="" pick
+  local -a ids=() labels=()
+  echo "What kind of computer will boot from this phone?"
+  echo "  1) A normal PC or laptop (Intel or AMD)   <- most computers"
+  echo "  2) An ARM computer"
+  wiz_ask "Choose 1 or 2 [1]:" 1
+  if [[ $REPLY_VAL == 2 ]]; then cpu=arm64; else cpu=x86_64; fi
+  wiz_ask "How much memory (RAM) does that computer have, in GB? Not sure? Press Enter [8]:" 8
+  [[ $REPLY_VAL =~ ^[0-9]+$ ]] || REPLY_VAL=8
+  ram=$REPLY_VAL
+  echo
+  echo "Systems that fit a $ram GB $cpu computer:"
+  for d in debian systemrescue arch fedora ubuntu ubuntu24 parrot; do
+    line=$( (DISTRO=$d TARGET_ARCH=$cpu; set_distro >/dev/null 2>&1 && printf '%s|%s' "$CLIENT_RAM_GB" "$P_LABEL") ) || continue
+    (( ${line%%|*} <= ram )) || continue
+    n=$((n+1)); ids+=("$d"); labels+=("${line#*|} (needs ~${line%%|*} GB)")
+    [[ -z $rec ]] && rec=$n
+  done
+  (( n )) || die "Nothing fits $ram GB. The smallest system here needs about 4 GB."
+  for ((d=0; d<n; d++)); do
+    printf '  %d) %s%s\n' "$((d+1))" "${labels[$d]}" "$( ((d+1 == rec)) && echo '   <- recommended')"
+  done
+  wiz_ask "Choose a number [$rec]:" "$rec"
+  pick=$REPLY_VAL
+  [[ $pick =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= n )) || pick=$rec
+  DISTRO=${ids[$((pick-1))]}
+  TARGET_ARCH=$cpu
+  set_distro
+  ok "Will boot: $P_LABEL on a $TARGET_ARCH computer"
+}
+
+wiz_connection() {
+  echo "How will that computer reach this phone?"
+  echo "  1) Same Wi-Fi or router as the phone"
+  echo "  2) A network cable straight from the phone (USB Ethernet adapter) to the computer"
+  echo "     The cable is the safer choice: nobody else on a network can get in between."
+  wiz_ask "Choose 1 or 2 [1]:" 1
+  if [[ $REPLY_VAL == 2 ]]; then DHCP_MODE=direct; else DHCP_MODE=proxy; fi
+  ok "Connection: $( [[ $DHCP_MODE == direct ]] && echo cable || echo 'same network')"
+}
+
+wiz_ipxe_ready() { ( require_ipxe_matches_ca ) >/dev/null 2>&1; }
+
+wiz_ipxe() {
+  if wiz_ipxe_ready; then
+    ok "iPXE is ready ($(ipxe_mode))"
+    return 0
+  fi
+  case "$HOST_ARCH:$TARGET_ARCH" in
+    x86_64:x86_64|aarch64:arm64|arm64:arm64)
+      info "This phone can build iPXE for that computer itself. This takes a few minutes."
+      wiz_run build_ipxe && return 0 ;;
+  esac
+  echo
+  echo "This phone ($HOST_ARCH) cannot build the boot loader for a $TARGET_ARCH computer by itself."
+  echo "  1) Use a Linux PC to build a SIGNED one (recommended, about 10 minutes)"
+  echo "  2) Quick mode: download a stock one now. Boots will NOT be signed."
+  echo "  3) I already have the files in a folder on this phone"
+  wiz_ask "Choose 1, 2 or 3 [1]:" 1
+  case $REPLY_VAL in
+    2) wiz_run quick_ipxe ;;
+    3) local dir; read -r -p "Folder holding the files: " dir; wiz_run import_ipxe "$dir" ;;
+    *) wiz_run pc_helper_phone ;;
+  esac
+}
+
+wizard() {
+  banner
+  cat <<EOF
+Welcome. This sets everything up, one step at a time.
+Most steps need no answers. Press Enter to accept the suggestion in [brackets].
+You can stop with Ctrl+C at any time. Run it again and finished steps are skipped.
+EOF
+  if wiz_tools_missing; then
+    wiz_title "1/8  Installing what this needs"
+    wiz_run deps
+  fi
+  wiz_title "2/8  Creating your keys (once)"
+  wiz_run wiz_identity
+  wiz_title "3/8  Checking the download servers' certificates"
+  wiz_run pins_refresh || warn "Continuing with the certificate pins built into the script"
+  wiz_title "4/8  What to boot"
+  wiz_target
+  wiz_title "5/8  How the computer connects"
+  wiz_connection
+  save_defaults
+  wiz_title "6/8  Checking this phone"
+  wiz_run check || warn "Some checks failed. Later steps may stop with a clear message."
+  wiz_title "7/8  The boot loader (iPXE)"
+  wiz_ipxe
+  wiz_title "8/8  Downloading and preparing $P_LABEL"
+  wiz_run fetch
+  wiz_run extract
+  wiz_run configure
+  wiz_run attest_report || true
+  mkdir -p "$STATE"; touch "$STATE/setup.done"
+  echo
+  ok "Setup is finished. From now on, just run: $0"
+  [[ $(ipxe_mode) == quick ]] && warn "Boots are UNSIGNED (quick mode). Upgrade any time from the menu: 'Upgrade to signed boot'."
+  local a
+  read -r -p "Start the boot server now? [Y/n] " a
+  [[ $a == [nN]* ]] || serve
+}
+
+# =============================================================================
+# Menu
+# =============================================================================
 interactive() {
   banner
-  info "Order: check, deps, attest-init, self-sign, pins refresh, build-ipxe, fetch, extract, configure, attest, serve."
+  [[ $(ipxe_mode) == quick ]] && warn "UNSIGNED BOOT (quick mode). Choose 'Upgrade to signed boot' to fix."
+  info "Target: $P_LABEL / $TARGET_ARCH, network mode $DHCP_MODE"
   echo
   local options=(
+    "Start the PXE server"
+    "Guided setup (run the first-time wizard again)"
+    "Change what to boot"
+    "Change network mode"
+    "Upgrade to signed boot (PC helper)"
     "Pre-flight check"
+    "Show fingerprints for external comparison"
+    "Verify this script against GitHub"
+    "Verify latest attestation report"
+    "Show HTTP log (last 50 lines)"
+    "Advanced: individual steps"
+    "Clean up"
+    "Help"
+    "Quit"
+  )
+  local choice
+  PS3="Choose: "
+  select choice in "${options[@]}"; do
+    case "$REPLY" in
+      1)  run_step serve ;;
+      2)  wizard ;;
+      3)  choose_target; save_defaults ;;
+      4)  choose_mode; save_defaults ;;
+      5)  run_step pc_helper_phone ;;
+      6)  run_step check ;;
+      7)  show_fingerprints ;;
+      8)  run_step verify_upstream ;;
+      9)  run_step verify_attest ;;
+      10) tail -n 50 "$HTTP_LOG" 2>/dev/null || warn "No log yet" ;;
+      11) advanced_menu ;;
+      12) run_step clean ;;
+      13) usage; echo ;;
+      14) break ;;
+      *)  warn "Enter a number from 1 to ${#options[@]}" ;;
+    esac
+    PS3="Choose: "
+  done
+  ok "Goodbye"
+}
+
+advanced_menu() {
+  local options=(
     "Install dependencies"
     "Create attestation identity"
     "Self-sign this script"
     "Refresh certificate pins from CT"
     "Build iPXE from source"
-    "Import iPXE built elsewhere"
+    "Import iPXE from a folder or http://PC:PORT"
+    "Quick mode: stock iPXE (UNSIGNED)"
     "Download and verify the ISO"
     "Extract boot files"
     "Configure (sign boot files, write dnsmasq)"
     "Write signed attestation report"
-    "Start the PXE server"
-    "Change target"
-    "Change network mode"
-    "Show fingerprints for external comparison"
-    "Verify latest attestation report"
-    "Show HTTP log (last 50 lines)"
-    "Clean up"
-    "Verify this script against GitHub"
-    "Help"
-    "Quit"
+    "Back"
   )
   local choice dir
-  PS3="Choose a step: "
+  PS3="Advanced step: "
   select choice in "${options[@]}"; do
     case "$REPLY" in
-      1)  run_step check ;;
-      2)  run_step deps ;;
-      3)  run_step attest_init ;;
-      4)  run_step self_sign ;;
-      5)  run_step pins_refresh ;;
-      6)  run_step build_ipxe ;;
-      7)  read -r -p "Directory holding the iPXE binaries: " dir; run_step import_ipxe "$dir" ;;
+      1)  run_step deps ;;
+      2)  run_step attest_init ;;
+      3)  run_step self_sign ;;
+      4)  run_step pins_refresh ;;
+      5)  run_step build_ipxe ;;
+      6)  read -r -p "Folder, or http://PC:PORT: " dir; run_step import_ipxe "$dir" ;;
+      7)  run_step quick_ipxe ;;
       8)  run_step fetch ;;
       9)  run_step extract ;;
       10) run_step configure ;;
       11) run_step attest_report ;;
-      12) run_step serve ;;
-      13) choose_target ;;
-      14) choose_mode ;;
-      15) show_fingerprints ;;
-      16) run_step verify_attest ;;
-      17) tail -n 50 "$HTTP_LOG" 2>/dev/null || warn "No log yet" ;;
-      18) run_step clean ;;
-      19) run_step verify_upstream ;;
-      20) usage; echo ;;
-      21) break ;;
-      *)  warn "Enter a number from 1 to 21" ;;
+      12) break ;;
+      *)  warn "Enter a number from 1 to ${#options[@]}" ;;
     esac
-    PS3="Choose a step: "
+    PS3="Advanced step: "
   done
-  ok "Goodbye"
+  PS3="Choose: "
 }
 
 # =============================================================================
@@ -2333,12 +2831,20 @@ USAGE
   $0 -h | --help
   $0                         (no arguments starts the interactive menu)
 
-FIRST RUN, IN ORDER
+FIRST RUN
+  Just run $0 with no arguments. The guided setup asks a few plain questions
+  and does every step below for you. Run it again later to get the menu.
+
+  The same steps by hand, in order:
   check, deps, attest-init, self-sign, pins refresh, build-ipxe (or import-ipxe),
   fetch, extract, configure, attest, serve
 
 COMMANDS
-  ui, interactive       Guided menu
+  setup                 Guided first-time setup (the default on first run)
+  ui, interactive       Menu (the default after setup)
+  pc-helper             Build signed iPXE on a Linux PC: shares the boot CA on the
+                        LAN, then pulls the PC's build and checks short codes
+  quick-ipxe            Stock iPXE from boot.ipxe.org. UNSIGNED boot; asks for YES
   check                 Pre-flight: root, tools, ports 67/69/4011/$HTTP_PORT, storage,
                         network, pins, attestation, artifacts
   deps                  Install packages (Termux pkg, apt, dnf, pacman, or apk)
@@ -2346,7 +2852,8 @@ COMMANDS
   self-sign             Record and sign this script's SHA-256
   fingerprints          Print values to compare against copies on another device
   release-stamp TIME    Stamp the planned upload time (UTC, e.g. 2026-10-09T18:00:00Z)
-                        into this script and print its release code
+                        into this script and print its release code (a hash bound to
+                        that time; not a secret, compare it with your own record)
   verify-upstream       Fetch this script from GitHub (pinned TLS) and prove the local
                         copy is byte-identical to the one committed at RELEASE_TIME
   pins refresh [HOST..] Validate each host against Certificate Transparency and
@@ -2355,7 +2862,8 @@ COMMANDS
   pins show             List pins in use
   build-ipxe            Build iPXE at IPXE_COMMIT with the boot CA and a
                         verify-first script embedded
-  import-ipxe DIR       Use iPXE binaries built on another machine
+  import-ipxe DIR|URL   Use iPXE binaries built elsewhere (folder, or http://PC:PORT
+                        from setup.sh --pc-helper)
   fetch                 Download the ISO and verify it against the vendor key
   extract               Pull kernel, initrd, root image (and microcode) from the ISO
   configure             Sign boot files, write boot.ipxe, dnsmasq.conf, and the manifest
@@ -2409,6 +2917,8 @@ ENVIRONMENT VARIABLES
   ALLOW_UNPINNED=1      Fetch transport-trusted content without a pin (not recommended)
   ALLOW_UNVERIFIED=1    Accept an ISO with no verified signature (not recommended)
   ACCEPT_SCRIPT_CHANGE=1  Run even though the script changed since self-sign
+  KEY_EXTRA_URL         An extra source for the vendor key (e.g. the vendor's own site)
+  PIN_STRICT_ISSUER=1   Refuse to update pins when a host's certificate issuer changes
   UPSTREAM_REPO         Repo for verify-upstream    (default: $DEFAULT_UPSTREAM_REPO)
   UPSTREAM_BRANCH       Branch for verify-upstream                (default: main)
   EXPECT_CODE           Release code you recorded; verify-upstream must match it
@@ -2454,17 +2964,24 @@ parse_args() {
 }
 
 parse_args "$@"
-COMMAND="${COMMAND:-ui}"
+if [[ -z $COMMAND ]]; then
+  # First run goes to the guided setup; after that, the menu
+  if [[ -f $STATE/setup.done ]]; then COMMAND=ui; else COMMAND=setup; fi
+fi
+if [[ $COMMAND == help ]]; then usage; exit 0; fi
 set_distro
+refresh_state
 
 case "$COMMAND" in
-  help|attest-init|self-sign|fingerprints|deps|release-stamp|verify-upstream) ;;
+  attest-init|self-sign|fingerprints|deps|release-stamp|verify-upstream|setup) ;;
   *) self_check ;;
 esac
 
 case "$COMMAND" in
+  setup|wizard)   wizard ;;
   ui|interactive) interactive ;;
-  help)           usage ;;
+  pc-helper)      pc_helper_phone ;;
+  quick-ipxe)     quick_ipxe ;;
   check)          check ;;
   deps)           deps ;;
   attest-init)    attest_init ;;

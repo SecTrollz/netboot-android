@@ -6,6 +6,22 @@ This is a README. You are reading it. Good. That is how it works.
 
 ---
 
+## Quick start
+
+On the phone, install **Termux** (from F-Droid) and give it root in Magisk or KernelSU. Then, in Termux:
+
+```sh
+curl -fLO https://raw.githubusercontent.com/SecTrollz/netboot-android/main/setup.sh
+less setup.sh     # it's short. Read it. It would want you to.
+bash setup.sh
+```
+
+That installs everything, checks the script against GitHub, and starts a guided setup. The guided setup asks about five plain questions, like "how much memory does the computer have." You answer. It does the rest. When it's done, you type `netboot` and it remembers everything.
+
+If it ever asks you to type **YES**, read the box above the question first. That box is the only part of this README that is not joking.
+
+---
+
 ## What happens
 
 1. The PC wakes up and asks the network for something to boot. It asks politely. It has never been told no.
@@ -19,14 +35,14 @@ That is the entire plot. There is no twist. The phone does not turn out to be th
 
 ## Why you can trust it
 
-Every step is checked. The script has trust issues, and they are healthy ones.
+Nearly every step is checked. The exceptions are listed plainly at the bottom, under "What it does not do." The script has trust issues, and they are healthy ones.
 
 1. **Vendor keys.** The real signing key fingerprints for each distro are written into the script. Each key is downloaded from at least two independent places, and both places must agree. If they disagree, the script leaves.
 2. **Vendor signatures.** An ISO is accepted only if a signature from that vendor key checks out.
 3. **TLS pinning.** Download servers are pinned by their public keys, which are checked against Certificate Transparency logs. If a server shows a key that isn't in those logs, someone is in the middle, and the script says so out loud.
 4. **Your own keys.** It makes a GPG key and a small code-signing CA on your device. They are yours. They will not be shared with a man named Greg.
 5. **iPXE built from source** at a pinned commit, with your CA baked in. It refuses to run the boot script, the kernel, or the initrd unless their signatures check out.
-6. **Integrity gate.** Before the servers start, every served file is hashed again and compared with the list.
+6. **Integrity gate.** Before the servers start, every served file is hashed again and compared with the list. The list itself is signed by your key, so nobody can quietly edit both.
 7. **Signed attestation reports.** A signed record of all of the above. You can re-check it whenever you want, including at 3 a.m., which is when most people want to.
 
 ---
@@ -58,7 +74,9 @@ Every step is checked. The script has trust issues, and they are healthy ones.
 
 ## How to run it
 
-The first time, do these in this order. The order matters. Do not do them in alphabetical order. Someone did once. We don't talk about it.
+Run `./netboot-android.sh` with no arguments. The first time, it starts the guided setup. After that, it shows a menu. The menu has numbers. You press a number. A thing happens. This is called technology.
+
+If you prefer doing it by hand, do these in this order. The order matters. Do not do them in alphabetical order. Someone did once. We don't talk about it.
 
 ```sh
 ./netboot-android.sh check          # is everything here?
@@ -80,8 +98,6 @@ Or do all of it at once:
 ./netboot-android.sh --distro debian all
 ```
 
-Run it with no arguments and you get a menu. The menu has numbers. You press a number. A thing happens. This is called technology.
-
 ---
 
 ## Network modes
@@ -98,17 +114,19 @@ The phone's own hotspot is unreliable, because Android's DHCP server may already
 
 Most phones are arm64. Most PCs are x86_64. The phone cannot build the PC's iPXE by itself. It tried. It got very quiet.
 
-Copy `~/netboot/attest/ca.crt` and the script to any x86_64 Linux machine and run:
+The guided setup handles this. It gives you two choices:
 
-```sh
-TRUST_CA=ca.crt FALLBACK_SERVER=<phone IP> ./netboot-android.sh --arch x86_64 build-ipxe
-```
+**1. The PC helper (recommended).** Any Linux PC on the same network builds a signed iPXE for the phone.
+- The phone shows a command. On the PC, run it: `bash setup.sh --pc-helper <phone IP>:8000`
+- The PC shows a short **CA code**, like `7792-d8ef-3ecf-0c95`. The phone shows one too. They must be the same.
+- The PC builds for a few minutes, then shows an address. Type it on the phone.
+- The phone downloads the files and shows short codes for them. The PC shows the same codes. Check that they match, press `y`, and you're done.
 
-Bring `ipxe.efi` and `undionly.kpxe` back to the phone and run:
+Matching codes means nothing was swapped on the way between the phone and the PC. Four groups of four characters. You can do this. You have matched socks before. Probably.
 
-```sh
-./netboot-android.sh import-ipxe DIR
-```
+**2. Quick mode.** It downloads a stock iPXE from boot.ipxe.org, right now, on the phone. It works, but **boots are not signed**: the PC will run whatever kernel it's handed. The script makes you type `YES` first. Afterwards, `check`, the menu, the server screen and the attestation report all say UNSIGNED, so you can't forget. Upgrade any time with the menu's "Upgrade to signed boot," or with `netboot pc-helper`.
+
+Doing it by hand also works: build with `TRUST_CA=ca.crt FALLBACK_SERVER=<phone IP> ./netboot-android.sh --arch x86_64 build-ipxe` on the PC, then `./netboot-android.sh import-ipxe DIR` on the phone.
 
 ---
 
@@ -122,7 +140,7 @@ The vendor fingerprints, the TLS pins and the iPXE commit are written into the s
 ./netboot-android.sh release-stamp 2026-10-09T18:00:00Z
 ```
 
-This writes the time into the script as `RELEASE_TIME`, and re-signs the script if you have attestation set up. It prints a **release code**: an HMAC-SHA256 of the whole script, keyed by that exact time. **Write the code down somewhere that is not the phone.** A notebook. A different device. The inside of a cereal box you will definitely keep.
+This writes the time into the script as `RELEASE_TIME`, and re-signs the script if you have attestation set up. It prints a **release code**: a SHA-256 hash of the whole script, bound to that exact time. It is not a password and not a signature. Anyone can work it out. Its only job is to be compared with the copy on GitHub and with the one you wrote down. **Write the code down somewhere that is not the phone.** A notebook. A different device. The inside of a cereal box you will definitely keep.
 
 **2. Commit and push with exactly that time** (the script prints these lines for you):
 
@@ -156,6 +174,9 @@ The time is not a secret. Anyone can read a commit date. The code alone proves n
 
 | Command | What it does |
 |---|---|
+| `setup` | The guided setup, again |
+| `pc-helper` | Upgrade to signed boot using a Linux PC |
+| `quick-ipxe` | Stock iPXE, UNSIGNED boot (asks for YES) |
 | `fingerprints` | Values to compare against a copy on another device |
 | `release-stamp TIME` | Stamps the upload time into the script and prints its release code |
 | `verify-upstream` | Proves this script is byte-identical to the GitHub copy committed at that time |
@@ -183,7 +204,10 @@ The time is not a secret. Anyone can read a commit date. The code alone proves n
 
 ## What it does not do
 
-- The large root image that the initrd downloads **after** boot (the Ubuntu ISO, the Debian or Parrot squashfs, the Fedora squashfs) is **not** signature-checked on the client. Arch and SystemRescue do check theirs.
+- **The very first file the PC loads is not checked.** The PC's firmware fetches iPXE over TFTP, which has no security at all, and Secure Boot is off. Someone on the network between the phone and the PC could hand it a fake iPXE that skips every check below it. So all the signing protects you only on a network you trust. A cable straight from the phone to the PC (`--mode direct`) is the safest setup.
+- **The big root image is not checked on the client, for any distro.** That's the Ubuntu ISO, the Debian or Parrot squashfs, the Fedora squashfs, all downloaded after boot. Arch and SystemRescue run `checksum=y`, but the checksum file comes over the same plain HTTP, so it catches a damaged download, not a tampered one.
+- **The signing key lives on the phone.** The chain protects against the network, not against someone who already controls the phone.
+- **Quick mode turns all of the boot checks off.** It says so everywhere while it's on.
 - Self-verification is tamper **evidence**, not tamper proof. Anyone who can edit the script can edit the check. Compare the `fingerprints` output against a copy kept on another device.
 - The embedded pins and vendor data were collected on **2026-10-08**. Run `pins refresh` on your own device before first use.
 - Test it on a machine you can afford to break.
