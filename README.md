@@ -56,6 +56,20 @@ Every step is checked. The script has trust issues, and they are healthy ones.
 
 ---
 
+## Backups of the working folder
+
+`serve` and `clean` first write a restorable archive of `~/netboot` (keys, attestation, pins, state, TFTP files, configs) to `~/netboot-backups`, with a SHA-256 sidecar. Extracted `http/`, `src/`, and `run/` are skipped because they rebuild. `downloads/` (the ISOs) is skipped unless `BACKUP_DL=1`. The newest 5 are kept (`BACKUP_KEEP`). If the backup fails, the command stops. `AUTO_BACKUP=0` turns this off.
+
+```sh
+./netboot-android.sh backup            # take one now
+./netboot-android.sh backup-list       # newest first
+./netboot-android.sh restore FILE      # verify checksum, save current state, restore
+```
+
+This is a file-level archive, not a Clonezilla or Shadow Copy block image. To image the whole phone or disk, do that separately. Editing the script changes its hash, so run `self-sign` again after pulling this change.
+
+---
+
 ## How to run it
 
 The first time, do these in this order. The order matters. Do not do them in alphabetical order. Someone did once. We don't talk about it.

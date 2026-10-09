@@ -124,6 +124,10 @@ CT_BOOTSTRAP="${CT_BOOTSTRAP:-0}"
 UPSTREAM_REPO="${UPSTREAM_REPO:-$DEFAULT_UPSTREAM_REPO}"
 UPSTREAM_BRANCH="${UPSTREAM_BRANCH:-main}"
 EXPECT_CODE="${EXPECT_CODE:-}"
+AUTO_BACKUP="${AUTO_BACKUP:-1}"           # 1: back up the working folder before serve and clean
+BACKUP_DIR="${BACKUP_DIR:-$HOME/netboot-backups}"
+BACKUP_KEEP="${BACKUP_KEEP:-5}"           # newest archives kept after each backup
+BACKUP_DL="${BACKUP_DL:-0}"               # 1: include downloads/ (ISOs, large)
 
 # User overrides, captured before presets so they always win
 U_ISO_URL="${ISO_URL:-}"
@@ -1960,6 +1964,79 @@ verify_attest() {
 }
 
 # =============================================================================
+# Backup and restore of the working folder
+# =============================================================================
+# Restorable point-in-time copy of $ROOT (keys, attestation, pins, state, TFTP
+# files, configs). Rebuildable bulk (extracted http/, src/, run/) is skipped, and
+# downloads/ only with BACKUP_DL=1. Each archive gets a SHA-256 sidecar.
+backup_create() {
+  local label=${1:-manual} base parent ts out
+  need tar; need sha256sum
+  [[ -d $ROOT ]] || die "Nothing to back up: $ROOT does not exist"
+  base=$(basename "$ROOT"); parent=$(dirname "$ROOT")
+  ts=$(date -u +%Y%m%dT%H%M%SZ)
+  out="$BACKUP_DIR/netboot-$label-$ts.tar.gz"
+  ( umask 077; mkdir -p "$BACKUP_DIR" ) || die "Cannot create $BACKUP_DIR"
+  local ex=(--exclude="$base/http" --exclude="$base/run" --exclude="$base/src")
+  (( BACKUP_DL )) || ex+=(--exclude="$base/downloads")
+  case "$(readlink -f "$BACKUP_DIR")/" in "$(readlink -f "$ROOT")"/*) ex+=(--exclude="$base/${BACKUP_DIR#"$ROOT"/}") ;; esac
+  info "Backing up $ROOT -> $out"
+  if ! ( umask 077; tar -C "$parent" -czpf "$out.part" "${ex[@]}" "$base" ) 2>/dev/null; then
+    rm -f "$out.part"
+    die "Backup failed (unreadable files? run: sudo chown -R \$(id -u) $ROOT). Set AUTO_BACKUP=0 to skip."
+  fi
+  tar -tzf "$out.part" >/dev/null 2>&1 || { rm -f "$out.part"; die "Backup archive failed its read-back test"; }
+  mv -f "$out.part" "$out"
+  ( cd "$BACKUP_DIR" && sha256sum "$(basename "$out")" > "$(basename "$out").sha256" )
+  chmod 600 "$out" "$out.sha256" 2>/dev/null || true
+  ok "Backup written: $out ($(file_size "$out") bytes)"
+  backup_prune
+}
+
+backup_prune() {
+  [[ $BACKUP_KEEP =~ ^[0-9]+$ ]] && (( BACKUP_KEEP > 0 )) || return 0
+  local f n=0
+  while IFS= read -r f; do
+    n=$((n+1))
+    (( n > BACKUP_KEEP )) && rm -f -- "$f" "$f.sha256"
+  done < <(ls -1t "$BACKUP_DIR"/netboot-*.tar.gz 2>/dev/null || true)
+}
+
+backup_list() {
+  ls -1t "$BACKUP_DIR"/netboot-*.tar.gz 2>/dev/null || { info "No backups in $BACKUP_DIR"; return 0; }
+}
+
+backup_verify() {
+  local f=$1
+  [[ -f $f ]] || die "No such backup: $f"
+  [[ -f $f.sha256 ]] || die "Missing checksum file: $f.sha256"
+  ( cd "$(dirname "$f")" && sha256sum -c "$(basename "$f").sha256" >/dev/null 2>&1 ) \
+    || die "Backup checksum mismatch: $f"
+  tar -tzf "$f" >/dev/null 2>&1 || die "Backup archive is unreadable: $f"
+}
+
+# Runs before anything that can change or remove served state.
+auto_backup() {
+  [[ $AUTO_BACKUP == 1 ]] || { warn "AUTO_BACKUP=0: skipping the pre-run backup"; return 0; }
+  [[ -d $ROOT ]] || return 0
+  backup_create "auto-$1"
+}
+
+restore() {
+  local f=${1:-}
+  [[ -n $f ]] || { backup_list; die "Usage: $0 restore ARCHIVE   (a file from the list above)"; }
+  [[ -f $f ]] || f="$BACKUP_DIR/$f"
+  need tar
+  backup_verify "$f"
+  kill_servers
+  [[ -d $ROOT ]] && backup_create "pre-restore"
+  warn "Restoring $f over $ROOT (files in the backup replace current copies; others are left alone)"
+  run_root "chown -R $(id -u):$(id -g) '$ROOT'" >/dev/null 2>&1 || true
+  tar -C "$(dirname "$ROOT")" -xzpf "$f" || die "Restore failed. The pre-restore backup is in $BACKUP_DIR"
+  ok "Restored. Run: $0 check, then $0 configure and $0 serve"
+}
+
+# =============================================================================
 # Serving
 # =============================================================================
 require_ready() {
@@ -2037,6 +2114,7 @@ serve() {
   grep -q "^interface=$IFACE$" "$DNSMASQ_CONF" && grep -q "$PHONE_IP:$HTTP_PORT" "$TFTP/boot.ipxe" \
     || die "Network changed since configure (now $IFACE $PHONE_IP). Run: $0 configure"
 
+  auto_backup serve
   verify_manifest
 
   if port_in_use tcp "$HTTP_PORT"; then die "TCP $HTTP_PORT is in use. Set HTTP_PORT=... or run: $0 clean"; fi
@@ -2185,6 +2263,7 @@ check() {
 }
 
 clean() {
+  auto_backup clean
   info "Stopping servers"
   kill_servers
   ok "Servers stopped"
@@ -2285,6 +2364,8 @@ interactive() {
     "Show HTTP log (last 50 lines)"
     "Clean up"
     "Verify this script against GitHub"
+    "Back up the working folder now"
+    "Restore the working folder from a backup"
     "Help"
     "Quit"
   )
@@ -2311,9 +2392,11 @@ interactive() {
       17) tail -n 50 "$HTTP_LOG" 2>/dev/null || warn "No log yet" ;;
       18) run_step clean ;;
       19) run_step verify_upstream ;;
-      20) usage; echo ;;
-      21) break ;;
-      *)  warn "Enter a number from 1 to 21" ;;
+      20) run_step backup_create manual ;;
+      21) backup_list; read -r -p "Archive to restore: " dir; run_step restore "$dir" ;;
+      22) usage; echo ;;
+      23) break ;;
+      *)  warn "Enter a number from 1 to 23" ;;
     esac
     PS3="Choose a step: "
   done
@@ -2361,11 +2444,14 @@ COMMANDS
   configure             Sign boot files, write boot.ipxe, dnsmasq.conf, and the manifest
   attest                Write a signed attestation report (also served to clients)
   verify-attest [FILE]  Check a report's signature and re-hash every listed file
-  serve                 Integrity gate, then HTTP + dnsmasq (DHCP/TFTP) as root
+  backup                Archive the working folder (SHA-256 sidecar) into $BACKUP_DIR
+  backup-list           List backups, newest first
+  restore ARCHIVE       Verify a backup, save the current state, then restore it
+  serve                 Backs up the working folder, integrity gate, then HTTP + dnsmasq (DHCP/TFTP) as root
   logs                  Follow the HTTP access log
   selinux {status|permissive|enforcing}
                         Android only. Permissive lowers device security.
-  clean                 Stop servers and remove generated files (keeps ISOs, keys, pins)
+  clean                 Back up, stop servers, remove generated files (keeps ISOs, keys, pins)
   all                   deps, attest-init, self-sign, pins refresh, build-ipxe, fetch,
                         extract, configure, attest, serve
 
@@ -2409,6 +2495,10 @@ ENVIRONMENT VARIABLES
   ALLOW_UNPINNED=1      Fetch transport-trusted content without a pin (not recommended)
   ALLOW_UNVERIFIED=1    Accept an ISO with no verified signature (not recommended)
   ACCEPT_SCRIPT_CHANGE=1  Run even though the script changed since self-sign
+  AUTO_BACKUP           1 (default): back up before serve and clean. 0: skip
+  BACKUP_DIR            Where backups go                          (default: ~/netboot-backups)
+  BACKUP_KEEP           Newest backups kept                       (default: 5)
+  BACKUP_DL             1: include downloads/ (ISOs) in backups   (default: 0)
   UPSTREAM_REPO         Repo for verify-upstream    (default: $DEFAULT_UPSTREAM_REPO)
   UPSTREAM_BRANCH       Branch for verify-upstream                (default: main)
   EXPECT_CODE           Release code you recorded; verify-upstream must match it
@@ -2486,6 +2576,9 @@ case "$COMMAND" in
   configure)      configure ;;
   attest)         resolve_network; attest_report ;;
   verify-attest)  verify_attest "${POSITIONAL[0]:-}" ;;
+  backup)         backup_create manual ;;
+  backup-list)    backup_list ;;
+  restore)        restore "${POSITIONAL[0]:-}" ;;
   serve)          serve ;;
   logs)           logs ;;
   selinux)        selinux_ctl "${POSITIONAL[0]:-status}" ;;
