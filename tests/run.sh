@@ -564,7 +564,8 @@ test_ipxe_request_prints_public_cert_only() {
 }
 
 test_cross_cpu_build_error_points_to_phone_build() {
-  sed -n "/^build_ipxe() {/,/^}/p" "$SCRIPT" | grep -q 'ipxe-phone'
+  body=$(sed -n "/^build_ipxe() {/,/^}/p" "$SCRIPT")
+  grep -q 'ipxe-phone' <<<"$body"
 }
 
 test_workflow_file_is_present_and_safe() {
