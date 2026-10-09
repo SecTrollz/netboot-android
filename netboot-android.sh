@@ -128,6 +128,8 @@ AUTO_BACKUP="${AUTO_BACKUP:-1}"           # 1: back up the working folder before
 BACKUP_DIR="${BACKUP_DIR:-$HOME/netboot-backups}"
 BACKUP_KEEP="${BACKUP_KEEP:-5}"           # newest archives kept after each backup
 BACKUP_DL="${BACKUP_DL:-0}"               # 1: include downloads/ (ISOs, large)
+BACKUP_UPLOAD_CMD="${BACKUP_UPLOAD_CMD:-}" # offsite hook, run as: CMD FILE.gpg (for example a Terabox uploader)
+BACKUP_GPG_PASSFILE="${BACKUP_GPG_PASSFILE:-}" # passphrase file; required to encrypt before upload
 
 # User overrides, captured before presets so they always win
 U_ISO_URL="${ISO_URL:-}"
@@ -1991,6 +1993,28 @@ backup_create() {
   chmod 600 "$out" "$out.sha256" 2>/dev/null || true
   ok "Backup written: $out ($(file_size "$out") bytes)"
   backup_prune
+  backup_upload "$out"
+}
+
+# Optional offsite copy. The archive holds the attestation GPG key and CA key, so it
+# is encrypted first and nothing is uploaded without a passphrase file. A failure here
+# only warns: the verified local backup already exists.
+backup_upload() {
+  [[ -n $BACKUP_UPLOAD_CMD ]] || return 0
+  local f=$1 enc="$1.gpg"
+  if [[ -z $BACKUP_GPG_PASSFILE || ! -s $BACKUP_GPG_PASSFILE ]]; then
+    warn "BACKUP_UPLOAD_CMD is set but BACKUP_GPG_PASSFILE is missing or empty. Not uploading an unencrypted archive."
+    return 0
+  fi
+  need gpg
+  rm -f "$enc"
+  if ! ( umask 077; gpg --batch --no-tty --yes --pinentry-mode loopback --passphrase-file "$BACKUP_GPG_PASSFILE" \
+         --symmetric --cipher-algo AES256 --output "$enc" "$f" ) >/dev/null 2>&1; then
+    rm -f "$enc"; warn "Encryption failed. Offsite upload skipped."; return 0
+  fi
+  info "Uploading $(basename "$enc") with: $BACKUP_UPLOAD_CMD"
+  if bash -c "$BACKUP_UPLOAD_CMD \"\$1\"" _ "$enc"; then ok "Offsite upload done"; else warn "Offsite upload failed. Local backup is intact: $f"; fi
+  rm -f "$enc"
 }
 
 backup_prune() {
@@ -1998,8 +2022,9 @@ backup_prune() {
   local f n=0
   while IFS= read -r f; do
     n=$((n+1))
-    (( n > BACKUP_KEEP )) && rm -f -- "$f" "$f.sha256"
+    if (( n > BACKUP_KEEP )); then rm -f -- "$f" "$f.sha256"; fi
   done < <(ls -1t "$BACKUP_DIR"/netboot-*.tar.gz 2>/dev/null || true)
+  return 0
 }
 
 backup_list() {
@@ -2499,6 +2524,8 @@ ENVIRONMENT VARIABLES
   BACKUP_DIR            Where backups go                          (default: ~/netboot-backups)
   BACKUP_KEEP           Newest backups kept                       (default: 5)
   BACKUP_DL             1: include downloads/ (ISOs) in backups   (default: 0)
+  BACKUP_UPLOAD_CMD     Offsite hook, run as: CMD FILE.gpg after each backup
+  BACKUP_GPG_PASSFILE   Passphrase file; the archive is AES256-encrypted before upload
   UPSTREAM_REPO         Repo for verify-upstream    (default: $DEFAULT_UPSTREAM_REPO)
   UPSTREAM_BRANCH       Branch for verify-upstream                (default: main)
   EXPECT_CODE           Release code you recorded; verify-upstream must match it

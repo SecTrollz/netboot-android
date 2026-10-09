@@ -66,6 +66,12 @@ Every step is checked. The script has trust issues, and they are healthy ones.
 ./netboot-android.sh restore FILE      # verify checksum, save current state, restore
 ```
 
+**Offsite copy (Terabox or anything else).** Set `BACKUP_UPLOAD_CMD` to any uploader command, such as an unofficial Terabox CLI you have logged in with. After each local backup the script encrypts the archive (AES256, passphrase from `BACKUP_GPG_PASSFILE`) and runs `CMD FILE.gpg`. It never uploads without the passphrase file, because the archive holds your signing keys. An upload failure only warns; the local backup stays.
+
+```sh
+BACKUP_GPG_PASSFILE=~/.nb-pass BACKUP_UPLOAD_CMD='terabox-upload' ./netboot-android.sh serve
+```
+
 This is a file-level archive, not a Clonezilla or Shadow Copy block image. To image the whole phone or disk, do that separately. Editing the script changes its hash, so run `self-sign` again after pulling this change.
 
 ---
