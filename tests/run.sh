@@ -21,8 +21,13 @@ run_test() {
     export HOME=$tmp NETBOOT_HOME=$tmp/netboot BACKUP_DIR=$tmp/bk T=$tmp
     cd "$HERE/.." || exit 99
     "$name"
-  ) > "$tmp/out" 2>&1
-  rc=$?
+  ) > "$tmp/out" 2>&1 &
+  local pid=$! wd
+  # a hanging test fails after TEST_TIMEOUT seconds instead of hanging the whole suite
+  ( sleep "${TEST_TIMEOUT:-150}"; echo "TIMEOUT: test ran longer than ${TEST_TIMEOUT:-150}s" >> "$tmp/out"; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  wd=$!
+  wait "$pid"; rc=$?
+  kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
   if (( rc == 0 )); then echo "ok   - $name"; echo P >> "$RESULTS"
   elif (( rc == 77 )); then echo "skip - $name ($(cat "$tmp/skip" 2>/dev/null))"; echo S >> "$RESULTS"
   else echo "FAIL - $name (exit $rc)"; sed 's/^/       | /' "$tmp/out" | tail -25; echo F >> "$RESULTS"; fi
@@ -878,6 +883,128 @@ test_importing_your_own_loader_replaces_the_github_approval() {
   assert "tells you" grep -q 'approval was cleared' "$T/i.out"
   heal_safe >/dev/null 2>&1
   assert "heal does not overwrite your own loader" test "$(sha256sum "$TFTP/undionly.kpxe" | cut -d' ' -f1)" = "$(sha256sum "$T/mine/undionly.kpxe" | cut -d' ' -f1)"
+}
+
+# ---- seen on a real phone: a finished 6 GB download was deleted over a key-lookup problem ----
+mk_fetch_env() {   # the script's own (resumable) file server stands in for the Ubuntu mirror
+  PORT=$((20000 + RANDOM % 20000))
+  export ISO_URL="http://127.0.0.1:$PORT/x.iso"      # must be set BEFORE the script is sourced
+  src; mkroot; write_libs
+  # never let a test download a real image
+  [[ $ISO_URL == http://127.0.0.1:* && $U_ISO_URL == "$ISO_URL" ]] || { echo "refusing: ISO_URL override did not take effect"; exit 1; }
+  WEBDIR="$T/mirror"; mkdir -p "$WEBDIR"
+  head -c 3000000 /dev/urandom > "$WEBDIR/x.iso"
+  HTTPD_LOG="$T/web.log" python3 "$LIB/httpd.py" 127.0.0.1 "$PORT" "$WEBDIR" >/dev/null 2>&1 & WEBPID=$!
+  sleep 1
+  mkdir -p "$DL"
+  prepare_keyring() { :; }
+  VCOUNT_FILE="$T/vcount"; echo 0 > "$VCOUNT_FILE"
+}
+
+fake_verify() {   # fake_verify RC...  returns each rc in turn (last one repeats), leaving the records fetch expects
+  FAKE_RCS=("$@")
+  verify_download() {
+    local n; n=$(cat "$VCOUNT_FILE"); echo $((n+1)) > "$VCOUNT_FILE"
+    local rc=${FAKE_RCS[$n]:-${FAKE_RCS[${#FAKE_RCS[@]}-1]}}
+    if [[ $rc -eq 0 ]]; then : > "$VERIFY_REC.tmp"; echo abc123 > "$VERIFY_REC.sha"; fi
+    return "$rc"
+  }
+}
+
+gets() { grep -c 'GET /x.iso' "$T/web.log" || true; }
+
+test_key_or_network_trouble_keeps_the_finished_download() {
+  mk_fetch_env; fake_verify 1
+  ( fetch ) >"$T/f.out" 2>&1; rc=$?
+  kill $WEBPID 2>/dev/null
+  assert "fetch reports a problem (exit 20)" test $rc -eq 20
+  assert "the finished download is kept as the ISO" test -s "$ISO"
+  assert "same size as the mirror's file" test "$(file_size "$ISO")" = "$(file_size "$WEBDIR/x.iso")"
+  assert "no partial file left behind" test ! -e "$ISO.part"
+  assert "says it was kept" grep -q 'kept' "$T/f.out"
+}
+
+test_next_run_only_verifies_it_does_not_download_again() {
+  mk_fetch_env; fake_verify 1 0
+  ( fetch ) >/dev/null 2>&1
+  before=$(gets)
+  ( fetch ) >"$T/f2.out" 2>&1; rc=$?
+  after=$(gets)
+  kill $WEBPID 2>/dev/null
+  assert "second run succeeds" test $rc -eq 0
+  assert "no second download" test "$before" = "$after"
+  assert "marked verified" iso_is_verified
+}
+
+test_a_genuinely_bad_image_is_discarded() {
+  mk_fetch_env; fake_verify 30
+  ( fetch ) >"$T/f.out" 2>&1; rc=$?
+  kill $WEBPID 2>/dev/null
+  assert "exit 30" test $rc -eq 30
+  assert "image removed" test ! -e "$ISO"
+  assert "partial removed" test ! -e "$ISO.part"
+}
+
+test_a_stale_partial_file_gets_exactly_one_clean_retry() {
+  mk_fetch_env; fake_verify 30 0
+  head -c 100000 "$WEBDIR/x.iso" | tr 'a-z' 'A-Z' > "$ISO.part"        # a corrupt partial from an earlier run
+  ( fetch ) >"$T/f.out" 2>&1; rc=$?
+  kill $WEBPID 2>/dev/null
+  [[ $rc -eq 0 ]] || sed 's/^/    fetch said: /' "$T/f.out" | tail -12
+  assert "ends verified after one retry" test $rc -eq 0
+  assert "downloaded the clean copy" test "$(sha256sum < "$ISO" | cut -d' ' -f1)" = "$(sha256sum < "$WEBDIR/x.iso" | cut -d' ' -f1)"
+  assert "mentions the retry" grep -q 'from scratch, once' "$T/f.out"
+}
+
+test_missing_key_is_caught_before_the_big_download() {
+  mk_fetch_env; fake_verify 0
+  prepare_keyring() { die "$E_NET" "key not confirmed"; }
+  ( fetch ) >"$T/f.out" 2>&1; rc=$?
+  kill $WEBPID 2>/dev/null
+  assert "stops with the network exit code" test $rc -eq 20
+  assert "nothing was downloaded" test "$(gets)" = 0
+  assert "no ISO or partial" bash -c '! test -e "$1" && ! test -e "$1.part"' _ "$ISO"
+}
+
+test_ubuntu_has_a_second_independent_key_source() {
+  src
+  for d in ubuntu ubuntu24; do
+    DISTRO=$d; TARGET_ARCH=x86_64; set_distro
+    assert "$d has a package-archive key source" bash -c '[[ $1 == deb:https://archive.ubuntu.com/* ]]' _ "$KEY_EXTRA_URL"
+  done
+}
+
+test_key_can_be_taken_from_a_deb_package() {
+  src
+  need_ok=0; command -v bsdtar >/dev/null && need_ok=1
+  [[ $need_ok -eq 1 ]] || skip "bsdtar missing"
+  mkdir -p "$T/pkg/usr/share/keyrings"
+  echo "KEYRING-BYTES" > "$T/pkg/usr/share/keyrings/ubuntu-cdimage-keyring.gpg"
+  ( cd "$T/pkg" && bsdtar -czf ../data.tar.gz ./usr ) ; echo 2.0 > "$T/debian-binary"
+  ( cd "$T" && bsdtar --format ar -cf fake_1.deb debian-binary data.tar.gz )
+  deb_extract_member "$T/fake_1.deb" usr/share/keyrings/ubuntu-cdimage-keyring.gpg "$T/out.gpg"
+  assert "extracted the right file" test "$(cat "$T/out.gpg")" = "KEYRING-BYTES"
+  assert "a missing member fails cleanly" bash -c '! deb_extract_member "$1" nope/none "$2"' _ "$T/fake_1.deb" "$T/o2" 2>/dev/null || true
+  idx='<a href="ubuntu-keyring_2021.03.26_all.deb">a</a> <a href="ubuntu-keyring_2026.08.18_all.deb">b</a> <a href="ubuntu-keyring_2023.11.28.1_all.deb">c</a> <a href="other_9.9_all.deb">x</a>'
+  assert "newest package is chosen" test "$(latest_deb_name ubuntu-keyring <<<"$idx")" = "ubuntu-keyring_2026.08.18_all.deb"
+}
+
+test_one_key_source_is_refused_unless_you_say_otherwise() {
+  src
+  assert "default needs two sources" test "$KEY_MIN_SOURCES" = 2
+}
+
+test_a_mirror_that_cannot_resume_restarts_cleanly() {
+  mk_fetch_env; fake_verify 0
+  kill $WEBPID 2>/dev/null; sleep 0.5
+  ( cd "$WEBDIR" && python3 -m http.server "$PORT" --bind 127.0.0.1 >/dev/null 2>&1 ) & WEBPID=$!    # no Range support
+  sleep 1
+  head -c 100000 "$WEBDIR/x.iso" | tr 'a-z' 'A-Z' > "$ISO.part"
+  ( fetch ) >"$T/f.out" 2>&1; rc=$?
+  kill $WEBPID 2>/dev/null
+  assert "completes" test $rc -eq 0
+  assert "clean copy, not the corrupt prefix" test "$(sha256sum < "$ISO" | cut -d' ' -f1)" = "$(sha256sum < "$WEBDIR/x.iso" | cut -d' ' -f1)"
+  assert "said why it started over" grep -q 'does not support resuming' "$T/f.out"
 }
 
 # ---------------------------------------------------------------- run

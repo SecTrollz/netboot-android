@@ -134,6 +134,7 @@ IPXE_CC="${IPXE_CC:-}"
 FALLBACK_SERVER="${FALLBACK_SERVER:-}"
 TRUST_CA="${TRUST_CA:-}"
 ALLOW_UNPINNED="${ALLOW_UNPINNED:-0}"
+KEY_MIN_SOURCES="${KEY_MIN_SOURCES:-2}"       # independent places that must agree on the vendor key
 ALLOW_UNVERIFIED="${ALLOW_UNVERIFIED:-0}"
 ACCEPT_SCRIPT_CHANGE="${ACCEPT_SCRIPT_CHANGE:-0}"
 CT_BOOTSTRAP="${CT_BOOTSTRAP:-0}"
@@ -649,6 +650,10 @@ set_distro() {
   SUMS_ALGO=$P_SUMS_ALGO
   ISO_SIG_URL=${U_ISO_SIG_URL:-$P_ISO_SIG_URL}
   KEY_EXTRA_URL=$P_KEY_EXTRA_URL
+  case "$DISTRO" in
+    ubuntu|ubuntu24)   # keys.openpgp.org does not carry Ubuntu's CD key; Ubuntu's own archive does
+      [[ -n $KEY_EXTRA_URL ]] || KEY_EXTRA_URL="deb:https://archive.ubuntu.com/ubuntu/pool/main/u/ubuntu-keyring/|ubuntu-keyring|usr/share/keyrings/ubuntu-cdimage-keyring.gpg" ;;
+  esac
   KEY_FPR=$(norm_fpr "${U_KEY_FPR:-$(vendor_fpr "$DISTRO")}")
   MIN_FREE_MB=${U_MIN_FREE_MB:-$P_MIN_MB}
   CLIENT_RAM_GB=$P_RAM_GB
@@ -1250,6 +1255,37 @@ key_fprs_of() {
     | awk -F: '$1=="fpr"{print $10}'
 }
 
+# Newest NAME_*_all.deb listed in an HTML directory index (stdin)
+latest_deb_name() {   # latest_deb_name PKG < index.html
+  grep -o "$1_[0-9][0-9A-Za-z.+~:-]*_all\.deb" | sort -uV | tail -n1
+}
+
+# Pulls one file out of a .deb (an ar archive holding data.tar.*)
+deb_extract_member() {   # deb_extract_member DEB MEMBER_PATH DEST
+  local deb=$1 member=$2 dest=$3
+  need bsdtar
+  bsdtar -xOf "$deb" 'data.tar*' 2>/dev/null | bsdtar -xOf - "./$member" > "$dest.tmp" 2>/dev/null \
+    && [[ -s $dest.tmp ]] && mv -f "$dest.tmp" "$dest" || { rm -f "$dest.tmp"; return 1; }
+}
+
+# A key source is either an https URL, or  deb:BASEURL|PACKAGE|PATH-INSIDE-PACKAGE
+fetch_key_source() {   # fetch_key_source SRC DEST
+  local src=$1 dest=$2
+  if [[ $src == deb:* ]]; then
+    local spec=${src#deb:} base pkg member idx name
+    base=${spec%%|*}; spec=${spec#*|}; pkg=${spec%%|*}; member=${spec#*|}
+    idx=$(mktemp)
+    vfetch "$base" "$idx" protected || { rm -f "$idx"; return 1; }
+    name=$(latest_deb_name "$pkg" < "$idx"); rm -f "$idx"
+    [[ -n $name ]] || return 1
+    vfetch "$base$name" "$dest.deb" protected || return 1
+    deb_extract_member "$dest.deb" "$member" "$dest"; local rc=$?
+    rm -f "$dest.deb"
+    return $rc
+  fi
+  vfetch "$src" "$dest" protected
+}
+
 prepare_keyring() {
   need gpg
   [[ -n $KEY_FPR ]] || die "No signing key fingerprint for $DISTRO. Set KEY_FPR."
@@ -1268,7 +1304,7 @@ prepare_keyring() {
   for src in "${srcs[@]}"; do
     i=$((i+1))
     f="$KEYS_DIR/$DISTRO/key.$i.asc"
-    if ( vfetch "$src" "$f" protected ); then
+    if ( fetch_key_source "$src" "$f" ); then
       fprs=$(key_fprs_of "$scratch" "$f")
       if grep -qx "$KEY_FPR" <<<"$fprs"; then
         agree=$((agree+1))
@@ -1284,7 +1320,9 @@ prepare_keyring() {
   done
   rm -rf "$scratch"
 
-  (( agree >= 2 )) || die "Key $KEY_FPR was confirmed by only $agree source(s). Need at least 2."
+  if (( agree < KEY_MIN_SOURCES )); then
+    die "$E_NET" "Key $KEY_FPR was confirmed by only $agree source(s); $KEY_MIN_SOURCES are required. Nothing was downloaded or deleted. Check your internet and run the same step again. (To accept one source, whose key matches the fingerprint built into this script, set KEY_MIN_SOURCES=1.)"
+  fi
   gpg --homedir "$GNUPG_HOME" --batch --no-tty --list-keys "$KEY_FPR" >/dev/null 2>&1 \
     || die "Key $KEY_FPR could not be imported into the keyring"
   touch "$GNUPG_HOME/.ready-$KEY_FPR"
@@ -1302,7 +1340,7 @@ sig_ok() {
   while read -r _ rest; do
     if grep -qw "$sigkey" <<<"$rest"; then count=$((count+1)); fi
   done < "$GNUPG_HOME/source-fprs"
-  (( count >= 2 )) || return 1
+  (( count >= KEY_MIN_SOURCES )) || return 1
   SIG_SIGNER=$sigkey
 }
 
@@ -2217,7 +2255,7 @@ verify_download() {
   if [[ -n $ISO_SIG_URL ]]; then
     vfetch "$ISO_SIG_URL" "$ISO_SIG_FILE" protected
     info "Checking the ISO signature (reads the whole file)"
-    verify_detached "$ISO_SIG_FILE" "$file" "ISO image" || return 1
+    verify_detached "$ISO_SIG_FILE" "$file" "ISO image" || return 30   # 30 = the image itself is bad
     iso_sig=1
   fi
 
@@ -2238,7 +2276,7 @@ verify_download() {
     fi
     if [[ $algohash != "$expect" ]]; then
       err "$SUMS_ALGO MISMATCH for $orig (expected $expect, got $algohash)"
-      return 1
+      return 30   # 30 = the image itself is bad
     fi
     ok "$SUMS_ALGO matches the published checksum"
     hash_ok=1
@@ -2265,7 +2303,12 @@ fetch() {
     die "No checksum or signature source for $DISTRO. Set SUMS_URL or ISO_SIG_URL, or ALLOW_UNVERIFIED=1."
   fi
 
-  local target code rc attempt=0 resumed=0 remote have need_mb avail_mb
+  local target code rc attempt=0 resumed=0 remote have need_mb avail_mb vrc=0
+  # Cheap checks first: if the vendor key cannot be confirmed, say so now, not after 6 GB.
+  if [[ -n $SUMS_URL || -n $ISO_SIG_URL ]]; then
+    info "Checking the vendor signing key before the big download"
+    prepare_keyring
+  fi
   if [[ -s $ISO ]]; then
     target=$ISO
     info "ISO present but not verified. Verifying now."
@@ -2292,6 +2335,10 @@ fetch() {
       if (( rc == 0 )) && [[ $code =~ ^[45] ]]; then
         rm -f "$ISO.part"; die "$E_NET" "The server answered HTTP $code for $ISO_URL. The partial file was discarded."
       fi
+      if (( rc == 33 )); then   # the server cannot resume: a stale partial file would never complete
+        warn "This server does not support resuming. Discarding the partial file and starting over."
+        rm -f "$ISO.part"; resumed=0
+      fi
       attempt=$((attempt+1))
       (( attempt < 5 )) || die "$E_NET" "Download kept failing (curl error $rc). Your progress is saved; re-run fetch to resume."
       warn "Download interrupted (curl error $rc). Retrying in $((attempt*5))s (attempt $attempt of 5); progress is kept."
@@ -2310,21 +2357,29 @@ fetch() {
     return 0
   fi
 
-  if ( verify_download "$target" "$ISO_NAME" ); then
+  ( verify_download "$target" "$ISO_NAME" ) || vrc=$?
+  if (( vrc == 0 )); then
     [[ $target == "$ISO.part" ]] && mv -f "$ISO.part" "$ISO"
     mv -f "$VERIFY_REC.tmp" "$VERIFY_REC"
     printf '%s %s %s\n' "$(cat "$VERIFY_REC.sha")" "$(file_size "$ISO")" "$(file_mtime "$ISO")" > "$ISO_VERIFIED"
     rm -f "$VERIFY_REC.sha"
     ok "ISO verified: $ISO"
-  else
-    rm -f "$VERIFY_REC.tmp" "$VERIFY_REC.sha"
-    if [[ $target == "$ISO.part" ]]; then rm -f "$ISO.part"; fi
+    return 0
+  fi
+  rm -f "$VERIFY_REC.tmp" "$VERIFY_REC.sha"
+  if (( vrc == 30 )); then
+    # the image does not match its signed checksum or signature: it really is bad
+    rm -f "$ISO.part"; [[ $target == "$ISO" ]] && rm -f "$ISO" "$ISO_VERIFIED"
     if (( resumed )) && [[ ${FETCH_RETRIED:-0} != 1 ]]; then
-      warn "A resumed download failed verification (a stale partial file is the usual cause). Downloading again from scratch, once."
+      warn "A resumed download did not match its signed checksum (a stale partial file is the usual cause). Downloading again from scratch, once."
       FETCH_RETRIED=1; fetch; return
     fi
-    die "$E_INTEGRITY" "Verification FAILED. The download was discarded."
+    die "$E_INTEGRITY" "The image does not match the vendor's signed checksum. It was discarded."
   fi
+  # anything else (key lookup, network, checksum list): the download itself is fine, so KEEP it
+  [[ $target == "$ISO.part" ]] && mv -f "$ISO.part" "$ISO"
+  info "Your download is complete and was kept: $ISO ($(file_size "$ISO") bytes)"
+  die "$E_NET" "The download is safe; only the verification step could not finish (see above). Fix the cause or try again later, then run fetch again. It will only re-verify, not download again."
 }
 
 # =============================================================================
