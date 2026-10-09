@@ -145,6 +145,8 @@ TRUST_CA=ca.crt FALLBACK_SERVER=<phone IP> ./netboot-android.sh --arch x86_64 bu
 | Command | What it does |
 |---|---|
 | `fingerprints` | Values to compare against a copy on ANOTHER device |
+| `release-stamp TIME` | Stamps the upload time into the script and prints its release code |
+| `verify-upstream` | Proves this script is byte-identical to the GitHub copy committed at that time |
 | `verify-attest` | Checks a signed report and re-hashes every file |
 | `pins show` | Lists the pins in use |
 | `logs` | Follows the HTTP log |
@@ -152,6 +154,49 @@ TRUST_CA=ca.crt FALLBACK_SERVER=<phone IP> ./netboot-android.sh --arch x86_64 bu
 | `clean` | Stops servers, removes generated files (keeps ISOs, keys, pins) |
 
 "Run `./netboot-android.sh --help` for EVERY environment variable! There are so many! Buttons! Everywhere!"
+
+*[channel flips]*
+
+---
+
+## 📺 CH. 9½: "THE TIME HEIST"
+
+*A detective made of wristwatches stares into the rain.*
+
+"The keys are hard-coded, kid. Fingerprints, pins, the iPXE commit. Somebody touches 'em, I want to know. So here's the play."
+
+**Before the upload, pick the exact moment:**
+
+```sh
+./netboot-android.sh release-stamp 2026-10-09T18:00:00Z
+```
+
+That writes the time into the script as `RELEASE_TIME`, re-signs it if you have attestation set up, and prints a **release code**: an HMAC-SHA256 of the whole script keyed by that exact time. **Write the code down somewhere that isn't the phone.**
+
+**Upload at that exact time** (the script prints these lines for you):
+
+```sh
+GIT_AUTHOR_DATE=2026-10-09T18:00:00Z GIT_COMMITTER_DATE=2026-10-09T18:00:00Z git commit -am "Release 2026-10-09T18:00:00Z"
+git push origin main
+```
+
+**Later, on any device:**
+
+```sh
+./netboot-android.sh verify-upstream
+EXPECT_CODE=xxxx-xxxx-xxxx-xxxx-xxxx ./netboot-android.sh verify-upstream
+```
+
+It pulls the script from GitHub over pinned TLS and finds the last commit that touched it. Then it checks three things:
+
+1. That commit's timestamp must equal `RELEASE_TIME`.
+2. The code recomputed from that timestamp must be identical for the local copy and the GitHub copy.
+3. If you pass `EXPECT_CODE`, it must match too.
+
+**All good:** you get one box: `UPSTREAM MATCH`, the commit, the upload time, the code.
+**Anything off:** it names the problem. If keys or pins changed, it shows the exact lines.
+
+"One thing, kid. The time ain't a secret. Anybody can read a commit date. The code alone proves nothing. What proves it is the copy on GitHub plus the code you wrote down off the phone. Don't squash-merge or rebase that commit either, or the timestamp changes and the case goes cold."
 
 *[channel flips]*
 
@@ -166,6 +211,8 @@ TRUST_CA=ca.crt FALLBACK_SERVER=<phone IP> ./netboot-android.sh --arch x86_64 bu
 - **"Network changed since configure"**: Your IP moved. Run `configure` again.
 - **"Script changed since self-sign"**: If YOU edited it, run `self-sign` again. If you DIDN'T, investigate.
 - **Boot stops at `imgverify`**: The iPXE binaries were built with a different CA. Rebuild iPXE.
+- **"TIME MISMATCH"**: The newest commit touching the script on GitHub wasn't made at `RELEASE_TIME`. Either someone pushed a newer version, or the release commit was made without the `GIT_*_DATE` variables.
+- **"Upstream verification FAILED"**: Your copy is not the one uploaded at that time. Read the diff it prints.
 
 **Dr. Segfault:** "He's going to be fine. Probably. Clear!"
 

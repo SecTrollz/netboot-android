@@ -45,6 +45,7 @@ set -euo pipefail
 umask 022
 
 SCRIPT_VERSION="2026.10.08-final"
+RELEASE_TIME=""   # upload time (UTC epoch) set by release-stamp; must equal the upstream commit time
 
 # =============================================================================
 # Platform detection
@@ -96,6 +97,8 @@ CT_HOST="api.certspotter.com"
 KEYSERVER_UBUNTU="https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x"
 KEYSERVER_OPENPGP="https://keys.openpgp.org/vks/v1/by-fingerprint/"
 INFRA_HOSTS=(api.certspotter.com keyserver.ubuntu.com keys.openpgp.org github.com)
+DEFAULT_UPSTREAM_REPO="https://github.com/SecTrollz/netboot-android.git"
+UPSTREAM_PATH="netboot-android.sh"
 
 # =============================================================================
 # Settings (environment overrides)
@@ -118,6 +121,9 @@ ALLOW_UNPINNED="${ALLOW_UNPINNED:-0}"
 ALLOW_UNVERIFIED="${ALLOW_UNVERIFIED:-0}"
 ACCEPT_SCRIPT_CHANGE="${ACCEPT_SCRIPT_CHANGE:-0}"
 CT_BOOTSTRAP="${CT_BOOTSTRAP:-0}"
+UPSTREAM_REPO="${UPSTREAM_REPO:-$DEFAULT_UPSTREAM_REPO}"
+UPSTREAM_BRANCH="${UPSTREAM_BRANCH:-main}"
+EXPECT_CODE="${EXPECT_CODE:-}"
 
 # User overrides, captured before presets so they always win
 U_ISO_URL="${ISO_URL:-}"
@@ -135,6 +141,7 @@ POWER_TWEAKED=0
 COMMAND=""
 POSITIONAL=()
 SIG_SIGNER=""
+GIT_PIN_OPTS=()
 
 # =============================================================================
 # Output
@@ -1060,7 +1067,11 @@ show_fingerprints() {
     "Boot CA SHA-256:" \
     "  $(ca_fpr_hex 2>/dev/null || echo 'not created')" \
     "iPXE commit:" \
-    "  $IPXE_COMMIT"
+    "  $IPXE_COMMIT" \
+    "Release time:" \
+    "  $( [[ -n $RELEASE_TIME ]] && epoch_to_iso "$RELEASE_TIME" || echo 'not stamped')" \
+    "Release code:" \
+    "  $( [[ -n $RELEASE_TIME ]] && release_code "$SELF" "$RELEASE_TIME" | awk '{print $2}' || echo 'not stamped')"
   echo
 }
 
@@ -1088,6 +1099,148 @@ deps() {
   DNSMASQ=$(find_bin dnsmasq || true)
   PYTHON=$(find_bin python3 || find_bin python || true)
   ok "Packages installed"
+}
+
+# =============================================================================
+# Pinned git transport
+# =============================================================================
+# Sets GIT_PIN_OPTS to the git options that pin github.com's TLS key
+git_pin_opts() {
+  GIT_PIN_OPTS=()
+  local pins
+  pins=$(pins_curl_arg github.com)
+  if [[ -n $pins ]]; then
+    GIT_PIN_OPTS=(-c "http.pinnedPubkey=$pins")
+  elif [[ $ALLOW_UNPINNED == 1 ]]; then
+    warn "No pin for github.com. Using git unpinned (ALLOW_UNPINNED=1). Commit hashes still pin the content."
+  else
+    die "No valid pin for github.com. Run: $0 pins refresh github.com"
+  fi
+}
+
+# =============================================================================
+# Release stamp and upstream verification
+# =============================================================================
+# HMAC-SHA256 of FILE keyed by the exact upload time. Prints "fullhex shortcode".
+release_code() {
+  local file=$1 epoch=$2 hex
+  hex=$(openssl dgst -sha256 -hmac "netboot-android-v1:$epoch" -r "$file" | awk '{print $1}')
+  [[ ${#hex} -eq 64 ]] || return 1
+  printf '%s %s-%s-%s-%s-%s\n' "$hex" "${hex:0:4}" "${hex:4:4}" "${hex:8:4}" "${hex:12:4}" "${hex:16:4}"
+}
+
+epoch_to_iso() { date -u -d "@$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -r "$1" '+%Y-%m-%dT%H:%M:%SZ'; }
+
+# The hard-coded trust data: vendor fingerprints, TLS pins, iPXE commit
+trust_block() {
+  local file=$1
+  sed -n -e '/^DEFAULT_IPXE_COMMIT=/p' \
+         -e '/^vendor_fpr() {/,/^}/p' \
+         -e '/^pin_snapshot() {/,/^}/p' "$file"
+}
+
+release_stamp() {
+  local when=${1:-} epoch line code
+  [[ -n $when ]] || die "Usage: $0 release-stamp TIME   (UTC, for example 2026-10-09T18:00:00Z)"
+  need openssl
+  epoch=$(date -u -d "$when" +%s 2>/dev/null) || die "Cannot parse time '$when'. Use a form like 2026-10-09T18:00:00Z"
+  [[ -w $SELF ]] || die "Cannot write $SELF"
+
+  line=$(grep -n '^RELEASE_TIME=' "$SELF" | head -n1 | cut -d: -f1)
+  [[ -n $line ]] || die "No RELEASE_TIME line found in $SELF"
+  sed -i "${line}s/^RELEASE_TIME=\"[0-9]*\"/RELEASE_TIME=\"$epoch\"/" "$SELF"
+  grep -q "^RELEASE_TIME=\"$epoch\"" "$SELF" || die "Could not write RELEASE_TIME into $SELF"
+  RELEASE_TIME=$epoch
+
+  read -r _ code < <(release_code "$SELF" "$epoch") || die "Could not compute the release code"
+  ok "RELEASE_TIME set to $epoch ($(epoch_to_iso "$epoch"))"
+  [[ -n $(attest_fpr) ]] && self_sign
+
+  local iso
+  iso=$(epoch_to_iso "$epoch")
+  echo
+  box \
+    "RELEASE CODE: $code" \
+    "" \
+    "Write this code down somewhere other than this device." \
+    "Upload time: $iso"
+  echo
+  info "Commit and push with exactly this time:"
+  printf '  GIT_AUTHOR_DATE=%s GIT_COMMITTER_DATE=%s git commit -am "Release %s"\n' "$iso" "$iso" "$iso"
+  printf '  git push origin %s\n\n' "$UPSTREAM_BRANCH"
+  info "Then, on any device: $0 verify-upstream   (optionally EXPECT_CODE=$code)"
+}
+
+verify_upstream() {
+  need git; need openssl
+  [[ -n $RELEASE_TIME ]] || die "This script has no RELEASE_TIME. Run: $0 release-stamp TIME"
+
+  local -a gopt=()
+  case $UPSTREAM_REPO in
+    https://github.com/*) git_pin_opts; gopt=("${GIT_PIN_OPTS[@]+"${GIT_PIN_OPTS[@]}"}") ;;
+    *) [[ $ALLOW_UNPINNED == 1 ]] || die "UPSTREAM_REPO is not on github.com. Set ALLOW_UNPINNED=1 to use $UPSTREAM_REPO"
+       warn "Using non-GitHub upstream $UPSTREAM_REPO (ALLOW_UNPINNED=1)" ;;
+  esac
+
+  local repo="$SRC_DIR/self.git"
+  mkdir -p "$SRC_DIR"
+  if [[ ! -d $repo ]]; then
+    info "Cloning $UPSTREAM_REPO (pinned TLS)"
+    git "${gopt[@]+"${gopt[@]}"}" clone --quiet --bare "$UPSTREAM_REPO" "$repo" || die "Clone failed (pin mismatch or network error)"
+  fi
+  git "${gopt[@]+"${gopt[@]}"}" -C "$repo" fetch --quiet --force "$UPSTREAM_REPO" \
+    "+refs/heads/$UPSTREAM_BRANCH:refs/remotes/upstream/$UPSTREAM_BRANCH" \
+    || die "Fetch of branch $UPSTREAM_BRANCH failed"
+
+  local commit ctime up
+  read -r commit ctime < <(git -C "$repo" log -1 --format='%H %ct' "upstream/$UPSTREAM_BRANCH" -- "$UPSTREAM_PATH") \
+    || die "No commit touching $UPSTREAM_PATH on $UPSTREAM_BRANCH"
+  up=$(mktemp)
+  git -C "$repo" show "$commit:$UPSTREAM_PATH" > "$up" || { rm -f "$up"; die "Cannot read $UPSTREAM_PATH at $commit"; }
+  info "Upstream: $UPSTREAM_BRANCH @ $commit, committed $(epoch_to_iso "$ctime")"
+
+  if [[ $ctime != "$RELEASE_TIME" ]]; then
+    rm -f "$up"
+    audit "UPSTREAM TIME-MISMATCH commit=$commit upstream=$ctime local=$RELEASE_TIME"
+    die "TIME MISMATCH. Upstream commit time $(epoch_to_iso "$ctime") is not this script's RELEASE_TIME $(epoch_to_iso "$RELEASE_TIME")."
+  fi
+
+  local lhex lcode uhex ucode
+  read -r lhex lcode < <(release_code "$SELF" "$RELEASE_TIME") || die "Could not hash $SELF"
+  read -r uhex ucode < <(release_code "$up" "$ctime") || die "Could not hash the upstream copy"
+
+  local bad=0
+  [[ $lhex == "$uhex" ]] || bad=1
+  if [[ -n $EXPECT_CODE ]]; then
+    local want=${EXPECT_CODE,,}
+    [[ $want == "$ucode" || $want == "$uhex" ]] || { err "EXPECT_CODE $EXPECT_CODE does not match the upstream code $ucode"; bad=1; }
+  fi
+
+  if (( bad )); then
+    err "This script is NOT the copy uploaded at $(epoch_to_iso "$ctime")"
+    err "  local code    $lcode"
+    err "  upstream code $ucode"
+    if [[ $lhex == "$uhex" ]]; then
+      err "The local file matches upstream, but upstream is not the release you recorded."
+    elif ! diff <(trust_block "$up") <(trust_block "$SELF") >/dev/null; then
+      err "Hard-coded trust data differs (upstream '<', local '>'):"
+      diff <(trust_block "$up") <(trust_block "$SELF") >&2 || true
+    else
+      err "Trust data is identical; other lines differ."
+    fi
+    rm -f "$up"
+    audit "UPSTREAM MISMATCH commit=$commit local=$lcode upstream=$ucode"
+    die "Upstream verification FAILED"
+  fi
+  rm -f "$up"
+  audit "UPSTREAM MATCH commit=$commit time=$ctime code=$ucode"
+  echo
+  box \
+    "UPSTREAM MATCH" \
+    "commit   $commit" \
+    "uploaded $(epoch_to_iso "$ctime")" \
+    "code     $ucode"
+  echo
 }
 
 # =============================================================================
@@ -1157,16 +1310,8 @@ build_ipxe() {
     die "This device is $HOST_ARCH and the target is $TARGET_ARCH. Build on a $TARGET_ARCH Linux machine with this same script, or set IPXE_CROSS (for example IPXE_CROSS=x86_64-linux-gnu-). Then copy the binaries over with: $0 import-ipxe DIR"
   fi
 
-  local -a gopt=()
-  local pins
-  pins=$(pins_curl_arg github.com)
-  if [[ -n $pins ]]; then
-    gopt=(-c "http.pinnedPubkey=$pins")
-  elif [[ $ALLOW_UNPINNED == 1 ]]; then
-    warn "No pin for github.com. Cloning unpinned (ALLOW_UNPINNED=1). The commit hash still pins the source."
-  else
-    die "No valid pin for github.com. Run: $0 pins refresh github.com"
-  fi
+  git_pin_opts
+  local -a gopt=("${GIT_PIN_OPTS[@]+"${GIT_PIN_OPTS[@]}"}")
 
   local src="$SRC_DIR/ipxe"
   mkdir -p "$SRC_DIR"
@@ -1732,6 +1877,12 @@ attest_report() {
     echo "script_signed_sha256=$(awk '{print $1}' "$ATTEST/script.sha256" 2>/dev/null || echo none)"
     echo "attest_key=$(attest_fpr)"
     echo "boot_ca_sha256=$(ca_fpr_hex 2>/dev/null || echo none)"
+    if [[ -n $RELEASE_TIME ]]; then
+      echo "release_time=$(epoch_to_iso "$RELEASE_TIME")"
+      echo "release_code=$(release_code "$SELF" "$RELEASE_TIME" | awk '{print $2}')"
+    else
+      echo "release_time=none"
+    fi
     echo
     echo "[target]"
     echo "distro=$DISTRO arch=$TARGET_ARCH family=$FAMILY label=\"$P_LABEL\""
@@ -2133,6 +2284,7 @@ interactive() {
     "Verify latest attestation report"
     "Show HTTP log (last 50 lines)"
     "Clean up"
+    "Verify this script against GitHub"
     "Help"
     "Quit"
   )
@@ -2158,9 +2310,10 @@ interactive() {
       16) run_step verify_attest ;;
       17) tail -n 50 "$HTTP_LOG" 2>/dev/null || warn "No log yet" ;;
       18) run_step clean ;;
-      19) usage; echo ;;
-      20) break ;;
-      *)  warn "Enter a number from 1 to 20" ;;
+      19) run_step verify_upstream ;;
+      20) usage; echo ;;
+      21) break ;;
+      *)  warn "Enter a number from 1 to 21" ;;
     esac
     PS3="Choose a step: "
   done
@@ -2192,6 +2345,10 @@ COMMANDS
   attest-init           Create the local attestation key and boot code-signing CA
   self-sign             Record and sign this script's SHA-256
   fingerprints          Print values to compare against copies on another device
+  release-stamp TIME    Stamp the planned upload time (UTC, e.g. 2026-10-09T18:00:00Z)
+                        into this script and print its release code
+  verify-upstream       Fetch this script from GitHub (pinned TLS) and prove the local
+                        copy is byte-identical to the one committed at RELEASE_TIME
   pins refresh [HOST..] Validate each host against Certificate Transparency and
                         update pins. A served key missing from CT is reported as
                         interception and the old pins are kept.
@@ -2252,6 +2409,9 @@ ENVIRONMENT VARIABLES
   ALLOW_UNPINNED=1      Fetch transport-trusted content without a pin (not recommended)
   ALLOW_UNVERIFIED=1    Accept an ISO with no verified signature (not recommended)
   ACCEPT_SCRIPT_CHANGE=1  Run even though the script changed since self-sign
+  UPSTREAM_REPO         Repo for verify-upstream    (default: $DEFAULT_UPSTREAM_REPO)
+  UPSTREAM_BRANCH       Branch for verify-upstream                (default: main)
+  EXPECT_CODE           Release code you recorded; verify-upstream must match it
 
 BUILDING iPXE FOR A DIFFERENT CPU
   Most phones are arm64 and most PCs are x86_64, so the phone usually cannot build
@@ -2298,7 +2458,7 @@ COMMAND="${COMMAND:-ui}"
 set_distro
 
 case "$COMMAND" in
-  help|attest-init|self-sign|fingerprints|deps) ;;
+  help|attest-init|self-sign|fingerprints|deps|release-stamp|verify-upstream) ;;
   *) self_check ;;
 esac
 
@@ -2310,6 +2470,8 @@ case "$COMMAND" in
   attest-init)    attest_init ;;
   self-sign)      self_sign ;;
   fingerprints)   show_fingerprints ;;
+  release-stamp)  release_stamp "${POSITIONAL[0]:-}" ;;
+  verify-upstream) verify_upstream ;;
   pins)
     case "${POSITIONAL[0]:-show}" in
       refresh)
