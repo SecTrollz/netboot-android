@@ -362,6 +362,18 @@ sha256_of()  {
 sha512_of()  { sha512sum "$1" | awk '{print $1}'; }
 file_size()  { stat -c %s "$1" 2>/dev/null || wc -c <"$1" | tr -d ' '; }
 file_mtime() { stat -c %Y "$1" 2>/dev/null || echo 0; }
+# Free space in MB for a path. Android's built-in df has no -m, so use KB and fall back to stat -f.
+free_mb() {
+  local p=$1 kb a b
+  while [[ ! -e $p && $p != / ]]; do p=$(dirname "$p"); done
+  kb=$(df -Pk "$p" 2>/dev/null | awk 'NR==2{print $4}')
+  [[ $kb =~ ^[0-9]+$ ]] || kb=$(df -k "$p" 2>/dev/null | awk 'END{print $4}')
+  if ! [[ $kb =~ ^[0-9]+$ ]]; then
+    read -r a b < <(stat -f -c '%a %S' "$p" 2>/dev/null) || true
+    [[ ${a:-} =~ ^[0-9]+$ && ${b:-} =~ ^[0-9]+$ ]] && kb=$(( a * b / 1024 )) || kb=0
+  fi
+  echo $(( kb / 1024 ))
+}
 url_host()   { local u=${1#*://}; u=${u%%/*}; printf '%s' "${u%%:*}"; }
 norm_fpr()   { printf '%s' "$1" | tr -d ' ' | tr 'a-f' 'A-F'; }
 nproc_n()    { nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2; }
@@ -1901,7 +1913,7 @@ fetch() {
              | awk 'tolower($1)=="content-length:" {gsub("\r","",$2); n=$2} END{print n+0}' || echo 0)
     have=$(file_size "$ISO.part" 2>/dev/null || echo 0)
     if (( remote > 0 )); then
-      need_mb=$(( (remote - have) / 1048576 + 1 )); avail_mb=$(df -Pm "$DL" | awk 'NR==2{print $4}')
+      need_mb=$(( (remote - have) / 1048576 + 1 )); avail_mb=$(free_mb "$DL")
       if (( avail_mb < need_mb + 256 )); then
         die "$E_DISK" "Not enough space for the download: need about $need_mb MB more, only $avail_mb MB free."
       fi
@@ -2027,7 +2039,7 @@ extract() {
   need_mb=$(bsdtar -tvf "$ISO" 2>/dev/null | awk -v want="$(printf '%s\n' "${files[@]#./}")" '
       BEGIN{n=split(want,a,"\n"); for(i=1;i<=n;i++) w[a[i]]=1}
       { name=$NF; sub(/^\.\//,"",name); if (name in w) sum+=$5 } END{printf "%d", sum/1048576 + 1}' || echo 0)
-  avail_mb=$(df -Pm "$HTTP" | awk 'NR==2{print $4}')
+  avail_mb=$(free_mb "$HTTP")
   if (( need_mb > 1 && avail_mb < need_mb + need_mb/20 + 64 )); then
     rm -rf "$stage"
     die "$E_DISK" "Not enough space to extract: need about $need_mb MB, only $avail_mb MB free. Nothing was changed."
@@ -2969,7 +2981,7 @@ check() {
   if port_in_use tcp "$HTTP_PORT"; then warn "TCP $HTTP_PORT in use"; else ok "TCP $HTTP_PORT free"; fi
 
   mkdir -p "$ROOT"
-  avail_mb=$(df -Pm "$ROOT" | awk 'NR==2{print $4}')
+  avail_mb=$(free_mb "$ROOT")
   if (( avail_mb >= MIN_FREE_MB )); then
     ok "Storage: $avail_mb MB free (need $MIN_FREE_MB MB for $DISTRO)"
   else
@@ -3105,7 +3117,7 @@ diagnose() {
   if [[ -f $DNSMASQ_CONF && ! -f $LIB/httpd.py ]]; then finding WARN LIBS "Helper programs are missing" "$0 heal"; fi
   # storage and memory
   mkdir -p "$ROOT" 2>/dev/null || true
-  avail=$(df -Pm "$ROOT" 2>/dev/null | awk 'NR==2{print $4}'); avail=${avail:-0}
+  avail=$(free_mb "$ROOT")
   if (( avail >= ${MIN_FREE_MB:-0} )); then finding OK DISK "Storage: $avail MB free" ""
   elif [[ -f $MANIFEST ]]; then finding WARN DISK "Storage is low: $avail MB free (serving still works)" "$0 clean   (keeps ISOs and keys)"
   else finding FAIL DISK "Storage: only $avail MB free, need ${MIN_FREE_MB:-?} MB for $DISTRO" "free space or set NETBOOT_HOME to a bigger drive"; fi
@@ -3406,6 +3418,25 @@ gstep_head() {
 }
 
 # guided_run "Title" "Plain explanation" DONE_CHECK_FUNCTION|"" command args...
+
+# In the guide, "something is missing" is expected before the next steps install it.
+# Real blockers (root, storage, network) still stop and offer Retry.
+check_soft() {
+  local log rc=0
+  log=$(mktemp)
+  check 2>&1 | tee "$log" || true
+  if ! grep -q 'required check' "$log"; then rm -f "$log"; return 0; fi
+  if grep -qE 'No root|FAT/exFAT|No usable network|only [0-9]+ MB free' "$log"; then rc=1; fi
+  rm -f "$log"
+  echo
+  if (( rc )); then
+    err "Something above must be fixed first (root, storage, or network). Fix it, then choose Retry."
+    return 1
+  fi
+  info "That is OK. The missing items are exactly what the next steps set up. Carrying on."
+  return 0
+}
+
 guided_run() {
   local title=$1 why=$2 donefn=$3 a; shift 3
   gstep_head "$title" "$why"
@@ -3589,7 +3620,7 @@ guided() {
   fi
 
   guided_run "Check this device" \
-    "Looks for root, tools, free space and network. Safe: it only reads things. (under a minute)" "" check
+    "Looks for root, tools, free space and network. Safe: it only reads things. (under a minute)" "" check_soft
   guided_run "Install the tools needed" \
     "Installs packages such as dnsmasq, python, gpg. Needs internet. (2-5 minutes)" "" deps
   guided_run "Create your private keys" \

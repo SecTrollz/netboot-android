@@ -391,6 +391,40 @@ test_help_has_start_here() {
   assert "start here block" grep -q "START HERE" <<<"$out"
 }
 
+# ---- regression: Android's df has no -m (seen on a real phone) ----
+test_free_mb_works_with_android_df() {
+  src; mkdir -p "$T/bin"
+  # toybox-style df: only -k, no -m and no -P
+  cat > "$T/bin/df" <<'EOS'
+#!/bin/sh
+for a in "$@"; do case "$a" in -m|-P|-Pm|-Pk) echo "df: Unknown option '${a#-}' (see \"df --help\")" >&2; exit 1;; esac; done
+echo "Filesystem 1K-blocks Used Available Use% Mounted on"
+echo "/dev/fake 20971520 1048576 5242880 17% /"
+EOS
+  chmod +x "$T/bin/df"
+  PATH="$T/bin:$PATH"
+  got=$(free_mb "$T")
+  assert "5 GB free read through df -k" test "$got" -eq 5120
+  # df that fails entirely: falls back to stat -f and still returns a number
+  printf '#!/bin/sh\nexit 1\n' > "$T/bin/df"
+  got=$(free_mb "$T")
+  assert "stat -f fallback gives a number" test "$got" -gt 0
+  got=$(free_mb "$T/does/not/exist/yet")
+  assert "missing path uses its parent" test "$got" -gt 0
+}
+
+test_guide_check_softens_only_fixable_failures() {
+  src
+  check() { echo "[-] Tool missing: gpg"; echo "[-] 3 required check(s) failed"; return 1; }
+  check_soft >/dev/null 2>&1; assert "missing tools do not block the guide" test $? -eq 0
+  check() { echo "[-] No root. Grant Termux root"; echo "[-] 1 required check(s) failed"; return 1; }
+  check_soft >/dev/null 2>&1; assert "no root still blocks" test $? -ne 0
+  check() { echo "[-] Storage: only 100 MB free"; echo "[-] 1 required check(s) failed"; return 1; }
+  check_soft >/dev/null 2>&1; assert "no space still blocks" test $? -ne 0
+  check() { echo "[+] all good"; return 0; }
+  check_soft >/dev/null 2>&1; assert "clean check passes" test $? -eq 0
+}
+
 # ---------------------------------------------------------------- run
 for t in $(declare -F | awk '{print $3}' | grep '^test_'); do run_test "$t"; done
 
