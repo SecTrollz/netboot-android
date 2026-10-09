@@ -3,11 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Jason — The Art of Jewelry | North Carolina</title>
-<meta name="description" content="Handcrafted custom jewelry, engagement rings, repairs and appraisals in North Carolina. Jason — The Art of Jewelry.">
-<meta property="og:title" content="Jason — The Art of Jewelry">
-<meta property="og:description" content="Handcrafted custom jewelry, engagement rings and repairs in North Carolina.">
+<title>Jason's The Art of Jewelry | Alamance County, NC</title>
+<meta name="description" content="Handcrafted custom jewelry, engagement rings, repairs and appraisals serving Alamance County, North Carolina since 2012. Jason's The Art of Jewelry.">
+<meta property="og:title" content="Jason's The Art of Jewelry">
+<meta property="og:description" content="Handcrafted custom jewelry, engagement rings and repairs in Alamance County, NC. Since 2012.">
 <meta property="og:type" content="website">
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"JewelryStore","name":"Jason's The Art of Jewelry","foundingDate":"2012","address":{"@type":"PostalAddress","addressRegion":"NC","addressCountry":"US"},"areaServed":{"@type":"AdministrativeArea","name":"Alamance County, North Carolina"}}
+</script>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cpath d='M32 6 52 24 32 58 12 24z' fill='%23b8924a'/%3E%3C/svg%3E">
 <style>
 :root{
@@ -154,7 +157,7 @@ dialog p{color:var(--muted);margin:.6rem 0 1.4rem}
 
 <header>
   <div class="wrap nav">
-    <a class="brand" href="#top" aria-label="Jason — The Art of Jewelry, home"><svg width="22" height="22" viewBox="0 0 64 64" aria-hidden="true"><path d="M32 6 52 24 32 58 12 24z" fill="var(--gold)"/></svg><b>Jason</b> <span>The Art of Jewelry</span></a>
+    <a class="brand" href="#top" aria-label="Jason's The Art of Jewelry, home"><svg width="22" height="22" viewBox="0 0 64 64" aria-hidden="true"><path d="M32 6 52 24 32 58 12 24z" fill="var(--gold)"/></svg><b>Jason's</b> <span>The Art of Jewelry</span></a>
     <button class="burger" aria-expanded="false" aria-controls="menu" aria-label="Menu">☰</button>
     <nav aria-label="Primary">
       <ul id="menu">
@@ -174,9 +177,9 @@ dialog p{color:var(--muted);margin:.6rem 0 1.4rem}
 <section class="hero">
   <div class="wrap">
     <div>
-      <span class="eyebrow" data-c="location">North Carolina</span>
+      <span class="eyebrow"><span data-c="location"></span> · Since <span data-c="founded"></span></span>
       <h1>Jewelry made by hand, <em>made for you.</em></h1>
-      <p>Custom designs, engagement rings, heirloom restoration and expert repair — each piece shaped at the bench with care, from first sketch to final polish.</p>
+      <p>Custom designs, engagement rings, heirloom restoration and expert repair for Alamance County families since 2012 — each piece shaped at the bench with care, from first sketch to final polish.</p>
       <div class="btns">
         <a class="btn" href="#contact">Start a custom piece</a>
         <a class="btn ghost" href="#work">View the work</a>
@@ -243,13 +246,13 @@ dialog p{color:var(--muted);margin:.6rem 0 1.4rem}
   <div class="wrap two reveal">
     <div>
       <span class="eyebrow">About</span>
-      <h2>The maker</h2>
-      <p class="lede">Jason designs and builds jewelry in North Carolina, treating every commission as a one-of-a-kind work of art. Whether it is a simple repair or a complete custom creation, the same attention goes into every piece that leaves the studio.</p>
-      <p class="lede" style="margin-top:1rem">Working directly with the person who makes your jewelry means honest advice, fair pricing and a piece that is built to last generations.</p>
+      <h2>Our story</h2>
+      <p class="lede">Founded in 2012, Jason's The Art of Jewelry has been designing and building jewelry for the people of Alamance County, North Carolina — <span id="yrs"></span> years and counting. Every commission is treated every commission as a one-of-a-kind work of art. Whether it is a simple repair or a complete custom creation, the same attention goes into every piece that leaves the studio.</p>
+      <p class="lede" style="margin-top:1rem">Serving Burlington, Graham, Mebane, Elon, Haw River, Gibsonville and neighbors across the county. Working directly with the person who makes your jewelry means honest advice, fair pricing and a piece that is built to last generations.</p>
     </div>
     <div class="grid" style="margin-top:0">
-      <blockquote>“He listened, sketched exactly what I had in my head, and the ring was even better in person.”<cite>— Client name, City, NC</cite></blockquote>
-      <blockquote>“My grandmother's brooch is now a pendant I wear every week. I cannot thank him enough.”<cite>— Client name, City, NC</cite></blockquote>
+      <blockquote>“He listened, sketched exactly what I had in my head, and the ring was even better in person.”<cite>— Client name, Alamance County, NC</cite></blockquote>
+      <blockquote>“My grandmother's brooch is now a pendant I wear every week. I cannot thank him enough.”<cite>— Client name, Alamance County, NC</cite></blockquote>
     </div>
   </div>
 </section>
@@ -303,7 +306,7 @@ dialog p{color:var(--muted);margin:.6rem 0 1.4rem}
 
 <footer>
   <div class="wrap">
-    <span>© <span id="yr"></span> Jason — The Art of Jewelry. North Carolina.</span>
+    <span>© <span id="yr"></span> Jason's The Art of Jewelry. Alamance County, North Carolina · Est. 2012</span>
     <span><a href="#top">Back to top ↑</a></span>
   </div>
 </footer>
@@ -322,8 +325,9 @@ dialog p{color:var(--muted);margin:.6rem 0 1.4rem}
 <script>
 /* ============ EDIT ME: business details ============ */
 const CONFIG = {
-  location: "North Carolina",
-  address:  "123 Main Street, City, NC 28000",
+  location: "Alamance County, NC",
+  founded:  2012,
+  address:  "123 Main Street, Burlington, NC 27215",
   phone:    "(555) 555-0123",
   email:    "hello@example.com",
   hours:    "Tue–Fri 10–5 · Sat 10–3 · Sun–Mon by appointment",
@@ -357,6 +361,7 @@ document.querySelectorAll('[data-c]').forEach(el => {
   else el.textContent = CONFIG[k];
 });
 $('#yr').textContent = new Date().getFullYear();
+$('#yrs').textContent = new Date().getFullYear() - CONFIG.founded;
 
 // mobile menu
 const burger = $('.burger'), menu = $('#menu');
