@@ -134,6 +134,8 @@ IPXE_CC="${IPXE_CC:-}"
 FALLBACK_SERVER="${FALLBACK_SERVER:-}"
 TRUST_CA="${TRUST_CA:-}"
 ALLOW_UNPINNED="${ALLOW_UNPINNED:-0}"
+ISO_FILE="${ISO_FILE:-}"                       # a file you already have (--iso PATH); it is verified before use
+EXTRA_ISO_DIRS="${EXTRA_ISO_DIRS:-}"          # more folders to search for an earlier download, colon separated
 KEY_MIN_SOURCES="${KEY_MIN_SOURCES:-2}"       # independent places that must agree on the vendor key
 ALLOW_UNVERIFIED="${ALLOW_UNVERIFIED:-0}"
 ACCEPT_SCRIPT_CHANGE="${ACCEPT_SCRIPT_CHANGE:-0}"
@@ -1157,7 +1159,7 @@ ct_get() {
 
 # Prints "spki until issuer" lines for all current, unrevoked certs covering HOST
 ct_current() {
-  local host=$1 tmp=$2 dom after page n last f
+  local host=$1 tmp=$2 dom after page pinfo n last f
   local -a files=() doms=("$host")
   local parent=${host#*.}
   [[ $parent == *.* ]] && doms+=("$parent")
@@ -1166,8 +1168,8 @@ ct_current() {
     while (( page < 40 )); do
       f="$tmp/ct.$dom.$page.json"
       ct_get "$CT_API?domain=$dom&expand=dns_names&expand=issuer&expand=revocation${after:+&after=$after}" "$f" || return 1
-      page=$("$PYTHON" "$LIB/ct_parse.py" page "$f") || return 1
-      read -r n last <<<"$page"
+      pinfo=$("$PYTHON" "$LIB/ct_parse.py" page "$f") || return 1
+      read -r n last <<<"$pinfo"
       if (( n == 0 )); then rm -f "$f"; break; fi
       files+=("$f")
       after=$last
@@ -2221,6 +2223,60 @@ import_ipxe() {
 # =============================================================================
 # Fetch and verify the ISO
 # =============================================================================
+# =============================================================================
+# Reuse an earlier download instead of fetching it again
+# =============================================================================
+# Prints candidate files (complete images first), best first.
+iso_candidates() {
+  local d dirs=()
+  [[ -n $ISO_FILE ]] && printf '%s\n' "$ISO_FILE"
+  dirs=("$ROOT" "$DL" "$HOME" "$HOME/Download" "$HOME/Downloads" "$HOME/storage/downloads"
+        "$HOME/storage/shared/Download" /sdcard/Download /storage/emulated/0/Download
+        /data/data/com.termux/files/home/netboot /root/netboot "$PWD")
+  local IFS=:; for d in $EXTRA_ISO_DIRS; do [[ -n $d ]] && dirs+=("$d"); done; unset IFS
+  for d in "${dirs[@]}"; do
+    [[ -d $d ]] || continue
+    find "$d" -maxdepth 2 -type f \( -name "$ISO_NAME" -o -name "$ISO_NAME.part" \) 2>/dev/null || true
+  done
+}
+
+# Puts an earlier download where fetch expects it. It is still fully verified afterwards;
+# the original file is never modified or deleted.
+adopt_existing_iso() {   # adopt_existing_iso REMOTE_BYTES
+  local remote=${1:-0} cand size min norm
+  [[ -s $ISO ]] && return 0
+  min=$(( P_ISO_MB * 900000 ))         # about 90% of the expected size, when the server will not tell us
+  norm=$(readlink -f "$ISO" 2>/dev/null || echo "$ISO")
+  while IFS= read -r cand; do
+    [[ -n $cand && -f $cand ]] || continue
+    [[ $(readlink -f "$cand" 2>/dev/null || echo "$cand") == "$norm" || $cand == "$ISO.part" ]] && continue
+    size=$(file_size "$cand")
+    if [[ $cand == *.part ]]; then
+      (( size > 1048576 )) || continue
+      [[ -s $ISO.part ]] && continue
+      if (( remote > 0 && size >= remote )); then continue; fi
+      info "Found an unfinished download: $cand ($((size/1048576)) MB). Resuming from it."
+      cp -f "$cand" "$ISO.part" || { rm -f "$ISO.part"; continue; }
+      return 0
+    fi
+    if (( remote > 0 )); then
+      (( size == remote )) || { info "Ignoring $cand: its size ($size) is not the expected $remote."; continue; }
+    else
+      (( size >= min )) || { info "Ignoring $cand: too small to be the full image."; continue; }
+    fi
+    info "Found an earlier download: $cand. Checking it instead of downloading again."
+    if ln "$cand" "$ISO" 2>/dev/null; then :
+    elif (( $(free_mb "$ROOT") > size / 1048576 + 256 )) && cp -f "$cand" "$ISO"; then :
+    elif ln -sf "$(readlink -f "$cand")" "$ISO" 2>/dev/null; then
+      warn "Not enough space for a second copy, so $ISO points at $cand. Keep that file in place."
+    else
+      continue
+    fi
+    return 0
+  done <<<"$(iso_candidates)"
+  return 1
+}
+
 iso_is_verified() {
   [[ -s $ISO && -s $ISO_VERIFIED ]] || return 1
   local size mtime
@@ -2303,11 +2359,17 @@ fetch() {
     die "No checksum or signature source for $DISTRO. Set SUMS_URL or ISO_SIG_URL, or ALLOW_UNVERIFIED=1."
   fi
 
-  local target code rc attempt=0 resumed=0 remote have need_mb avail_mb vrc=0
+  local target code rc attempt=0 resumed=0 remote=0 have need_mb avail_mb vrc=0
+  if [[ -n $ISO_FILE && ! -f $ISO_FILE ]]; then die "$E_USAGE" "--iso: no such file: $ISO_FILE"; fi
   # Cheap checks first: if the vendor key cannot be confirmed, say so now, not after 6 GB.
   if [[ -n $SUMS_URL || -n $ISO_SIG_URL ]]; then
     info "Checking the vendor signing key before the big download"
     prepare_keyring
+  fi
+  if [[ ! -s $ISO ]]; then
+    remote=$(curl -sIL --proto-redir '=https' --connect-timeout 20 "$ISO_URL" 2>/dev/null \
+             | awk 'tolower($1)=="content-length:" {gsub("\r","",$2); n=$2} END{print n+0}' || echo 0)
+    adopt_existing_iso "$remote" || true
   fi
   if [[ -s $ISO ]]; then
     target=$ISO
@@ -2315,8 +2377,6 @@ fetch() {
   else
     target="$ISO.part"
     [[ -s $ISO.part ]] && resumed=1
-    remote=$(curl -sIL --proto-redir '=https' --connect-timeout 20 "$ISO_URL" 2>/dev/null \
-             | awk 'tolower($1)=="content-length:" {gsub("\r","",$2); n=$2} END{print n+0}' || echo 0)
     have=$(file_size "$ISO.part" 2>/dev/null || echo 0)
     if (( remote > 0 )); then
       need_mb=$(( (remote - have) / 1048576 + 1 )); avail_mb=$(free_mb "$DL")
@@ -4491,6 +4551,8 @@ parse_args() {
       -h|--help)  usage; exit 0 ;;
       --dry-run)  DRY_RUN=1 ;;
       -y|--yes)   ASSUME_YES=1 ;;
+      --iso)      [[ $# -ge 2 ]] || die "--iso requires a path"; ISO_FILE="$2"; shift ;;
+      --iso=*)    ISO_FILE="${1#*=}" ;;
       --distro)   [[ $# -ge 2 ]] || die "--distro requires a value"; DISTRO="$2"; CLI_SET+=" DISTRO"; shift ;;
       --distro=*) DISTRO="${1#*=}"; CLI_SET+=" DISTRO" ;;
       --arch)     [[ $# -ge 2 ]] || die "--arch requires a value"; TARGET_ARCH="$2"; CLI_SET+=" TARGET_ARCH"; shift ;;

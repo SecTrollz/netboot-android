@@ -892,7 +892,7 @@ mk_fetch_env() {   # the script's own (resumable) file server stands in for the 
   src; mkroot; write_libs
   # never let a test download a real image
   [[ $ISO_URL == http://127.0.0.1:* && $U_ISO_URL == "$ISO_URL" ]] || { echo "refusing: ISO_URL override did not take effect"; exit 1; }
-  WEBDIR="$T/mirror"; mkdir -p "$WEBDIR"
+  WEBDIR="$T/srv/a/b/mirror"; mkdir -p "$WEBDIR"     # deeper than the finder looks
   head -c 3000000 /dev/urandom > "$WEBDIR/x.iso"
   HTTPD_LOG="$T/web.log" python3 "$LIB/httpd.py" 127.0.0.1 "$PORT" "$WEBDIR" >/dev/null 2>&1 & WEBPID=$!
   sleep 1
@@ -1005,6 +1005,94 @@ test_a_mirror_that_cannot_resume_restarts_cleanly() {
   assert "completes" test $rc -eq 0
   assert "clean copy, not the corrupt prefix" test "$(sha256sum < "$ISO" | cut -d' ' -f1)" = "$(sha256sum < "$WEBDIR/x.iso" | cut -d' ' -f1)"
   assert "said why it started over" grep -q 'does not support resuming' "$T/f.out"
+}
+
+# ---- reuse an earlier download instead of downloading again ----
+mk_old_download() {   # mk_old_download NAME  (a complete copy of the mirror's image in a Downloads folder)
+  mkdir -p "$T/Downloads"
+  export EXTRA_ISO_DIRS="$T/Downloads"
+}
+
+test_an_earlier_download_is_found_and_not_fetched_again() {
+  mk_old_download; mk_fetch_env; fake_verify 0
+  cp "$WEBDIR/x.iso" "$T/Downloads/x.iso"
+  ( fetch ) >"$T/f.out" 2>&1; rc=$?
+  kill $WEBPID 2>/dev/null
+  assert "succeeds" test $rc -eq 0
+  assert "found it" grep -q 'Found an earlier download' "$T/f.out"
+  assert "no GET of the image at all" test "$(gets)" = 0
+  assert "verified" iso_is_verified
+  assert "the original is untouched" test -s "$T/Downloads/x.iso"
+}
+
+test_an_unfinished_download_elsewhere_is_resumed() {
+  mk_old_download; mk_fetch_env; fake_verify 0
+  head -c 1500000 "$WEBDIR/x.iso" > "$T/Downloads/x.iso.part"
+  ( fetch ) >"$T/f.out" 2>&1; rc=$?
+  kill $WEBPID 2>/dev/null
+  assert "succeeds" test $rc -eq 0
+  assert "says it resumed" grep -q 'Found an unfinished download' "$T/f.out"
+  assert "got the complete, correct file" test "$(sha256sum < "$ISO" | cut -d' ' -f1)" = "$(sha256sum < "$WEBDIR/x.iso" | cut -d' ' -f1)"
+  assert "only the rest was fetched (partial-content reply)" grep -q ' 206 ' "$T/web.log"
+}
+
+test_a_wrong_size_file_is_ignored_not_trusted() {
+  mk_old_download; mk_fetch_env; fake_verify 0
+  head -c 1000000 "$WEBDIR/x.iso" > "$T/Downloads/x.iso"
+  ( fetch ) >"$T/f.out" 2>&1; rc=$?
+  kill $WEBPID 2>/dev/null
+  assert "still succeeds" test $rc -eq 0
+  assert "ignored the short file" grep -q 'Ignoring' "$T/f.out"
+  assert "downloaded the real image" test "$(file_size "$ISO")" = "$(file_size "$WEBDIR/x.iso")"
+}
+
+test_your_file_is_never_deleted_even_if_it_fails_verification() {
+  mk_old_download; mk_fetch_env; fake_verify 30
+  cp "$WEBDIR/x.iso" "$T/Downloads/x.iso"
+  ( fetch ) >"$T/f.out" 2>&1; rc=$?
+  kill $WEBPID 2>/dev/null
+  assert "refused (30)" test $rc -eq 30
+  assert "the original file is still there" test -s "$T/Downloads/x.iso"
+}
+
+test_iso_option_uses_the_file_you_name() {
+  mkdir -p "$T/mine"; export ISO_FILE="$T/mine/whatever-name.iso"
+  mk_fetch_env; fake_verify 0
+  cp "$WEBDIR/x.iso" "$ISO_FILE"
+  ( fetch ) >"$T/f.out" 2>&1; rc=$?
+  kill $WEBPID 2>/dev/null
+  assert "succeeds" test $rc -eq 0
+  assert "no download" test "$(gets)" = 0
+  unset ISO_FILE
+}
+
+test_iso_option_with_a_missing_file_is_a_clear_error() {
+  export ISO_FILE="$T/nope.iso"
+  mk_fetch_env
+  ( fetch ) >"$T/f.out" 2>&1; rc=$?
+  kill $WEBPID 2>/dev/null
+  assert "usage error (2)" test $rc -eq 2
+  assert "names the file" grep -q 'nope.iso' "$T/f.out"
+}
+
+test_ct_paging_loop_counter_is_not_clobbered() {
+  # seen on a real phone: "arithmetic syntax error ... 2 17174131604" in ct_current
+  src; mkroot; write_libs
+  PYTHON=python3
+  : > "$T/ct.calls"
+  ct_get() {   # first page has results, the next page is empty
+    echo x >> "$T/ct.calls"
+    if [[ $(wc -l < "$T/ct.calls") -eq 1 ]]; then
+      echo '[{"id":"11","dns_names":["a.example"],"pubkey_sha256":"00","not_before":"2020-01-01T00:00:00Z","not_after":"2099-01-01T00:00:00Z"},{"id":"17174131604"}]' > "$2"
+    else
+      echo '[]' > "$2"
+    fi
+  }
+  sleep() { :; }
+  out=$(ct_current a.example "$T" 2>&1); rc=$?
+  assert "no arithmetic error" bash -c '! grep -q "arithmetic syntax" <<<"$1"' _ "$out"
+  assert "succeeds" test $rc -eq 0
+  assert "second page was requested" test "$(wc -l < "$T/ct.calls")" -ge 2
 }
 
 # ---------------------------------------------------------------- run

@@ -151,6 +151,12 @@ Anyone can double-check a pinned build from any computer with `gh attestation ve
 
 ---
 
+## It finds your earlier downloads
+
+Before downloading anything, `fetch` looks for an image you already have: in `~/netboot`, `~/netboot/downloads`, your home folder, `Download`/`Downloads`, `~/storage/downloads` (after `termux-setup-storage`), `/sdcard/Download`, and any folders in `EXTRA_ISO_DIRS` (colon separated). A complete file of the right size is re-used (hard link, or a copy if needed), an unfinished `NAME.part` is resumed from where it stopped, and anything of the wrong size is ignored. Whatever it finds is still fully verified against the vendor's signed checksum, and your original file is never changed or deleted. To point at a file yourself: `./netboot-android.sh --iso /path/to/file.iso fetch`.
+
+---
+
 ## A download is never thrown away over a key or network problem
 
 The vendor signing key is checked **before** the big download starts, so a problem shows up in seconds, not after 6 GB. Ubuntu's key is confirmed by two independent places (Ubuntu's keyserver and the `ubuntu-keyring` package from Ubuntu's own archive; `keys.openpgp.org` does not carry that key). If verification cannot finish for any reason other than the image really not matching its signed checksum, the finished download is **kept** and the next `fetch` only re-verifies it. Only a real checksum or signature mismatch discards the image (after one clean retry if it was a resumed download). A mirror that cannot resume makes the script start the file over instead of retrying forever. `KEY_MIN_SOURCES=1` accepts a key from one source (its fingerprint is built into the script), if you choose to.
@@ -186,7 +192,7 @@ What it does for you while it runs:
 
 Honest limits: the fast check trusts a file's size, time, and inode for a few minutes until the background check finishes, so someone with root who forges those could briefly serve a changed root image (the kernel and initrd are signed and always fully checked). The root image is unsigned on the client for most distros; see the header of the script. Android features (root, `oom_score_adj`, Wi-Fi power mode) can only be proven on a real phone.
 
-Tests: `tests/run.sh` runs 72 checks (fault injection and the easy-mode screens) (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
+Tests: `tests/run.sh` runs 79 checks (fault injection and the easy-mode screens) (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
 
 ---
 
