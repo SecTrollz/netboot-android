@@ -91,13 +91,63 @@ This is a file-level archive, not a Clonezilla or Shadow Copy block image. To im
 
 ---
 
-## Easiest way: let it hold your hand
+## Start here (the whole thing in three lines)
 
 ```sh
 ./netboot-android.sh
 ```
 
-Choose **1, GUIDED SETUP**. It goes one small step at a time, says in plain words what each step does, and asks before it does anything. Press Enter to accept the suggested answer, type `q` to stop safely at any question. Steps you already finished are noticed and offered as "do it again?" with the answer No. If a step fails, you get retry, skip, or quit instead of a crash. The guide also covers the optional Google One and Terabox cloud backups. Run just that part with `./netboot-android.sh backup-setup`, or the guide alone with `./netboot-android.sh guide`.
+1. Press **Enter**. The first time, it asks one plain question (rescue a PC, try Ubuntu, or something else) and then sets everything up, about 20 to 40 minutes, mostly downloading.
+2. Every time after that, the same command shows **READY**. Press **Enter** and boot your PC from the network. Press Ctrl+C when you are done.
+3. If something is wrong, it says so in plain words and offers to fix it. Press Enter to accept.
+
+When the server starts, a box tells you what to press on the PC (boot-menu keys for Dell, HP, Lenovo, Asus, Acer, and Surface, and what to turn on in firmware).
+
+**One tap on Android.** Run `./netboot-android.sh shortcut`, then add the free Termux:Widget app to your home screen. A **Boot-a-PC** button starts serving with your saved settings. It never starts by itself.
+
+`--yes` accepts the suggested answers for scripts. It will never trust a script that has changed since you signed it; only you can say yes to that.
+
+---
+
+## The guided setup, in detail
+
+```sh
+./netboot-android.sh
+```
+
+Run `./netboot-android.sh guide` (or choose **1, GUIDED SETUP** in `./netboot-android.sh menu`). It goes one small step at a time, says in plain words what each step does, and asks before it does anything. Press Enter to accept the suggested answer, type `q` to stop safely at any question. Steps you already finished are noticed and offered as "do it again?" with the answer No. If a step fails, you get retry, skip, or quit instead of a crash. The guide also covers the optional Google One and Terabox cloud backups. Run just that part with `./netboot-android.sh backup-setup`, or the guide alone with `./netboot-android.sh guide`.
+
+---
+
+## Running inside a "Linux on your phone" (proot)? Read this
+
+If your prompt shows a Linux such as Ubuntu or Debian started with `proot-distro`, that environment **cannot serve a PC**: it cannot see the phone's Wi-Fi and cannot open the DHCP/TFTP ports. Serve from **Termux itself** (rooted). The script detects this and says so.
+
+A proot Linux is, however, a good place to **build the loader**, because `apt` can install an x86_64 cross-compiler there. Run `./netboot-android.sh proot-build` inside it and follow the on-screen steps: copy only your **public** `ca.crt` from Termux into the proot, build, then copy `ipxe.efi` and `undionly.kpxe` back and run `import-ipxe`. Do not use keys created inside the proot: the loader must contain the certificate of the install that serves.
+
+---
+
+## Phone and PC have different CPUs? One safe GitHub build, then pinned
+
+A phone is arm64 and most PCs are x86_64. The network loader (iPXE) must be compiled for the PC's CPU, and it decides what your PC will boot. The guide's default for a phone is a **one-time build on GitHub that the script then pins forever**:
+
+```sh
+./netboot-android.sh ipxe-cloud
+```
+
+1. It prints a page address and copies your **public** certificate. On that page tap **Run workflow**, paste, pick the PC's CPU, run (about 5 minutes, free). GitHub only shows *Run workflow* for workflows on your default branch, so merge this branch to `main` first.
+2. Back in the terminal press Enter. The script downloads the build and checks, in this order:
+   - the checksums match;
+   - the build ran **exactly the workflow file you can read** in `.github/workflows/build-ipxe.yml` (its SHA-256 is baked into the script, and the script also fetches that file at the tagged commit and hashes it itself);
+   - the loader contains **your** certificate;
+   - **GitHub's signed build provenance** verifies, when the GitHub CLI is set up (`pkg install gh && gh auth login`). Without it the check is skipped and the default answer to the approval question becomes **No**.
+3. You approve once. From then on the script **pins those exact bytes** (a signed record in `~/netboot/state`). Every later run, `heal`, restore, or new distro reuses that same file, restores it automatically if it goes missing, and refuses any different file. `ipxe-fetch new` is the only way to replace it, and it asks.
+
+The workflow itself is hardened: actions are pinned to commit hashes (never movable tags), the iPXE source is pinned by hash, the release is tied to the building commit, inputs never reach a shell, and a pasted private key is rejected.
+
+**What this does not remove:** for that one run you still trust GitHub's build servers, and the first approval is trust-on-first-use of that file. A loader built on a computer you control has no such gap (`ipxe-phone` builds it on the phone itself with a Debian cross-compiler; or build on an x86_64 Linux computer and `import-ipxe DIR`). If you never want the GitHub route, delete the workflow file. `status` shows whether the pinned loader's provenance was verified.
+
+Anyone can double-check a pinned build from any computer with `gh attestation verify ipxe.efi --repo OWNER/REPO`.
 
 ---
 
@@ -130,7 +180,7 @@ What it does for you while it runs:
 
 Honest limits: the fast check trusts a file's size, time, and inode for a few minutes until the background check finishes, so someone with root who forges those could briefly serve a changed root image (the kernel and initrd are signed and always fully checked). The root image is unsigned on the client for most distros; see the header of the script. Android features (root, `oom_score_adj`, Wi-Fi power mode) can only be proven on a real phone.
 
-Tests: `tests/run.sh` runs 21 fault-injection checks (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
+Tests: `tests/run.sh` runs 63 checks (fault injection and the easy-mode screens) (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
 
 ---
 

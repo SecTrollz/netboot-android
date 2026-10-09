@@ -1,0 +1,94 @@
+name: build-ipxe
+
+# One-time build of the iPXE network loader with YOUR boot CA certificate inside,
+# so an arm64 phone can get an x86_64 loader. Run it from the phone:
+#   ./netboot-android.sh ipxe-cloud
+#
+# Safety design (read this file before you run it; it is short):
+#   * Every action is pinned to an exact commit hash, not a movable tag.
+#   * The iPXE source is pinned by hash inside netboot-android.sh.
+#   * The run records the SHA-256 of THIS file in the release notes, and the phone
+#     script refuses a release unless that equals the hash baked into the script and
+#     the same file fetched from the tagged commit.
+#   * The run signs a build-provenance attestation for each binary (GitHub-signed,
+#     publicly verifiable with:  gh attestation verify FILE --repo OWNER/REPO).
+#   * The CA *certificate* is public. The private key never leaves your device.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ca_pem_b64:
+        description: "Your boot CA certificate, base64 on one line (printed by: ./netboot-android.sh ipxe-request)"
+        required: true
+        type: string
+      arch:
+        description: "CPU of the PC that will boot"
+        required: true
+        default: x86_64
+        type: choice
+        options:
+          - x86_64
+          - arm64
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CA_B64: ${{ inputs.ca_pem_b64 }}
+      TARGET: ${{ inputs.arch }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git make perl gcc liblzma-dev libarchive-tools gnupg openssl python3 curl
+          if [ "$TARGET" = arm64 ]; then sudo apt-get install -y gcc-aarch64-linux-gnu; fi
+
+      - name: Check the certificate you pasted
+        run: |
+          pem=$(printf '%s' "$CA_B64" | tr -d ' \n\r' | base64 -d)
+          # a private key pasted by mistake must never be accepted or kept
+          if printf '%s' "$pem" | grep -q 'PRIVATE KEY'; then
+            echo "::error::You pasted a PRIVATE KEY. Stop: that must stay on your device. Rotate the CA."; exit 1
+          fi
+          printf '%s\n' "$pem" > "$RUNNER_TEMP/ca.crt"
+          openssl x509 -in "$RUNNER_TEMP/ca.crt" -noout -subject -enddate
+          openssl x509 -in "$RUNNER_TEMP/ca.crt" -noout -text | grep -q 'CA:TRUE' \
+            || { echo "::error::That certificate is not a CA certificate"; exit 1; }
+
+      - name: Build iPXE with that CA inside
+        run: |
+          export NETBOOT_HOME="$RUNNER_TEMP/nb" TRUST_CA="$RUNNER_TEMP/ca.crt" ALLOW_UNPINNED=1
+          # the iPXE commit is pinned by hash in the script; that pins the content
+          if [ "$TARGET" = arm64 ]; then export IPXE_CROSS=aarch64-linux-gnu-; fi
+          ./netboot-android.sh --arch "$TARGET" build-ipxe
+          mkdir -p "$RUNNER_TEMP/out"
+          cp "$NETBOOT_HOME"/tftp/*.efi "$NETBOOT_HOME"/tftp/*.kpxe "$RUNNER_TEMP/out/" 2>/dev/null || true
+          cp "$NETBOOT_HOME"/state/ipxe-*.built-from "$RUNNER_TEMP/out/build-record.txt"
+          ( cd "$RUNNER_TEMP/out" && sha256sum *.efi *.kpxe 2>/dev/null > SHA256SUMS; cat SHA256SUMS )
+
+      - name: Sign build provenance for the binaries
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            ${{ runner.temp }}/out/*.efi
+            ${{ runner.temp }}/out/*.kpxe
+
+      - name: Publish as a release the phone can download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          fp=$(openssl x509 -in "$RUNNER_TEMP/ca.crt" -noout -fingerprint -sha256 | cut -d= -f2)
+          wf=$(sha256sum .github/workflows/build-ipxe.yml | cut -d' ' -f1)
+          tag="ipxe-$TARGET-${{ github.run_id }}"
+          notes=$(printf 'workflow-sha256: %s\ncommit: %s\nrun: %s/%s/actions/runs/%s\nca: %s\n' \
+            "$wf" "$GITHUB_SHA" "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}" "$fp")
+          gh release create "$tag" "$RUNNER_TEMP"/out/* --target "$GITHUB_SHA" \
+            --title "iPXE loader ($TARGET) for CA $fp" --notes "$notes"

@@ -44,13 +44,15 @@
 set -euo pipefail
 umask 022
 
-SCRIPT_VERSION="2026.10.09-resilient"
+SCRIPT_VERSION="2026.10.09-easy"
 RELEASE_TIME=""   # upload time (UTC epoch) set by release-stamp; must equal the upstream commit time
 
 # =============================================================================
 # Platform detection
 # =============================================================================
 IS_TERMUX=0; [[ ${PREFIX:-} == *com.termux* ]] && IS_TERMUX=1
+IS_PROOT=0
+if [[ -n ${PROOT_TMP_DIR:-}${PROOT_L2S_DIR:-} ]] || grep -q '^TracerPid:[[:space:]]*[1-9]' /proc/self/status 2>/dev/null; then IS_PROOT=1; fi
 IS_ANDROID=0; [[ -e /system/build.prop || -n ${ANDROID_ROOT:-} ]] && IS_ANDROID=1
 HOST_ARCH=$(uname -m)
 SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
@@ -66,6 +68,18 @@ find_bin() {
 
 DNSMASQ="${DNSMASQ:-$(find_bin dnsmasq || true)}"
 PYTHON="${PYTHON:-$(find_bin python3 || find_bin python || true)}"
+
+# Is an x86_64 cross-compiler installed on this (arm64) system? Kept as a function so tests can stub it.
+have_cross_gcc() { command -v x86_64-linux-gnu-gcc >/dev/null 2>&1; }
+
+# Programs the whole flow needs. Prints the missing ones, space separated.
+missing_tools() {
+  local t m=""
+  for t in curl gpg openssl bsdtar; do command -v "$t" >/dev/null 2>&1 || m+="$t "; done
+  [[ -n ${DNSMASQ:-} && -x ${DNSMASQ:-} ]] || m+="dnsmasq "
+  [[ -n ${PYTHON:-} ]] || m+="python3 "
+  printf '%s' "${m% }"
+}
 
 # =============================================================================
 # Paths
@@ -125,6 +139,15 @@ ACCEPT_SCRIPT_CHANGE="${ACCEPT_SCRIPT_CHANGE:-0}"
 CT_BOOTSTRAP="${CT_BOOTSTRAP:-0}"
 UPSTREAM_REPO="${UPSTREAM_REPO:-$DEFAULT_UPSTREAM_REPO}"
 UPSTREAM_BRANCH="${UPSTREAM_BRANCH:-main}"
+XBOX_NAME="${XBOX_NAME:-debian}"          # proot-distro container used to cross-compile on a phone
+GITHUB_API_BASE="${GITHUB_API_BASE:-https://api.github.com}"
+GITHUB_RAW_BASE="${GITHUB_RAW_BASE:-https://raw.githubusercontent.com}"
+# SHA-256 of .github/workflows/build-ipxe.yml as reviewed. A cloud build is accepted only if it
+# ran exactly this file. Change the workflow => update this value (tests enforce it).
+WORKFLOW_SHA256="8e3f75dcea2216b7d189e35255588bf6d1245d3d044b49384b352d9430df155b"
+IPXE_CLOUD_OK="${IPXE_CLOUD_OK:-0}"            # 1 lets --yes run the one-time cloud approval unattended
+IPXE_ALLOW_UNATTESTED="${IPXE_ALLOW_UNATTESTED:-0}"
+IPXE_CURL_OPTS="${IPXE_CURL_OPTS---proto =https --tlsv1.2}"   # tests may set this empty to talk to a local server
 EXPECT_CODE="${EXPECT_CODE:-}"
 # Settings saved by the guided offsite-backup setup. Read as plain NAME='value' lines
 # (never executed); a variable already set in the environment wins.
@@ -169,6 +192,7 @@ U_MIN_FREE_MB="${MIN_FREE_MB:-}"
 
 # Runtime state
 SERVE_HTTP_PID=""
+TAIL_PID=""
 DNS_LOG=""
 DIRECT_ADDED=0
 JID_DIRECT=""
@@ -176,6 +200,7 @@ JID_POWER=""
 POWER_TWEAKED=0
 COMMAND=""
 DRY_RUN=0
+ASSUME_YES=0
 POSITIONAL=()
 SIG_SIGNER=""
 GIT_PIN_OPTS=()
@@ -243,17 +268,20 @@ trap 'on_err $? $LINENO "$BASH_COMMAND"' ERR
 
 # ---- lock: one mutating command at a time; stale locks (dead owner) clear themselves
 LOCK_DIR="$STATE/lock.d"
-LOCK_HELD=""
 proc_start() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'; }
 lock_owner_alive() {
   local pid st
   read -r pid st < "$LOCK_DIR/owner" 2>/dev/null || return 1
   [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null && [[ $(proc_start "$pid") == "$st" ]]
 }
+# Ownership is the whole process tree ($$ is the same in every subshell). Only the shell
+# that took the lock (LOCK_AT) removes it, so a subshell finishing never frees its parent's lock.
+LOCK_TREE=""
+LOCK_AT=""
 acquire_lock() {
-  [[ $LOCK_HELD == "$BASHPID" ]] && return 0
+  [[ $LOCK_TREE == "$$" ]] && return 0
   mkdir -p "$STATE"
-  local tries=0 age
+  local tries=0 age me=$BASHPID
   while ! mkdir "$LOCK_DIR" 2>/dev/null; do
     if [[ -f $LOCK_DIR/owner ]]; then
       if ! lock_owner_alive; then warn "Clearing a stale lock left by a run that died."; rm -rf "$LOCK_DIR"; continue; fi
@@ -266,15 +294,21 @@ acquire_lock() {
     fi
     sleep 1
   done
-  printf '%s %s\n' "$BASHPID" "$(proc_start "$BASHPID")" > "$LOCK_DIR/owner"
-  LOCK_HELD=$BASHPID
+  printf '%s %s\n' "$$" "$(proc_start "$$")" > "$LOCK_DIR/owner"
+  LOCK_TREE=$$; LOCK_AT=$me
   trap release_lock EXIT
 }
 release_lock() {
-  if [[ $LOCK_HELD == "${BASHPID:-x}" ]]; then rm -rf "$LOCK_DIR"; fi
-  LOCK_HELD=""
+  if [[ $LOCK_TREE == "$$" && $LOCK_AT == "$BASHPID" ]]; then rm -rf "$LOCK_DIR"; LOCK_TREE=""; LOCK_AT=""; fi
 }
-with_lock() { acquire_lock; local rc=0; "$@" || rc=$?; release_lock; return "$rc"; }
+with_lock() {
+  local mine=1 rc=0
+  [[ $LOCK_TREE == "$$" ]] && mine=0
+  acquire_lock
+  "$@" || rc=$?
+  (( mine )) && release_lock
+  return "$rc"
+}
 
 # ---- refuse to operate on dangerous locations (we rm -rf and chown -R under ROOT)
 guard_root() {
@@ -326,7 +360,7 @@ journal_replay() {   # newest first; entries that succeed are removed
   while IFS= read -r f; do
     cmd=$(cat "$f" 2>/dev/null) || continue
     if run_root "$cmd" >/dev/null 2>&1; then rm -f "$f"; n=$((n+1)); else warn "Could not undo: $cmd"; fi
-  done < <(ls -1r "$JOURNAL"/* 2>/dev/null || true)
+  done <<<"$(ls -1r "$JOURNAL"/* 2>/dev/null || true)"
   (( n == 0 )) || { ok "Undid $n leftover system change(s) from an earlier run"; log_event INFO "journal replayed $n"; }
   return 0
 }
@@ -361,6 +395,18 @@ sha256_of()  {
 sha512_of()  { sha512sum "$1" | awk '{print $1}'; }
 file_size()  { stat -c %s "$1" 2>/dev/null || wc -c <"$1" | tr -d ' '; }
 file_mtime() { stat -c %Y "$1" 2>/dev/null || echo 0; }
+# Free space in MB for a path. Android's built-in df has no -m, so use KB and fall back to stat -f.
+free_mb() {
+  local p=$1 kb a b
+  while [[ ! -e $p && $p != / ]]; do p=$(dirname "$p"); done
+  kb=$(df -Pk "$p" 2>/dev/null | awk 'NR==2{print $4}')
+  [[ $kb =~ ^[0-9]+$ ]] || kb=$(df -k "$p" 2>/dev/null | awk 'END{print $4}')
+  if ! [[ $kb =~ ^[0-9]+$ ]]; then
+    read -r a b <<<"$(stat -f -c '%a %S' "$p" 2>/dev/null || true)"
+    [[ ${a:-} =~ ^[0-9]+$ && ${b:-} =~ ^[0-9]+$ ]] && kb=$(( a * b / 1024 )) || kb=0
+  fi
+  echo $(( kb / 1024 ))
+}
 url_host()   { local u=${1#*://}; u=${u%%/*}; printf '%s' "${u%%:*}"; }
 norm_fpr()   { printf '%s' "$1" | tr -d ' ' | tr 'a-f' 'A-F'; }
 nproc_n()    { nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2; }
@@ -916,7 +962,7 @@ auto_iface() {
       *)                score=10 ;;
     esac
     if (( score > bestscore )); then best=$name; bestscore=$score; fi
-  done < <(ip_q -4 -o addr show | awk '{print $2, $4}')
+  done <<<"$(ip_q -4 -o addr show | awk '{print $2, $4}')"
 
   if [[ -z $best && $DHCP_MODE == direct ]]; then
     best=$(ip_q -o link show | awk -F': ' '{print $2}' | sed 's/@.*//' \
@@ -1115,7 +1161,8 @@ ct_current() {
     while (( page < 40 )); do
       f="$tmp/ct.$dom.$page.json"
       ct_get "$CT_API?domain=$dom&expand=dns_names&expand=issuer&expand=revocation${after:+&after=$after}" "$f" || return 1
-      read -r n last < <("$PYTHON" "$LIB/ct_parse.py" page "$f") || return 1
+      page=$("$PYTHON" "$LIB/ct_parse.py" page "$f") || return 1
+      read -r n last <<<"$page"
       if (( n == 0 )); then rm -f "$f"; break; fi
       files+=("$f")
       after=$last
@@ -1146,7 +1193,7 @@ pins_refresh() {
   mkdir -p "$PIN_DIR" "$STATE"
 
   local -a hosts=("$@")
-  if (( ${#hosts[@]} == 0 )); then mapfile -t hosts < <(pin_hosts_for_target); fi
+  if (( ${#hosts[@]} == 0 )); then mapfile -t hosts <<<"$(pin_hosts_for_target)"; fi
 
   local tmp h served fails=0 n
   tmp=$(mktemp -d)
@@ -1249,7 +1296,8 @@ sig_ok() {
   local st=$1 sigkey="" primary="" count=0 rest
   grep -q '^\[GNUPG:\] GOODSIG ' "$st" || return 1
   if grep -qE '^\[GNUPG:\] (BADSIG|EXPKEYSIG|REVKEYSIG|EXPSIG|ERRSIG) ' "$st"; then return 1; fi
-  read -r sigkey primary < <(awk '$2=="VALIDSIG"{print $3, $NF}' "$st" | head -n1) || return 1
+  validsig=$(awk '$2=="VALIDSIG"{print $3, $NF}' "$st" | head -n1) || return 1
+  read -r sigkey primary <<<"$validsig"
   [[ $primary == "$KEY_FPR" ]] || return 1
   while read -r _ rest; do
     if grep -qw "$sigkey" <<<"$rest"; then count=$((count+1)); fi
@@ -1410,6 +1458,16 @@ self_status() {   # prints: unset | bad | changed | ok   (never dies)
   if [[ $cur != "$rec" ]]; then echo changed; else echo ok; fi
 }
 
+self_check_soft() {   # for interactive entry points: a *changed* script can be re-signed on the spot
+  [[ $(self_status) != unset ]] || return 0   # first run: the guide sets this up, no scary warning
+  if [[ $(self_status) == changed ]] && { [[ -t 0 ]] || [[ $ASSUME_YES == 1 ]]; }; then
+    warn "This script was updated since you last signed it."
+    hint "If you just updated it yourself or pulled a new version, that is normal."
+    if ask_yn "Trust this version and re-sign it now?" n; then self_sign; return 0; fi
+  fi
+  self_check
+}
+
 self_check() {
   case "$(self_status)" in
     unset)
@@ -1455,11 +1513,16 @@ deps() {
   info "Installing packages"
   if (( IS_TERMUX )); then
     pkg update -y
-    pkg install -y dnsmasq python libarchive curl iproute2 procps openssl gnupg git \
+    pkg install -y dnsmasq python libarchive bsdtar curl iproute2 procps openssl openssl-tool gnupg git \
                    clang make perl binutils liblzma xz-utils coreutils
     termux-wake-lock 2>/dev/null || warn "termux-wake-lock unavailable (install Termux:API to keep the CPU awake)"
   elif command -v apt-get >/dev/null 2>&1; then
     run_root "apt-get update && apt-get install -y dnsmasq python3 libarchive-tools curl iproute2 openssl gnupg git build-essential perl liblzma-dev"
+    if [[ $(uname -m) == aarch64 && $TARGET_ARCH == x86_64 ]]; then
+      info "This is an arm64 system and the PC is x86_64: adding the x86_64 cross-compiler"
+      run_root "apt-get install -y gcc-x86-64-linux-gnu binutils-x86-64-linux-gnu" \
+        || warn "Could not install the x86_64 cross-compiler here. Try: apt-get install gcc-x86-64-linux-gnu binutils-x86-64-linux-gnu"
+    fi
   elif command -v dnf >/dev/null 2>&1; then
     run_root "dnf install -y dnsmasq python3 bsdtar curl iproute openssl gnupg2 git gcc make perl xz-devel"
   elif command -v pacman >/dev/null 2>&1; then
@@ -1469,9 +1532,17 @@ deps() {
   else
     die "Unknown package manager. Install manually: dnsmasq python3 bsdtar curl iproute2 openssl gnupg git gcc make perl liblzma headers"
   fi
+  hash -r 2>/dev/null || true
   DNSMASQ=$(find_bin dnsmasq || true)
   PYTHON=$(find_bin python3 || find_bin python || true)
-  ok "Packages installed"
+  local still; still=$(missing_tools)
+  if [[ -n $still ]]; then
+    if (( IS_TERMUX )); then
+      die "$E_ENV" "The install finished but these programs are still missing: $still. On Termux try: pkg install openssl-tool bsdtar dnsmasq gnupg curl python"
+    fi
+    die "$E_ENV" "The install finished but these programs are still missing: $still. Install them with your package manager and run again."
+  fi
+  ok "Packages installed and every required program is present"
 }
 
 # =============================================================================
@@ -1525,7 +1596,8 @@ release_stamp() {
   grep -q "^RELEASE_TIME=\"$epoch\"" "$SELF" || die "Could not write RELEASE_TIME into $SELF"
   RELEASE_TIME=$epoch
 
-  read -r _ code < <(release_code "$SELF" "$epoch") || die "Could not compute the release code"
+  rc_out=$(release_code "$SELF" "$epoch") || die "Could not compute the release code"
+  read -r _ code <<<"$rc_out"
   ok "RELEASE_TIME set to $epoch ($(epoch_to_iso "$epoch"))"
   [[ -n $(attest_fpr) ]] && self_sign
 
@@ -1566,8 +1638,9 @@ verify_upstream() {
     || die "Fetch of branch $UPSTREAM_BRANCH failed"
 
   local commit ctime up
-  read -r commit ctime < <(git -C "$repo" log -1 --format='%H %ct' "upstream/$UPSTREAM_BRANCH" -- "$UPSTREAM_PATH") \
+  gl_out=$(git -C "$repo" log -1 --format='%H %ct' "upstream/$UPSTREAM_BRANCH" -- "$UPSTREAM_PATH") \
     || die "No commit touching $UPSTREAM_PATH on $UPSTREAM_BRANCH"
+  read -r commit ctime <<<"$gl_out"
   up=$(mktemp)
   git -C "$repo" show "$commit:$UPSTREAM_PATH" > "$up" || { rm -f "$up"; die "Cannot read $UPSTREAM_PATH at $commit"; }
   info "Upstream: $UPSTREAM_BRANCH @ $commit, committed $(epoch_to_iso "$ctime")"
@@ -1579,8 +1652,10 @@ verify_upstream() {
   fi
 
   local lhex lcode uhex ucode
-  read -r lhex lcode < <(release_code "$SELF" "$RELEASE_TIME") || die "Could not hash $SELF"
-  read -r uhex ucode < <(release_code "$up" "$ctime") || die "Could not hash the upstream copy"
+  rc_l=$(release_code "$SELF" "$RELEASE_TIME") || die "Could not hash $SELF"
+  read -r lhex lcode <<<"$rc_l"
+  rc_u=$(release_code "$up" "$ctime") || die "Could not hash the upstream copy"
+  read -r uhex ucode <<<"$rc_u"
 
   local bad=0
   [[ $lhex == "$uhex" ]] || bad=1
@@ -1593,15 +1668,17 @@ verify_upstream() {
     err "This script is NOT the copy uploaded at $(epoch_to_iso "$ctime")"
     err "  local code    $lcode"
     err "  upstream code $ucode"
+    local tb_up tb_self
+    tb_up=$(mktemp); tb_self=$(mktemp)
     if [[ $lhex == "$uhex" ]]; then
       err "The local file matches upstream, but upstream is not the release you recorded."
-    elif ! diff <(trust_block "$up") <(trust_block "$SELF") >/dev/null; then
+    elif ! { trust_block "$up" > "$tb_up"; trust_block "$SELF" > "$tb_self"; diff "$tb_up" "$tb_self" >/dev/null; }; then
       err "Hard-coded trust data differs (upstream '<', local '>'):"
-      diff <(trust_block "$up") <(trust_block "$SELF") >&2 || true
+      diff "$tb_up" "$tb_self" >&2 || true
     else
       err "Trust data is identical; other lines differ."
     fi
-    rm -f "$up"
+    rm -f "$up" "$tb_up" "$tb_self"
     audit "UPSTREAM MISMATCH commit=$commit local=$lcode upstream=$ucode"
     die "Upstream verification FAILED"
   fi
@@ -1659,9 +1736,50 @@ check_ca_embedded() {
   write_libs
   if "$PYTHON" "$LIB/findbytes.py" "$bin" "$fp"; then
     ok "Trust anchor found inside $(basename "$bin")"
+  elif [[ ${3:-} == strict ]]; then
+    err "$(basename "$bin") does not contain your certificate."
+    return 1
   else
     warn "Could not confirm the trust anchor inside $(basename "$bin"). If it is missing, every boot will fail closed at imgverify."
   fi
+}
+
+# =============================================================================
+# On-phone cross-compiler: a small Debian environment (proot-distro) holds an
+# x86_64 compiler that runs on the phone's arm64 CPU. Everything stays on this
+# device. The guest can only see the iPXE source folder, never your keys.
+# =============================================================================
+xbox_exec() {   # xbox_exec BINDDIR command args...
+  local bind=$1; shift
+  proot-distro login "$XBOX_NAME" --shared-tmp --bind "$bind:$bind" -- "$@"
+}
+
+xbox_ready() {
+  command -v proot-distro >/dev/null 2>&1 || return 1
+  mkdir -p "$SRC_DIR"
+  xbox_exec "$SRC_DIR" x86_64-linux-gnu-gcc -dumpmachine 2>/dev/null | grep -q '^x86_64-linux-gnu'
+}
+
+xbox_setup() {
+  (( IS_TERMUX )) || die "$E_ENV" "This helper is for Termux on a phone. On a normal Linux computer just run: $0 build-ipxe"
+  [[ $TARGET_ARCH == x86_64 ]] || die "$E_USAGE" "The on-phone compiler is for x86_64 PCs. An arm64 PC can be built natively on this phone."
+  info "Setting up a small Debian environment with an x86_64 compiler (about 600 MB, 5-15 minutes)"
+  command -v proot-distro >/dev/null 2>&1 || pkg install -y proot-distro || die "$E_ENV" "Could not install proot-distro. Try: pkg install proot-distro"
+  if ! proot-distro login "$XBOX_NAME" -- true >/dev/null 2>&1; then
+    proot-distro install "$XBOX_NAME" || die "$E_NET" "Could not download the Debian environment. Check your internet and run this again; it resumes."
+  fi
+  mkdir -p "$SRC_DIR"
+  xbox_exec "$SRC_DIR" bash -c '
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update &&
+    apt-get install -y --no-install-recommends build-essential make perl git liblzma-dev binutils-x86-64-linux-gnu &&
+    { apt-get install -y --no-install-recommends gcc-x86-64-linux-gnu ||
+      { v=$(apt-cache search --names-only "^gcc-[0-9]+-x86-64-linux-gnu$" | sort -V | tail -n1 | cut -d" " -f1) &&
+        [ -n "$v" ] && apt-get install -y --no-install-recommends "$v" &&
+        ln -sf "x86_64-linux-gnu-gcc-${v#gcc-}" /usr/local/bin/x86_64-linux-gnu-gcc; }; }
+  ' || die "$E_ENV" "Installing the compiler inside the Debian environment failed. Run the same command again."
+  xbox_ready || die "$E_ENV" "The Debian environment is installed but the x86_64 compiler does not answer. Run: $0 ipxe-phone"
+  ok "The on-phone x86_64 compiler is ready"
 }
 
 build_ipxe() {
@@ -1679,8 +1797,22 @@ build_ipxe() {
   case "$HOST_ARCH:$TARGET_ARCH" in
     x86_64:x86_64|aarch64:arm64|arm64:arm64) native=1 ;;
   esac
+  local xin="" ca_use="" embed_use=""
+  local -a runner=()
   if (( ! native )) && [[ -z $IPXE_CROSS ]]; then
-    die "This device is $HOST_ARCH and the target is $TARGET_ARCH. Build on a $TARGET_ARCH Linux machine with this same script, or set IPXE_CROSS (for example IPXE_CROSS=x86_64-linux-gnu-). Then copy the binaries over with: $0 import-ipxe DIR"
+    if [[ $TARGET_ARCH == x86_64 ]] && have_cross_gcc; then
+      IPXE_CROSS=x86_64-linux-gnu-
+      info "Using the x86_64 cross-compiler found on this system"
+    elif (( IS_TERMUX )) && [[ $TARGET_ARCH == x86_64 ]] && xbox_ready; then
+      IPXE_CROSS=x86_64-linux-gnu-
+      xin="$SRC_DIR/xin"
+      runner=(xbox_exec "$SRC_DIR")
+      info "Cross-compiling for $TARGET_ARCH inside the on-phone Debian environment (everything stays on this device)"
+    elif (( IS_TERMUX )) && [[ $TARGET_ARCH == x86_64 ]]; then
+      die "$E_ENV" "This phone is $HOST_ARCH and the PC is $TARGET_ARCH. Set up the on-phone compiler once with: $0 ipxe-phone"
+    else
+      die "$E_ENV" "This device is $HOST_ARCH and the target is $TARGET_ARCH, so it cannot compile the loader. Build it on a $TARGET_ARCH Linux computer you control and copy it back with: $0 import-ipxe DIR (the guide shows the steps)."
+    fi
   fi
 
   git_pin_opts
@@ -1712,7 +1844,12 @@ build_ipxe() {
   local -a mopts=()
   if [[ $VERIFIED_BOOT == 1 ]]; then
     write_embed_script "$embed" "$fb"
-    mopts=(TRUST="$ca" EMBED="$embed")
+    ca_use=$ca; embed_use=$embed
+    if [[ -n $xin ]]; then   # the guest sees only $SRC_DIR, so stage the two public inputs there
+      mkdir -p "$xin"; cp -f "$ca" "$xin/ca.crt"; cp -f "$embed" "$xin/embed.ipxe"
+      ca_use="$xin/ca.crt"; embed_use="$xin/embed.ipxe"
+    fi
+    mopts=(TRUST="$ca_use" EMBED="$embed_use")
     info "Embedded script fallback server: ${fb:-none (uses DHCP next-server)}"
   fi
   [[ -n $IPXE_CROSS ]] && mopts+=(CROSS="$IPXE_CROSS")
@@ -1730,9 +1867,9 @@ build_ipxe() {
   fi
 
   info "Building ${targets[*]} (several minutes)"
-  make -C "$src/src" clean >/dev/null 2>&1 || true
-  make -C "$src/src" -j"$(nproc_n)" "${mopts[@]}" "${targets[@]}" \
-    || die "iPXE build failed. On Termux, clang builds are not guaranteed. Building on a Linux PC with gcc is the reliable route."
+  "${runner[@]+"${runner[@]}"}" make -C "$src/src" clean >/dev/null 2>&1 || true
+  "${runner[@]+"${runner[@]}"}" make -C "$src/src" -j"$(nproc_n)" "${mopts[@]}" "${targets[@]}" \
+    || die "iPXE build failed. See the messages above. If you are on a phone, run: $0 ipxe-phone to repair the compiler setup, or import a loader built on a computer you control."
 
   mkdir -p "$TFTP"
   if [[ $TARGET_ARCH == x86_64 ]]; then
@@ -1759,6 +1896,251 @@ build_ipxe() {
   ok "iPXE installed to $TFTP (record: $IPXE_BUILT)"
 }
 
+# =============================================================================
+# iPXE built in the cloud (for a phone whose CPU differs from the PC's)
+# =============================================================================
+upstream_slug() {   # https://github.com/Owner/Repo.git -> Owner/Repo
+  local u=${UPSTREAM_REPO%.git}
+  printf '%s' "${u#*github.com/}"
+}
+
+loader_pin_path() { printf '%s/loader-%s.pin' "$STATE" "$TARGET_ARCH"; }
+pin_get() { sed -n "s/^$1=//p" "$(loader_pin_path)" 2>/dev/null | head -n1; }
+curl_api() { # curl_api URL  (JSON from GitHub; honours IPXE_CURL_OPTS so tests can use a local server)
+  # shellcheck disable=SC2086
+  curl -fsS $IPXE_CURL_OPTS --connect-timeout 20 --max-time 60 -H 'Accept: application/vnd.github+json' "$1"
+}
+json_get() { "$PYTHON" -I -c '
+import json, sys
+d = json.load(sys.stdin)
+for part in sys.argv[1].split("."):
+    d = d[int(part)] if isinstance(d, list) else d.get(part, "")
+print(d if d is not None else "")
+' "$1"; }
+
+ipxe_request() {
+  [[ -s $ATTEST/ca.crt ]] || die "$E_ENV" "Your boot certificate does not exist yet. Run the guide first (it creates your keys)."
+  local b64 slug fp url
+  b64=$(base64 < "$ATTEST/ca.crt" | tr -d '\n')
+  slug=$(upstream_slug)
+  fp=$(openssl x509 -in "$ATTEST/ca.crt" -noout -fingerprint -sha256 | cut -d= -f2)
+  url="https://github.com/$slug/actions/workflows/build-ipxe.yml"
+  printf '%s\n' "$b64" | atomic_write "$HOME/ipxe-request.txt"
+  local copied=0
+  if command -v termux-clipboard-set >/dev/null 2>&1 && printf '%s' "$b64" | termux-clipboard-set 2>/dev/null; then copied=1; fi
+  echo
+  box \
+    "ONE-TIME LOADER BUILD ON GITHUB (about 5 minutes)" \
+    "" \
+    "1. Open the page below and sign in to GitHub." \
+    "2. Tap 'Run workflow'." \
+    "3. In the first box, paste the certificate text" \
+    "   $( ((copied)) && echo "(already copied for you)" || echo "(saved in ~/ipxe-request.txt)" )" \
+    "4. Choose the PC's CPU (x86_64 for most PCs) and tap 'Run workflow'." \
+    "5. When the run turns green, come back here."
+  echo
+  say "${C_BOLD}The page:${C_RESET}"
+  say "$url"
+  echo
+  hint "No 'Run workflow' button? GitHub only shows it for workflows on your default branch: merge this branch to main first."
+  hint "The text is only your PUBLIC certificate. Your private key never leaves this device."
+  hint "Certificate fingerprint: ${fp:0:47}..."
+  if (( ! copied )); then
+    echo
+    say "The certificate text (long line):"
+    printf '%s\n' "$b64"
+  fi
+}
+
+# Does GitHub's signed provenance say these files came from this repo's build workflow?
+# Result in LOADER_ATTEST: yes | no (verification ran and FAILED) | skipped (gh missing or not logged in)
+LOADER_ATTEST="skipped"
+loader_attest() {   # loader_attest DIR
+  local dir=$1 slug f
+  LOADER_ATTEST="skipped"
+  command -v gh >/dev/null 2>&1 || return 0
+  gh auth status >/dev/null 2>&1 || return 0
+  slug=$(upstream_slug)
+  for f in "$dir"/*.efi "$dir"/*.kpxe; do
+    [[ -f $f ]] || continue
+    if ! gh attestation verify "$f" --repo "$slug" --signer-workflow "$slug/.github/workflows/build-ipxe.yml" >/dev/null 2>&1; then
+      LOADER_ATTEST="no"; return 0
+    fi
+  done
+  LOADER_ATTEST="yes"
+}
+
+loader_pin_matches() {   # the files in TFTP are exactly the ones you approved
+  local pin line name want
+  pin=$(loader_pin_path)
+  [[ -s $pin ]] || return 1
+  gpg_verify_file "$pin" || return 1
+  while IFS= read -r line; do
+    [[ $line == file=* ]] || continue
+    name=${line#file=}; name=${name%% *}; want=${line##*sha256=}
+    [[ -s $TFTP/$name && $(sha256_of "$TFTP/$name") == "$want" ]] || return 1
+  done < "$pin"
+  return 0
+}
+
+ipxe_fetch() {
+  need curl
+  [[ -n $PYTHON ]] || die "$E_ENV" "python3 is required. Run: $0 deps"
+  local mode=${1:-} slug tag lines name url dir f json pinned=0 relurl commit wfhash body fp
+  slug=$(upstream_slug)
+  mkdir -p "$STATE" "$DL"
+
+  if [[ -s $(loader_pin_path) && $mode != new ]]; then
+    gpg_verify_file "$(loader_pin_path)" || die "$E_INTEGRITY" "The saved loader approval failed its signature check. Not trusting it."
+    pinned=1; tag=$(pin_get tag)
+    info "Restoring the exact loader you approved ($tag)"
+    relurl="$GITHUB_API_BASE/repos/$slug/releases/tags/$tag"
+    json=$(curl_api "$relurl") || die "$E_NET" "Could not reach GitHub, or that build no longer exists. Check your internet."
+  else
+    if [[ $mode == new && -s $(loader_pin_path) ]]; then
+      ask_yn "Replace the loader you approved earlier with a newer build?" n || { info "Kept the approved loader."; return 0; }
+    fi
+    info "Looking for a loader built for your certificate"
+    json=$(curl_api "$GITHUB_API_BASE/repos/$slug/releases?per_page=30") \
+      || die "$E_NET" "Could not reach GitHub. Check your internet and try again."
+    fp=$(openssl x509 -in "$ATTEST/ca.crt" -noout -fingerprint -sha256 | cut -d= -f2)
+    tag=$("$PYTHON" -I -c '
+import json, sys
+arch, want = sys.argv[1], sys.argv[2]
+for rel in json.load(sys.stdin):
+    t = rel.get("tag_name", "")
+    if t.startswith("ipxe-" + arch + "-") and not rel.get("draft") and want in (rel.get("name") or ""):
+        print(t); break
+' "$TARGET_ARCH" "$fp" <<<"$json")
+    if [[ -z $tag ]]; then
+      err "No loader for THIS certificate and CPU ($TARGET_ARCH) has been built yet."
+      next_step "run '$0 ipxe-request', follow the steps, wait for the green check, then run '$0 ipxe-fetch'."
+      return 1
+    fi
+    json=$(curl_api "$GITHUB_API_BASE/repos/$slug/releases/tags/$tag") || die "$E_NET" "Could not read build $tag."
+  fi
+  ok "Using build $tag"
+
+  lines=$("$PYTHON" -I -c '
+import json, sys
+for a in json.load(sys.stdin).get("assets", []):
+    print(a["name"], a["browser_download_url"])
+' <<<"$json")
+  dir=$(mktemp -d "$DL/ipxe-cloud.XXXXXX")
+  while read -r name url; do
+    case "$name" in ipxe.efi|undionly.kpxe|ipxe-arm64.efi|SHA256SUMS) ;; *) continue ;; esac
+    # shellcheck disable=SC2086
+    curl -fsSL $IPXE_CURL_OPTS --connect-timeout 20 --max-time 600 -o "$dir/$name" "$url" \
+      || { rm -rf "$dir"; die "$E_NET" "Download of $name failed. Try again."; }
+  done <<<"$lines"
+  [[ -s $dir/SHA256SUMS ]] || { rm -rf "$dir"; die "$E_INTEGRITY" "The build has no checksum list. Not using it."; }
+  ( cd "$dir" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ) || { rm -rf "$dir"; die "$E_INTEGRITY" "Downloaded files do not match their checksums. Not using them."; }
+  ok "Checksums match"
+  f=$(ipxe_files_for_arch | head -n1)
+
+  if (( pinned )); then
+    # exactly the bytes you approved, or nothing
+    while IFS= read -r line; do
+      [[ $line == file=* ]] || continue
+      name=${line#file=}; name=${name%% *}; want=${line##*sha256=}
+      [[ -s $dir/$name && $(sha256_of "$dir/$name") == "$want" ]] \
+        || { rm -rf "$dir"; die "$E_INTEGRITY" "$name is NOT the file you approved. The release was changed. Refusing to use it."; }
+    done < "$(loader_pin_path)"
+    ok "Matches the loader you approved"
+  else
+    # 1. the build must have run exactly the reviewed workflow file
+    body=$(printf '%s' "$json" | json_get body)
+    wfhash=$(sed -n 's/^workflow-sha256: *//p' <<<"$body" | head -n1)
+    [[ $wfhash == "$WORKFLOW_SHA256" ]] \
+      || { rm -rf "$dir"; die "$E_INTEGRITY" "This build did not run the reviewed workflow (hash mismatch). Not using it."; }
+    commit=$(curl_api "$GITHUB_API_BASE/repos/$slug/git/ref/tags/$tag" | json_get object.sha) \
+      || { rm -rf "$dir"; die "$E_NET" "Could not read which commit built $tag."; }
+    # shellcheck disable=SC2086
+    [[ $(curl -fsSL $IPXE_CURL_OPTS --connect-timeout 20 --max-time 60 "$GITHUB_RAW_BASE/$slug/$commit/.github/workflows/build-ipxe.yml" | sha256sum | cut -d' ' -f1) == "$WORKFLOW_SHA256" ]] \
+      || { rm -rf "$dir"; die "$E_INTEGRITY" "The workflow file at commit ${commit:0:10} is not the reviewed one. Not using this build."; }
+    ok "Built by the reviewed workflow (commit ${commit:0:10})"
+    # 2. the loader must contain YOUR certificate
+    check_ca_embedded "$dir/$f" "$ATTEST/ca.crt" strict \
+      || { rm -rf "$dir"; die "$E_INTEGRITY" "The loader does not contain YOUR certificate, so it was refused. Run ipxe-request again and paste the right certificate."; }
+    # 3. GitHub's signed provenance, when the GitHub CLI is set up
+    loader_attest "$dir"
+    case $LOADER_ATTEST in
+      yes) ok "GitHub's signed build provenance verified" ;;
+      no)
+        if [[ $IPXE_ALLOW_UNATTESTED != 1 ]]; then
+          rm -rf "$dir"; die "$E_INTEGRITY" "GitHub's signed provenance does NOT match these files. They were not built by the workflow. Refusing."
+        fi
+        warn "Provenance check failed but IPXE_ALLOW_UNATTESTED=1 is set." ;;
+      *) warn "Build provenance was NOT checked (GitHub CLI missing or not logged in)."
+         hint "Stronger: pkg install gh && gh auth login, then run ipxe-fetch again." ;;
+    esac
+    echo
+    box \
+      "APPROVE THIS LOADER (one time)" \
+      "" \
+      "Build : $tag" \
+      "Commit: ${commit:0:40}" \
+      "Cert  : yours (checked inside the file)" \
+      "Proof : provenance $LOADER_ATTEST (yes = verified, skipped = not checked)" \
+      "" \
+      "Once approved, this exact file is pinned. From now on the script" \
+      "only ever restores THIS file and refuses any different one."
+    echo
+    if [[ $ASSUME_YES == 1 && $IPXE_CLOUD_OK != 1 ]]; then
+      rm -rf "$dir"; die "$E_USAGE" "Approval needs a human. Run it yourself, or set IPXE_CLOUD_OK=1 knowingly."
+    fi
+    ask_yn "Approve and pin this loader?" "$([[ $LOADER_ATTEST == yes ]] && echo y || echo n)" \
+      || { rm -rf "$dir"; info "Not approved. Nothing was installed."; return 1; }
+  fi
+
+  # the files verified above are the ones installed
+  ( IMPORT_KEEP_PIN=1; import_ipxe "$dir" ) || { rm -rf "$dir"; die "$E_INTEGRITY" "Import refused the files."; }
+  { echo "source=cloud:$tag"; echo "fetched=$(now_iso)"; } >> "$IPXE_BUILT"
+  if (( ! pinned )); then
+    {
+      echo "tag=$tag"; echo "arch=$TARGET_ARCH"; echo "workflow_sha256=$WORKFLOW_SHA256"
+      echo "commit=$commit"; echo "attested=$LOADER_ATTEST"; echo "approved=$(now_iso)"
+      for name in $(ipxe_files_for_arch); do echo "file=$name sha256=$(sha256_of "$TFTP/$name")"; done
+    } | atomic_write "$(loader_pin_path)"
+    rm -f "$(loader_pin_path).asc"
+    gpg_sign_file "$(loader_pin_path)" || warn "Could not sign the approval record (attestation key missing?)."
+    ok "Approved and pinned. This is now the only cloud loader the script will use."
+  fi
+  rm -rf "$dir"
+  ok "Loader installed ($f)."
+}
+
+ipxe_cloud() {   # one-time GitHub build, then pinned forever
+  if [[ -s $(loader_pin_path) ]]; then
+    ok "You already approved a GitHub-built loader. Restoring exactly that one."
+    ipxe_fetch; return
+  fi
+  echo
+  box \
+    "ONE-TIME GITHUB BUILD: WHAT IS CHECKED, WHAT IS NOT" \
+    "" \
+    "Checked: the build ran the exact workflow file you can read in" \
+    "your repo (hash pinned in this script), the loader contains YOUR" \
+    "certificate, checksums match, and (with the GitHub CLI set up)" \
+    "GitHub's signed provenance matches. Then that one file is pinned." \
+    "" \
+    "Still trusted: GitHub's build servers for that single run." \
+    "A loader built on a computer you control avoids even that."
+  echo
+  ask_yn "Do the one-time GitHub build?" y || { info "OK. Other routes: $0 ipxe-phone, or build on a computer you control."; return 0; }
+  ipxe_request
+  local a
+  while :; do
+    read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Press Enter once the run is green (or type s to skip, q to quit): " a || a=s
+    case "${a,,}" in
+      q) exit 0 ;;
+      s) warn "Skipped. Later: $0 ipxe-fetch"; return 0 ;;
+    esac
+    if ( ipxe_fetch ); then return 0; fi
+    warn "Not ready yet. A run takes about 5 minutes; check the Actions page, then press Enter again."
+  done
+}
+
 import_ipxe() {
   local dir=${1:-}
   [[ -n $dir && -d $dir ]] || die "Usage: $0 import-ipxe DIR   (DIR holds ipxe.efi / undionly.kpxe / ipxe-arm64.efi)"
@@ -1781,6 +2163,10 @@ import_ipxe() {
     check_ca_embedded "$TFTP/$(ipxe_files_for_arch | head -n1)" "$ATTEST/ca.crt"
   else
     warn "VERIFIED_BOOT=0: imported binaries are trusted as-is"
+  fi
+  if [[ ${IMPORT_KEEP_PIN:-0} != 1 && -s $(loader_pin_path) ]]; then
+    rm -f "$(loader_pin_path)" "$(loader_pin_path).asc"
+    info "Your earlier GitHub-loader approval was cleared because you imported a different loader."
   fi
   {
     echo "commit=imported"
@@ -1890,7 +2276,7 @@ fetch() {
              | awk 'tolower($1)=="content-length:" {gsub("\r","",$2); n=$2} END{print n+0}' || echo 0)
     have=$(file_size "$ISO.part" 2>/dev/null || echo 0)
     if (( remote > 0 )); then
-      need_mb=$(( (remote - have) / 1048576 + 1 )); avail_mb=$(df -Pm "$DL" | awk 'NR==2{print $4}')
+      need_mb=$(( (remote - have) / 1048576 + 1 )); avail_mb=$(free_mb "$DL")
       if (( avail_mb < need_mb + 256 )); then
         die "$E_DISK" "Not enough space for the download: need about $need_mb MB more, only $avail_mb MB free."
       fi
@@ -2016,7 +2402,7 @@ extract() {
   need_mb=$(bsdtar -tvf "$ISO" 2>/dev/null | awk -v want="$(printf '%s\n' "${files[@]#./}")" '
       BEGIN{n=split(want,a,"\n"); for(i=1;i<=n;i++) w[a[i]]=1}
       { name=$NF; sub(/^\.\//,"",name); if (name in w) sum+=$5 } END{printf "%d", sum/1048576 + 1}' || echo 0)
-  avail_mb=$(df -Pm "$HTTP" | awk 'NR==2{print $4}')
+  avail_mb=$(free_mb "$HTTP")
   if (( need_mb > 1 && avail_mb < need_mb + need_mb/20 + 64 )); then
     rm -rf "$stage"
     die "$E_DISK" "Not enough space to extract: need about $need_mb MB, only $avail_mb MB free. Nothing was changed."
@@ -2282,7 +2668,7 @@ write_manifest() {
     fi
     printf '%s %s %s\n' "$h" "$sz" "$rel" >> "$tmp"
     printf '%s %s\n' "$fp" "$rel" >> "$fpt"
-  done < <(manifest_files)
+  done <<<"$(manifest_files)"
   sync_file "$tmp"; sync_file "$fpt"
   mv -f "$fpt" "$MANIFEST.fp"
   mv -f "$tmp" "$MANIFEST"
@@ -2370,6 +2756,7 @@ attest_report() {
     echo
     echo "[identity]"
     echo "script_sha256=$(sha256_of "$SELF")"
+    if [[ -f $IPXE_BUILT ]]; then echo "loader_record=$(tr '\n' ' ' < "$IPXE_BUILT" | cut -c1-240)"; fi
     echo "script_signed_sha256=$(awk '{print $1}' "$ATTEST/script.sha256" 2>/dev/null || echo none)"
     echo "attest_key=$(attest_fpr)"
     echo "boot_ca_sha256=$(ca_fpr_hex 2>/dev/null || echo none)"
@@ -2566,7 +2953,7 @@ backup_prune() {
   while IFS= read -r f; do
     n=$((n+1))
     if (( n > BACKUP_KEEP )); then rm -f -- "$f" "$f.sha256" "$f.meta"; fi
-  done < <(ls -1t "$BACKUP_DIR"/netboot-*.tar.gz 2>/dev/null || true)
+  done <<<"$(ls -1t "$BACKUP_DIR"/netboot-*.tar.gz 2>/dev/null || true)"
   return 0
 }
 
@@ -2702,6 +3089,7 @@ cleanup() {
   power_save_restore
   (( IS_TERMUX )) && termux-wake-unlock 2>/dev/null || true
   run_root "chown -R $(id -u):$(id -g) '$RUN'" >/dev/null 2>&1 || true
+  if [[ -n $TAIL_PID ]]; then kill "$TAIL_PID" 2>/dev/null || true; fi
   if [[ -n $DEEP_PID ]]; then pkill -P "$DEEP_PID" 2>/dev/null || true; kill "$DEEP_PID" 2>/dev/null || true; fi
   note_serve "stopped"
   release_lock
@@ -2710,6 +3098,9 @@ cleanup() {
 }
 
 serve() {
+  if (( IS_PROOT )); then
+    die "$E_ENV" "You are inside a proot Linux environment. It cannot see the phone's network or open the DHCP/TFTP ports, so it cannot serve a PC. Type 'exit' to return to Termux and run this there (rooted). This environment is good for building the loader: $0 proot-build"
+  fi
   resolve_network
   require_ready
   [[ $MODE == direct ]] && setup_direct
@@ -2767,10 +3158,12 @@ serve() {
 
   info "Starting dnsmasq ($MODE DHCP + TFTP) as root"
   start_dns
+  tail -n 0 -F "$DNS_LOG" 2>/dev/null & TAIL_PID=$!
   sleep 1
   dns_alive || die "$E_ENV" "dnsmasq exited. If it could not bind a port, check: $0 selinux status, and whether a hotspot or another DHCP/TFTP service holds ports 67/69."
   protect_pid "$(run_root "cat '$RUN/dnsmasq.pid'" 2>/dev/null || true)"
   ok "Ready. Boot the PC from the network now."
+  pc_instructions
   watchdog || true
   serve_epilogue
 }
@@ -2794,7 +3187,7 @@ http_stats()  { curl -fsS -m 2 "http://$PHONE_IP:$HTTP_PORT/healthz" 2>/dev/null
 start_dns() {
   local ldp=""
   (( IS_TERMUX )) && ldp="LD_LIBRARY_PATH=$PREFIX/lib "
-  { run_root "${ldp}$DNSMASQ --no-daemon --conf-file=$DNSMASQ_CONF" || true; } > >(tee -a "$DNS_LOG") 2>&1 &
+  { run_root "${ldp}$DNSMASQ --no-daemon --conf-file=$DNSMASQ_CONF" || true; } >> "$DNS_LOG" 2>&1 &
 }
 
 dns_alive() {
@@ -2957,7 +3350,7 @@ check() {
   if port_in_use tcp "$HTTP_PORT"; then warn "TCP $HTTP_PORT in use"; else ok "TCP $HTTP_PORT free"; fi
 
   mkdir -p "$ROOT"
-  avail_mb=$(df -Pm "$ROOT" | awk 'NR==2{print $4}')
+  avail_mb=$(free_mb "$ROOT")
   if (( avail_mb >= MIN_FREE_MB )); then
     ok "Storage: $avail_mb MB free (need $MIN_FREE_MB MB for $DISTRO)"
   else
@@ -2979,6 +3372,8 @@ check() {
     if [[ $MODE == proxy ]]; then
       info "Proxy mode needs the PC on the same network segment as $IFACE. Guest Wi-Fi and AP client isolation block PXE."
     fi
+  elif (( IS_PROOT )); then
+    warn "Inside a proot Linux: the phone's network and ports 67/69 are not reachable from here. Use this environment to BUILD the loader (run: $0 proot-build). Serve from Termux itself."
   else
     err "No usable network interface (set IFACE=..., or --mode direct for a cable)"; fails=$((fails+1))
   fi
@@ -3073,7 +3468,7 @@ orphans_running() {
 
 diagnose() {
   F_LVL=(); F_TAG=(); F_MSG=(); F_FIX=()
-  local other=0 cfg_ip cur n avail ft ma last age st f
+  local other=0 cfg_ip cur n avail ft ma last age st f missing
   # lock
   if [[ -f $LOCK_DIR/owner ]] && lock_owner_alive; then
     read -r n _ < "$LOCK_DIR/owner"
@@ -3093,7 +3488,7 @@ diagnose() {
   if [[ -f $DNSMASQ_CONF && ! -f $LIB/httpd.py ]]; then finding WARN LIBS "Helper programs are missing" "$0 heal"; fi
   # storage and memory
   mkdir -p "$ROOT" 2>/dev/null || true
-  avail=$(df -Pm "$ROOT" 2>/dev/null | awk 'NR==2{print $4}'); avail=${avail:-0}
+  avail=$(free_mb "$ROOT")
   if (( avail >= ${MIN_FREE_MB:-0} )); then finding OK DISK "Storage: $avail MB free" ""
   elif [[ -f $MANIFEST ]]; then finding WARN DISK "Storage is low: $avail MB free (serving still works)" "$0 clean   (keeps ISOs and keys)"
   else finding FAIL DISK "Storage: only $avail MB free, need ${MIN_FREE_MB:-?} MB for $DISTRO" "free space or set NETBOOT_HOME to a bigger drive"; fi
@@ -3105,6 +3500,10 @@ diagnose() {
   ma=$(mem_avail_mb)
   if (( ma > 0 && ma < 300 )); then finding WARN MEM "Only $ma MB of RAM free: close other apps so Android keeps the servers alive" ""
   elif (( ma > 0 )); then finding OK MEM "Memory: $ma MB free"; fi
+  # required programs (installed by the "deps" step)
+  missing=$(missing_tools)
+  if [[ -n $missing ]]; then finding FAIL TOOLS "Missing programs: $missing. Setup installs them" "$0 deps"
+  else finding OK TOOLS "Required programs are installed" ""; fi
   # trust chain
   if [[ -z $(attest_fpr) ]]; then
     last=$(ls -1t "$BACKUP_DIR"/netboot-*.tar.gz 2>/dev/null | head -n1 || true)
@@ -3119,7 +3518,17 @@ diagnose() {
       bad)     finding FAIL SELF "Signed script record failed verification (possible tampering)" "$0 fingerprints" ;;
     esac
   fi
-  [[ -s $TFTP/ipxe.efi ]] && finding OK IPXE "iPXE loader present" "" || finding FAIL IPXE "iPXE loader missing" "$0 build-ipxe   (or import-ipxe DIR)"
+  if [[ -s $(loader_pin_path) ]]; then
+    if loader_pin_matches; then
+      if [[ $(pin_get attested) == yes ]]; then finding INFO LOADERPIN "Loader is the GitHub build you approved (provenance verified)" ""
+      else finding WARN LOADERPIN "Loader is the GitHub build you approved, but its build provenance was never checked" "$0 ipxe-fetch new"; fi
+    else
+      finding FAIL LOADERPIN "The loader on disk is NOT the one you approved" "$0 ipxe-fetch"
+    fi
+  elif [[ -s $TFTP/ipxe.efi && -f $IPXE_BUILT ]] && grep -q '^source=cloud' "$IPXE_BUILT"; then
+    finding WARN LOADERTRUST "The iPXE loader came from GitHub without a saved approval" "$0 ipxe-fetch new"
+  fi
+  [[ -s $TFTP/ipxe.efi ]] && finding OK IPXE "iPXE loader present" "" || finding FAIL IPXE "iPXE loader missing (this phone can build it itself)" "$([[ $HOST_ARCH == aarch64 && $TARGET_ARCH == x86_64 ]] && echo "$0 ipxe-phone" || echo "$0 build-ipxe")"
   iso_is_verified && finding OK ISO "$P_LABEL image verified" "" || finding FAIL ISO "$P_LABEL image not downloaded/verified" "$0 --distro $DISTRO --arch $TARGET_ARCH fetch"
   [[ -f $LAYOUT ]] && finding OK EXTRACT "Boot files extracted" "" || finding FAIL EXTRACT "Boot files not extracted" "$0 --distro $DISTRO --arch $TARGET_ARCH extract"
   if [[ -f $MANIFEST && -f $TFTP/boot.ipxe ]]; then
@@ -3191,6 +3600,10 @@ heal_safe() {
   done
   if [[ -d $RUN && ! -O $RUN ]]; then run_root "chown -R $(id -u):$(id -g) '$RUN'" >/dev/null 2>&1 && { ok "Fixed ownership of $RUN"; did=1; }; fi
   if [[ -f $DNSMASQ_CONF && ! -f $LIB/httpd.py ]]; then write_libs; ok "Rewrote helper programs"; did=1; fi
+  if [[ -s $(loader_pin_path) ]] && ! loader_pin_matches; then
+    info "The loader is missing or changed. Restoring the exact one you approved."
+    if ( ipxe_fetch ) >/dev/null 2>&1; then ok "Approved loader restored"; did=1; else warn "Could not restore it now (offline?). Run: $0 ipxe-fetch"; fi
+  fi
   (( did )) || ok "Nothing needed fixing"
   log_event INFO "heal_safe did=$did"
   return 0
@@ -3209,11 +3622,14 @@ heal() {
   fi
   print_findings
   verdict || {
-    if [[ -t 0 ]]; then
-      for i in "${!F_LVL[@]}"; do
-        [[ ${F_LVL[$i]} == FAIL && -n ${F_FIX[$i]} && ${F_FIX[$i]} == "$0 "* ]] || continue
-        ask_yn "Run now: ${F_FIX[$i]#"$0 "}?" n && { ( with_lock bash -c "${F_FIX[$i]}" ) || warn "That did not finish."; }
-      done
+    local setup_bad=0
+    for i in "${!F_LVL[@]}"; do
+      [[ ${F_LVL[$i]} == FAIL ]] || continue
+      case "${F_TAG[$i]}" in TOOLS|ATTEST|IPXE|LOADERPIN|ISO|EXTRACT|CONFIG) setup_bad=1 ;; esac
+    done
+    if (( setup_bad )) && [[ -t 0 ]]; then
+      say "The missing pieces are setup steps. The guide does them in the right order and skips what is done."
+      ask_yn "Run the guided setup now?" y && GUIDE_WELCOMED=1 guided
     fi
     return 1
   }
@@ -3238,6 +3654,173 @@ go_cmd() {
 }
 
 # =============================================================================
+# Inside a proot Linux on the phone: build the loader for the Termux install
+# =============================================================================
+proot_build_flow() {
+  echo
+  box \
+    "YOU ARE INSIDE A PROOT LINUX ON THE PHONE" \
+    "" \
+    "This environment can compile the loader but cannot run the PXE" \
+    "server (no access to the phone's network or ports 67/69)." \
+    "" \
+    "Important: the loader must contain the certificate of the install" \
+    "that will SERVE, i.e. your Termux one. Keys made in here are not" \
+    "used. So we build with a copy of Termux's PUBLIC certificate."
+  echo
+  say "${C_BOLD}Step A, in Termux (not here):${C_RESET} copy the public certificate into this environment"
+  say "  cp ~/netboot/attest/ca.crt \"\$PREFIX\"/var/lib/proot-distro/installed-rootfs/*/root/ca.crt"
+  hint "If you have more than one proot Linux, replace * with this one's folder name."
+  echo
+  local ca="${TRUST_CA:-/root/ca.crt}" ans
+  read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Path to that ca.crt inside this environment [$ca]: " ans || ans=""
+  ca=${ans:-$ca}
+  [[ -s $ca ]] || die "$E_ENV" "No file at $ca. Do Step A in Termux first, then run: $0 proot-build"
+  if grep -q 'PRIVATE KEY' "$ca"; then die "$E_INTEGRITY" "That file contains a PRIVATE KEY. Never copy private keys around. Use ca.crt only."; fi
+  openssl x509 -in "$ca" -noout -text 2>/dev/null | grep -q 'CA:TRUE' || die "$E_INTEGRITY" "$ca is not a CA certificate. Copy ~/netboot/attest/ca.crt from Termux."
+  ok "Certificate: $(openssl x509 -in "$ca" -noout -fingerprint -sha256 | cut -d= -f2 | cut -c1-23)..."
+  if ! have_cross_gcc && [[ $TARGET_ARCH == x86_64 && $(uname -m) == aarch64 ]]; then
+    ask_yn "Install the x86_64 compiler and build tools now?" y || return 0
+    ( deps ) || die "$E_ENV" "Tool install failed. See the messages above."
+  fi
+  say "Building. On a phone this takes roughly 20 to 45 minutes."
+  ( export TRUST_CA="$ca" FALLBACK_SERVER=""; build_ipxe ) || die "$E_ENV" "The build did not finish. Run $0 proot-build again."
+  echo
+  box \
+    "DONE. NOW, BACK IN TERMUX:" \
+    "" \
+    "mkdir -p ~/loader" \
+    "cp \"\$PREFIX\"/var/lib/proot-distro/installed-rootfs/*$TFTP/ipxe.efi ~/loader/" \
+    "cp \"\$PREFIX\"/var/lib/proot-distro/installed-rootfs/*$TFTP/undionly.kpxe ~/loader/" \
+    "cd ~/netboot-android && ./netboot-android.sh import-ipxe ~/loader" \
+    "" \
+    "import-ipxe checks that the loader contains your certificate."
+  echo
+}
+
+# =============================================================================
+# Easy mode: the zero-argument screen, one plain question, and a one-tap shortcut
+# =============================================================================
+pick_goal() {
+  local c=1
+  say "${C_BOLD}What do you want to do?${C_RESET}"
+  say "  1) Rescue or repair a PC          ${C_DIM}(SystemRescue: small and fast, about 4 GB of RAM)${C_RESET}"
+  say "  2) Try a full desktop             ${C_DIM}(Ubuntu: about 10 GB of RAM)${C_RESET}"
+  say "  3) Something else                 ${C_DIM}(shows the full list)${C_RESET}"
+  if [[ $ASSUME_YES != 1 ]]; then
+    read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Choose 1, 2 or 3 [1]: " c || c=1
+  fi
+  case "${c:-1}" in
+    2) DISTRO=ubuntu; TARGET_ARCH=x86_64 ;;
+    3) choose_target; choose_mode ;;
+    *) DISTRO=systemrescue; TARGET_ARCH=x86_64 ;;
+  esac
+  set_distro
+  save_profile
+  ok "OK: $P_LABEL"
+}
+
+pc_instructions() {
+  echo
+  box \
+    "NOW, ON THE PC YOU WANT TO BOOT:" \
+    "" \
+    "1. Plug it into the same network (or cable) as this phone." \
+    "2. Turn it on and tap the boot-menu key right away:" \
+    "     Dell F12   HP F9 or Esc   Lenovo F12 or Enter, then F12" \
+    "     Asus F8 or Esc   Acer F12   Microsoft Surface: hold Volume Down" \
+    "     (not sure? try F12, then Esc, then F2 to open settings)" \
+    "3. Pick: Network, PXE, or IPv4 Network Boot. UEFI is fine." \
+    "4. If it will not list network boot: in settings turn ON" \
+    "   network boot and turn OFF Secure Boot, then try again." \
+    "" \
+    "A good sign: text scrolls here when the PC asks for its files." \
+    "Stop the server with Ctrl+C when the PC has booted."
+  echo
+}
+
+shortcut_cmd() {
+  local dir="$HOME/.shortcuts" f
+  mkdir -p "$dir"
+  f="$dir/Boot-a-PC"
+  atomic_write "$f" <<EOF
+#!/usr/bin/env bash
+# Created by netboot-android.sh: one tap starts serving with your saved settings.
+exec "$SELF" --yes go
+EOF
+  chmod 700 "$f"
+  ok "Created the one-tap shortcut: $f"
+  say "To use it on Android:"
+  say "  1. Install the free app Termux:Widget (same place you got Termux)."
+  say "  2. Long-press your home screen > Widgets > Termux:Widget > add it."
+  say "  3. Tap 'Boot-a-PC' in that widget. That is it."
+  hint "Needs root already granted to Termux. It never starts by itself; you tap it."
+}
+
+# Picks the one screen that makes sense for the current state.
+easy_home() {
+  if [[ ! -t 0 || ! -t 1 ]]; then interactive; return; fi
+  if (( IS_PROOT )); then proot_build_flow; return; fi
+  local i key setup_bad=0 note="" fixcmd=""
+  load_profile && set_distro || true
+  clear 2>/dev/null || true
+  banner
+  if [[ ! -r $PROFILE && -z $(attest_fpr) ]]; then
+    box \
+      "FIRST TIME HERE? I'll set everything up for you." \
+      "" \
+      "It takes about 20-40 minutes, mostly downloading." \
+      "You only answer a couple of simple questions." \
+      "Nothing is deleted. Type q at any question to stop."
+    echo
+    ask_yn "Start now?" y || { info "OK. Run me again whenever you are ready."; return 0; }
+    echo
+    pick_goal
+    GUIDE_WELCOMED=1 guided
+    return 0
+  fi
+  diagnose
+  for i in "${!F_LVL[@]}"; do
+    [[ ${F_LVL[$i]} == FAIL ]] || continue
+    case "${F_TAG[$i]}" in
+      TOOLS|ATTEST|IPXE|LOADERPIN|ISO|EXTRACT|CONFIG) setup_bad=1; note=${note:-${F_MSG[$i]}} ;;
+      SELF) note=${F_MSG[$i]}; fixcmd=self ;;
+      *) note=${note:-${F_MSG[$i]}}; fixcmd=${fixcmd:-heal} ;;
+    esac
+  done
+  if (( setup_bad )); then
+    box "SETUP ISN'T FINISHED" "" "$note"
+    echo
+    ask_yn "Continue the guided setup (it skips what is already done)?" y && guided
+    return 0
+  fi
+  if [[ $fixcmd == self ]]; then
+    self_check_soft || true
+    return 0
+  fi
+  if [[ -n $fixcmd ]]; then
+    box "ONE THING NEEDS ATTENTION" "" "$note"
+    echo
+    if ask_yn "Try to fix it automatically?" y; then heal || true; fi
+    return 0
+  fi
+  heal_safe >/dev/null 2>&1 || true
+  box \
+    "READY.  $P_LABEL" \
+    "" \
+    "Enter = boot a PC now      m = full menu" \
+    "s = status                 q = quit"
+  echo
+  read -r -p "${C_BOLD}${C_BLUE}>${C_RESET} " key || key=q
+  case "${key,,}" in
+    "")  with_lock go_cmd ;;
+    m)   interactive ;;
+    s)   status || true ;;
+    *)   info "Bye." ;;
+  esac
+}
+
+# =============================================================================
 # Guided mode: walks through everything, one plain step at a time
 # =============================================================================
 GSTEP=0; GTOTAL=13
@@ -3249,6 +3832,9 @@ hint() { printf '%s    %s%s\n' "$C_DIM" "$*" "$C_RESET"; }
 ask_yn() {
   local q=$1 d=${2:-y} a h="[y/N]"
   [[ $d == y ]] && h="[Y/n]"
+  if [[ $ASSUME_YES == 1 ]]; then   # --yes takes the suggested answer; it never overrides a "no" default
+    printf '%s %s %s\n' "$q" "$h" "(--yes: ${d})"; [[ $d == y ]]; return
+  fi
   while true; do
     read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} $q $h " a || { echo; a=""; }
     a=${a,,}
@@ -3270,6 +3856,25 @@ gstep_head() {
 }
 
 # guided_run "Title" "Plain explanation" DONE_CHECK_FUNCTION|"" command args...
+
+# In the guide, "something is missing" is expected before the next steps install it.
+# Real blockers (root, storage, network) still stop and offer Retry.
+check_soft() {
+  local log rc=0
+  log=$(mktemp)
+  check 2>&1 | tee "$log" || true
+  if ! grep -q 'required check' "$log"; then rm -f "$log"; return 0; fi
+  if grep -qE 'No root|FAT/exFAT|No usable network|only [0-9]+ MB free' "$log"; then rc=1; fi
+  rm -f "$log"
+  echo
+  if (( rc )); then
+    err "Something above must be fixed first (root, storage, or network). Fix it, then choose Retry."
+    return 1
+  fi
+  info "That is OK. The missing items are exactly what the next steps set up. Carrying on."
+  return 0
+}
+
 guided_run() {
   local title=$1 why=$2 donefn=$3 a; shift 3
   gstep_head "$title" "$why"
@@ -3298,29 +3903,77 @@ g_done_fetch()   { iso_is_verified; }
 g_done_extract() { [[ -f $LAYOUT ]]; }
 
 guided_ipxe() {
-  local host_cpu want c dir
+  local host_cpu c
   gstep_head "Get the network-boot loader (iPXE)" \
     "iPXE is the tiny program the PC runs first. It is built with YOUR key inside," \
-    "so it only boots files you signed."
+    "so it only boots files you signed. Building takes 10-30 minutes on a phone."
   if g_done_ipxe; then ok "Already done."; ask_yn "Do it again anyway?" n || return 0; fi
   host_cpu=$(uname -m); [[ $host_cpu == aarch64 ]] && host_cpu=arm64
-  if [[ $host_cpu == "$TARGET_ARCH" ]]; then want=1
-    hint "This device matches the PC's CPU ($TARGET_ARCH), so building here works."
-  else want=2
-    hint "This device is $host_cpu but the PC is $TARGET_ARCH. Easiest: build on any x86_64 Linux"
-    hint "computer (see README, 'Building iPXE for a different CPU'), then choose 2."
+  if [[ $host_cpu == "$TARGET_ARCH" ]]; then
+    hint "This device matches the PC's CPU ($TARGET_ARCH), so building here works and keeps everything on this device."
+    say "  1) Build it here (slow on a phone, but automatic)  ${C_GREEN}recommended${C_RESET}"
+    say "  2) I built it on another computer I control: import it"
+    say "  3) One-time build on GitHub, then pinned and verified"
+    say "  4) Skip for now"
+    read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Choose 1-4 [1]: " c || c=""
+    case "${c:-1}" in
+      1) ( build_ipxe ) && ok "iPXE built" || warn "Build did not finish. Run it again from the menu." ;;
+      2) guided_ipxe_import ;;
+      3) ipxe_cloud ;;
+      *) warn "Skipped. configure will stop until iPXE is in place." ;;
+    esac
+  else
+    hint "This phone is $host_cpu and the PC is $TARGET_ARCH, so it cannot compile the loader the normal way."
+    say "  1) One-time build on GitHub, then pinned and verified  ${C_GREEN}default, about 5 minutes${C_RESET}"
+    say "  2) Build it on this phone with an x86_64 compiler (slow, nothing leaves the phone)"
+    say "  3) Build it on a $TARGET_ARCH Linux computer I control, then import it"
+    say "  4) Skip for now"
+    read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Choose 1-4 [1]: " c || c=""
+    case "${c:-1}" in
+      1) ipxe_cloud ;;
+      2) ipxe_phone ;;
+      3) ipxe_own_machine_help; guided_ipxe_import ;;
+      *) warn "Skipped. configure will stop until iPXE is in place." ;;
+    esac
   fi
-  say "  1) Build it here (slow on a phone, but automatic)"
-  say "  2) I already built it on another computer: import it"
-  say "  3) Skip for now"
-  read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Choose 1, 2 or 3 [$want]: " c || c=""
-  c=${c:-$want}
-  case "$c" in
-    1) ( build_ipxe ) && ok "iPXE built" || warn "Build did not finish. Run it again from the menu." ;;
-    2) read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Folder holding ipxe.efi and undionly.kpxe: " dir || dir=""
-       ( import_ipxe "$dir" ) && ok "iPXE imported" || warn "Import did not finish. Check the folder and retry from the menu." ;;
-    *) warn "Skipped. configure will stop until iPXE is in place." ;;
-  esac
+}
+
+ipxe_phone() {   # set up the compiler if needed, then build
+  if ! xbox_ready; then
+    say "First time only: this downloads a small Debian environment (about 600 MB) and an x86_64 compiler."
+    ask_yn "Set it up now?" y || { warn "Skipped."; return 0; }
+    ( xbox_setup ) || { warn "Setup did not finish. Run it again; it resumes."; return 1; }
+  fi
+  say "Building the loader on this phone. This is the slow part: about 20-45 minutes."
+  hint "Keep the screen on and Termux unrestricted; if it stops, run the same step again."
+  ( build_ipxe ) && ok "iPXE built on this phone" || warn "Build did not finish. Run it again from the menu."
+}
+
+ipxe_own_machine_help() {
+  echo
+  box \
+    "BUILD THE LOADER ON A COMPUTER YOU CONTROL" \
+    "" \
+    "On any $TARGET_ARCH Linux computer:" \
+    "1. Get this script there (same file as on the phone)." \
+    "2. Copy ONLY your public certificate from the phone:" \
+    "     $ATTEST/ca.crt" \
+    "   (never copy anything else from that folder)" \
+    "3. Check both copies match: run  ./netboot-android.sh fingerprints" \
+    "   on both and compare the lines." \
+    "4. On the computer run:" \
+    "     TRUST_CA=ca.crt ./netboot-android.sh --arch $TARGET_ARCH build-ipxe" \
+    "5. Copy ipxe.efi and undionly.kpxe from its ~/netboot/tftp back to" \
+    "   a folder on this phone."
+  echo
+  hint "Phone to computer tips: termux-setup-storage then copy into ~/storage/downloads, or use scp."
+  read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Press Enter when the two files are on this phone: " _ || true
+}
+
+guided_ipxe_import() {
+  local dir
+  read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Folder holding ipxe.efi and undionly.kpxe: " dir || dir=""
+  ( import_ipxe "$dir" ) && ok "iPXE imported" || warn "Import did not finish. Check the folder and retry from the menu."
 }
 
 # ---- offsite backup wizard ---------------------------------------------------
@@ -3427,39 +4080,47 @@ offsite_wizard() {
 }
 
 guided() {
-  [[ -t 0 ]] || die "Guided mode needs a terminal. Run it directly in Termux or a shell."
-  clear 2>/dev/null || true
-  printf '\n'
-  box \
-    "WELCOME. I will walk you through, one small step at a time." \
-    "" \
-    "- Every step says what it does, in plain words." \
-    "- Press Enter to accept the suggested answer (shown in capitals)." \
-    "- Type q at any question to stop safely." \
-    "- Nothing is deleted. A backup of your working folder is taken" \
-    "  before the server starts."
-  say ""
-  ask_yn "Ready to begin?" y || { info "OK. Come back any time."; return 0; }
+  [[ -t 0 || $ASSUME_YES == 1 ]] || die "Guided mode needs a terminal. Run it directly in Termux or a shell."
+  if (( IS_PROOT )); then proot_build_flow; return; fi
+  if [[ ${GUIDE_WELCOMED:-0} != 1 ]]; then
+    clear 2>/dev/null || true
+    printf '\n'
+    box \
+      "WELCOME. I will walk you through, one small step at a time." \
+      "" \
+      "- Every step says what it does, in plain words." \
+      "- Press Enter to accept the suggested answer (shown in capitals)." \
+      "- Type q at any question to stop safely." \
+      "- Nothing is deleted. A backup of your working folder is taken" \
+      "  before the server starts."
+    say ""
+    ask_yn "Ready to begin?" y || { info "OK. Come back any time."; return 0; }
+  fi
 
-  gstep_head "Choose what to boot and how it connects" \
-    "Now: $P_LABEL on a $TARGET_ARCH PC, network mode '$DHCP_MODE'."
-  if ask_yn "Change that?" n; then choose_target; choose_mode; set_distro; fi
+  load_profile && set_distro || true
+  gstep_head "Choose what to boot" \
+    "Now: $P_LABEL on a $TARGET_ARCH PC."
+  if [[ -r $PROFILE ]]; then
+    if ask_yn "Change that?" n; then pick_goal; fi
+  else
+    pick_goal
+  fi
 
   guided_run "Check this device" \
-    "Looks for root, tools, free space and network. Safe: it only reads things." "" check
+    "Looks for root, tools, free space and network. Safe: it only reads things. (under a minute)" "" check_soft
   guided_run "Install the tools needed" \
-    "Installs packages such as dnsmasq, python, gpg. Needs internet." "" deps
+    "Installs packages such as dnsmasq, python, gpg. Needs internet. (2-5 minutes)" "" deps
   guided_run "Create your private keys" \
     "Makes a signing key and a small certificate authority that live only on this device." g_done_attest attest_init
   guided_run "Sign this script" \
     "Records the script's fingerprint so any later tampering is noticed." g_done_sign self_sign
   guided_run "Check the download servers" \
-    "Confirms each vendor's server identity against public logs before trusting it." "" pins_refresh
+    "Confirms each vendor's server identity against public logs before trusting it. (about a minute)" "" pins_refresh
   guided_ipxe
   guided_run "Download and verify the Linux image" \
-    "Downloads $P_LABEL and checks the vendor's signature. Large download: use Wi-Fi." g_done_fetch fetch
+    "Downloads $P_LABEL and checks the vendor's signature. Large download, so use Wi-Fi. (10-40 minutes; safe to stop and resume)" g_done_fetch fetch
   guided_run "Unpack the boot files" \
-    "Pulls the kernel and files the PC needs out of the image." g_done_extract extract
+    "Pulls the kernel and files the PC needs out of the image. (1-5 minutes)" g_done_extract extract
   guided_run "Sign and prepare everything" \
     "Signs the boot files with your key and writes the server settings for your current network." "" configure
 
@@ -3623,10 +4284,18 @@ usage() {
 netboot-android.sh $SCRIPT_VERSION
 Verified PXE live boot of Linux ISOs from a rooted Android phone or any Linux host.
 
+START HERE
+  $0                         Run with no arguments and press Enter. It asks one simple
+                             question the first time, then sets everything up for you.
+  $0 go                      Already set up? Start serving a PC right now.
+  $0 status                  What is ready, and what needs attention.
+  $0 shortcut                Make a one-tap "Boot-a-PC" button (Termux:Widget).
+
 USAGE
   $0 [--distro NAME] [--arch ARCH] [--mode MODE] [--iface IF] COMMAND [args]
   $0 -h | --help
-  $0                         (no arguments starts the interactive menu)
+  $0                         (no arguments: the easy screen for your situation)
+  $0 --yes COMMAND           (accept suggested answers; never trusts a changed script)
 
 FIRST RUN, IN ORDER
   check, deps, attest-init, self-sign, pins refresh, build-ipxe (or import-ipxe),
@@ -3638,6 +4307,9 @@ COMMANDS
   heal                  Fix safe problems automatically (stale locks, leftovers, address change)
   doctor                Same report as status, with the exact fix command for each problem
   verify [deep]         Re-check served files now (deep = full re-hash of everything)
+  easy                  The zero-argument screen (same as running with no arguments)
+  menu                  Full menu of every step
+  shortcut              Create the one-tap Termux:Widget "Boot-a-PC" shortcut
   guide                 Step-by-step guided setup (best for first time)
   ui, interactive       Menu of every step (no arguments does this too)
   backup-setup          Guided setup of Google One / Terabox cloud backups
@@ -3658,6 +4330,12 @@ COMMANDS
   build-ipxe            Build iPXE at IPXE_COMMIT with the boot CA and a
                         verify-first script embedded
   import-ipxe DIR       Use iPXE binaries built on another machine
+  ipxe-phone            Build the x86_64 loader ON THIS PHONE (sets up a small compiler first)
+  proot-build           Inside a proot Linux on the phone: build the loader for your Termux install
+  xbuild-setup          Only set up that on-phone compiler (Debian via proot-distro)
+  ipxe-cloud            Build the loader on GitHub instead (WEAKER trust; asks first)
+  ipxe-request          Print what to paste into the GitHub build page
+  ipxe-fetch [new]      Download, verify, pin, and install the GitHub-built loader (new = replace the pinned one)
   fetch                 Download the ISO and verify it against the vendor key
   extract               Pull kernel, initrd, root image (and microcode) from the ISO
   configure             Sign boot files, write boot.ipxe, dnsmasq.conf, and the manifest
@@ -3757,6 +4435,7 @@ parse_args() {
     case "$1" in
       -h|--help)  usage; exit 0 ;;
       --dry-run)  DRY_RUN=1 ;;
+      -y|--yes)   ASSUME_YES=1 ;;
       --distro)   [[ $# -ge 2 ]] || die "--distro requires a value"; DISTRO="$2"; CLI_SET+=" DISTRO"; shift ;;
       --distro=*) DISTRO="${1#*=}"; CLI_SET+=" DISTRO" ;;
       --arch)     [[ $# -ge 2 ]] || die "--arch requires a value"; TARGET_ARCH="$2"; CLI_SET+=" TARGET_ARCH"; shift ;;
@@ -3781,17 +4460,20 @@ case "$COMMAND" in
   *) guard_root; log_rotate ;;
 esac
 case "$COMMAND" in
-  deps|attest-init|self-sign|pins|build-ipxe|import-ipxe|fetch|extract|configure|attest|serve|clean|backup|restore|terabox-install|all)
+  deps|attest-init|self-sign|pins|build-ipxe|ipxe-phone|xbuild-setup|import-ipxe|proot-build|fetch|extract|configure|attest|serve|clean|backup|restore|terabox-install|all)
     acquire_lock ;;
 esac
 
 case "$COMMAND" in
-  help|attest-init|self-sign|fingerprints|deps|release-stamp|verify-upstream|status|doctor) ;;
+  help|attest-init|self-sign|fingerprints|deps|release-stamp|verify-upstream|status|doctor|shortcut) ;;
+  ui|easy|guide|guided|go) self_check_soft ;;
   *) self_check ;;
 esac
 
 case "$COMMAND" in
-  ui|interactive) interactive ;;
+  ui|easy)       easy_home ;;
+  menu|interactive) interactive ;;
+  shortcut)      shortcut_cmd ;;
   guide|guided)   guided ;;
   go)             acquire_lock; go_cmd ;;
   status)         status || exit 1 ;;
@@ -3816,6 +4498,12 @@ case "$COMMAND" in
     esac ;;
   build-ipxe)     build_ipxe ;;
   import-ipxe)    import_ipxe "${POSITIONAL[0]:-}" ;;
+  ipxe-phone)     ipxe_phone ;;
+  proot-build)    proot_build_flow ;;
+  xbuild-setup)   xbox_setup ;;
+  ipxe-request)   ipxe_request ;;
+  ipxe-fetch)     ipxe_fetch "${POSITIONAL[0]:-}" ;;
+  ipxe-cloud)     ipxe_cloud ;;
   fetch)          fetch ;;
   extract)        extract ;;
   configure)      configure ;;
@@ -3840,5 +4528,11 @@ case "$COMMAND" in
     configure
     attest_report
     serve ;;
-  *) usage; die "Unknown command: $COMMAND" ;;
+  *)
+    known_cmds="go status heal doctor guide easy menu check deps fetch extract configure serve backup restore shortcut verify clean logs"
+    sugg=$( { compgen -W "$known_cmds" -- "${COMMAND:0:2}" || compgen -W "$known_cmds" -- "${COMMAND:0:1}" || true; } | tr '\n' ' ')
+    err "Unknown command: $COMMAND"
+    say "Did you mean: ${sugg:-go, status, heal, guide}"
+    say "Start here: run  $0  with no arguments, and press Enter."
+    exit "$E_USAGE" ;;
 esac
