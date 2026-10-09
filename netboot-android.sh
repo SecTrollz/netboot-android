@@ -134,6 +134,7 @@ ACCEPT_SCRIPT_CHANGE="${ACCEPT_SCRIPT_CHANGE:-0}"
 CT_BOOTSTRAP="${CT_BOOTSTRAP:-0}"
 UPSTREAM_REPO="${UPSTREAM_REPO:-$DEFAULT_UPSTREAM_REPO}"
 UPSTREAM_BRANCH="${UPSTREAM_BRANCH:-main}"
+XBOX_NAME="${XBOX_NAME:-debian}"          # proot-distro container used to cross-compile on a phone
 GITHUB_API_BASE="${GITHUB_API_BASE:-https://api.github.com}"
 IPXE_CURL_OPTS="${IPXE_CURL_OPTS---proto =https --tlsv1.2}"   # tests may set this empty to talk to a local server
 EXPECT_CODE="${EXPECT_CODE:-}"
@@ -1718,6 +1719,44 @@ check_ca_embedded() {
   fi
 }
 
+# =============================================================================
+# On-phone cross-compiler: a small Debian environment (proot-distro) holds an
+# x86_64 compiler that runs on the phone's arm64 CPU. Everything stays on this
+# device. The guest can only see the iPXE source folder, never your keys.
+# =============================================================================
+xbox_exec() {   # xbox_exec BINDDIR command args...
+  local bind=$1; shift
+  proot-distro login "$XBOX_NAME" --shared-tmp --bind "$bind:$bind" -- "$@"
+}
+
+xbox_ready() {
+  command -v proot-distro >/dev/null 2>&1 || return 1
+  mkdir -p "$SRC_DIR"
+  xbox_exec "$SRC_DIR" x86_64-linux-gnu-gcc -dumpmachine 2>/dev/null | grep -q '^x86_64-linux-gnu'
+}
+
+xbox_setup() {
+  (( IS_TERMUX )) || die "$E_ENV" "This helper is for Termux on a phone. On a normal Linux computer just run: $0 build-ipxe"
+  [[ $TARGET_ARCH == x86_64 ]] || die "$E_USAGE" "The on-phone compiler is for x86_64 PCs. An arm64 PC can be built natively on this phone."
+  info "Setting up a small Debian environment with an x86_64 compiler (about 600 MB, 5-15 minutes)"
+  command -v proot-distro >/dev/null 2>&1 || pkg install -y proot-distro || die "$E_ENV" "Could not install proot-distro. Try: pkg install proot-distro"
+  if ! proot-distro login "$XBOX_NAME" -- true >/dev/null 2>&1; then
+    proot-distro install "$XBOX_NAME" || die "$E_NET" "Could not download the Debian environment. Check your internet and run this again; it resumes."
+  fi
+  mkdir -p "$SRC_DIR"
+  xbox_exec "$SRC_DIR" bash -c '
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update &&
+    apt-get install -y --no-install-recommends build-essential make perl git liblzma-dev binutils-x86-64-linux-gnu &&
+    { apt-get install -y --no-install-recommends gcc-x86-64-linux-gnu ||
+      { v=$(apt-cache search --names-only "^gcc-[0-9]+-x86-64-linux-gnu$" | sort -V | tail -n1 | cut -d" " -f1) &&
+        [ -n "$v" ] && apt-get install -y --no-install-recommends "$v" &&
+        ln -sf "x86_64-linux-gnu-gcc-${v#gcc-}" /usr/local/bin/x86_64-linux-gnu-gcc; }; }
+  ' || die "$E_ENV" "Installing the compiler inside the Debian environment failed. Run the same command again."
+  xbox_ready || die "$E_ENV" "The Debian environment is installed but the x86_64 compiler does not answer. Run: $0 ipxe-phone"
+  ok "The on-phone x86_64 compiler is ready"
+}
+
 build_ipxe() {
   need git; need make; need perl
   [[ -n $PYTHON ]] || die "python3 is required. Run: $0 deps"
@@ -1733,8 +1772,19 @@ build_ipxe() {
   case "$HOST_ARCH:$TARGET_ARCH" in
     x86_64:x86_64|aarch64:arm64|arm64:arm64) native=1 ;;
   esac
+  local xin="" ca_use="" embed_use=""
+  local -a runner=()
   if (( ! native )) && [[ -z $IPXE_CROSS ]]; then
-    die "$E_ENV" "This device is $HOST_ARCH and the target is $TARGET_ARCH, so it cannot compile the loader. Build it on a $TARGET_ARCH Linux computer you control and copy it back with: $0 import-ipxe DIR (the guide shows the steps). A weaker-trust cloud route exists: $0 ipxe-cloud"
+    if (( IS_TERMUX )) && [[ $TARGET_ARCH == x86_64 ]] && xbox_ready; then
+      IPXE_CROSS=x86_64-linux-gnu-
+      xin="$SRC_DIR/xin"
+      runner=(xbox_exec "$SRC_DIR")
+      info "Cross-compiling for $TARGET_ARCH inside the on-phone Debian environment (everything stays on this device)"
+    elif (( IS_TERMUX )) && [[ $TARGET_ARCH == x86_64 ]]; then
+      die "$E_ENV" "This phone is $HOST_ARCH and the PC is $TARGET_ARCH. Set up the on-phone compiler once with: $0 ipxe-phone"
+    else
+      die "$E_ENV" "This device is $HOST_ARCH and the target is $TARGET_ARCH, so it cannot compile the loader. Build it on a $TARGET_ARCH Linux computer you control and copy it back with: $0 import-ipxe DIR (the guide shows the steps)."
+    fi
   fi
 
   git_pin_opts
@@ -1766,7 +1816,12 @@ build_ipxe() {
   local -a mopts=()
   if [[ $VERIFIED_BOOT == 1 ]]; then
     write_embed_script "$embed" "$fb"
-    mopts=(TRUST="$ca" EMBED="$embed")
+    ca_use=$ca; embed_use=$embed
+    if [[ -n $xin ]]; then   # the guest sees only $SRC_DIR, so stage the two public inputs there
+      mkdir -p "$xin"; cp -f "$ca" "$xin/ca.crt"; cp -f "$embed" "$xin/embed.ipxe"
+      ca_use="$xin/ca.crt"; embed_use="$xin/embed.ipxe"
+    fi
+    mopts=(TRUST="$ca_use" EMBED="$embed_use")
     info "Embedded script fallback server: ${fb:-none (uses DHCP next-server)}"
   fi
   [[ -n $IPXE_CROSS ]] && mopts+=(CROSS="$IPXE_CROSS")
@@ -1784,9 +1839,9 @@ build_ipxe() {
   fi
 
   info "Building ${targets[*]} (several minutes)"
-  make -C "$src/src" clean >/dev/null 2>&1 || true
-  make -C "$src/src" -j"$(nproc_n)" "${mopts[@]}" "${targets[@]}" \
-    || die "iPXE build failed. On Termux, clang builds are not guaranteed. Building on a Linux PC with gcc is the reliable route."
+  "${runner[@]+"${runner[@]}"}" make -C "$src/src" clean >/dev/null 2>&1 || true
+  "${runner[@]+"${runner[@]}"}" make -C "$src/src" -j"$(nproc_n)" "${mopts[@]}" "${targets[@]}" \
+    || die "iPXE build failed. See the messages above. If you are on a phone, run: $0 ipxe-phone to repair the compiler setup, or import a loader built on a computer you control."
 
   mkdir -p "$TFTP"
   if [[ $TARGET_ARCH == x86_64 ]]; then
@@ -3302,7 +3357,7 @@ diagnose() {
   if [[ -s $TFTP/ipxe.efi && -f $IPXE_BUILT ]] && grep -q '^source=cloud' "$IPXE_BUILT"; then
     finding WARN LOADERTRUST "The iPXE loader was built by GitHub's cloud runner, not on a device you control" "$0 import-ipxe DIR"
   fi
-  [[ -s $TFTP/ipxe.efi ]] && finding OK IPXE "iPXE loader present" "" || finding FAIL IPXE "iPXE loader missing (build it on a computer you control, then import it)" "$0 build-ipxe"
+  [[ -s $TFTP/ipxe.efi ]] && finding OK IPXE "iPXE loader present" "" || finding FAIL IPXE "iPXE loader missing (this phone can build it itself)" "$([[ $HOST_ARCH == aarch64 && $TARGET_ARCH == x86_64 ]] && echo "$0 ipxe-phone" || echo "$0 build-ipxe")"
   iso_is_verified && finding OK ISO "$P_LABEL image verified" "" || finding FAIL ISO "$P_LABEL image not downloaded/verified" "$0 --distro $DISTRO --arch $TARGET_ARCH fetch"
   [[ -f $LAYOUT ]] && finding OK EXTRACT "Boot files extracted" "" || finding FAIL EXTRACT "Boot files not extracted" "$0 --distro $DISTRO --arch $TARGET_ARCH extract"
   if [[ -f $MANIFEST && -f $TFTP/boot.ipxe ]]; then
@@ -3647,18 +3702,31 @@ guided_ipxe() {
       *) warn "Skipped. configure will stop until iPXE is in place." ;;
     esac
   else
-    hint "This phone is $host_cpu but the PC is $TARGET_ARCH, so it cannot compile the loader itself."
-    hint "The loader decides what your PC will boot, so it should be built on a computer YOU control."
-    say "  1) Build it on a $TARGET_ARCH Linux computer I control, then import it  ${C_GREEN}recommended${C_RESET}"
-    say "  2) Build it in the cloud on GitHub  ${C_YELLOW}weaker trust, not recommended${C_RESET}"
-    say "  3) Skip for now"
-    read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Choose 1, 2 or 3 [1]: " c || c=""
+    hint "This phone is $host_cpu and the PC is $TARGET_ARCH. The phone can still build it itself using"
+    hint "a small x86_64 compiler in a Debian environment. Nothing leaves this device."
+    say "  1) Build it on this phone with the x86_64 compiler  ${C_GREEN}recommended, no other computer${C_RESET}"
+    say "  2) Build it on a $TARGET_ARCH Linux computer I control, then import it"
+    say "  3) Build it in the cloud on GitHub  ${C_YELLOW}weaker trust, not recommended${C_RESET}"
+    say "  4) Skip for now"
+    read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Choose 1-4 [1]: " c || c=""
     case "${c:-1}" in
-      1) ipxe_own_machine_help; guided_ipxe_import ;;
-      2) ipxe_cloud ;;
+      1) ipxe_phone ;;
+      2) ipxe_own_machine_help; guided_ipxe_import ;;
+      3) ipxe_cloud ;;
       *) warn "Skipped. configure will stop until iPXE is in place." ;;
     esac
   fi
+}
+
+ipxe_phone() {   # set up the compiler if needed, then build
+  if ! xbox_ready; then
+    say "First time only: this downloads a small Debian environment (about 600 MB) and an x86_64 compiler."
+    ask_yn "Set it up now?" y || { warn "Skipped."; return 0; }
+    ( xbox_setup ) || { warn "Setup did not finish. Run it again; it resumes."; return 1; }
+  fi
+  say "Building the loader on this phone. This is the slow part: about 20-45 minutes."
+  hint "Keep the screen on and Termux unrestricted; if it stops, run the same step again."
+  ( build_ipxe ) && ok "iPXE built on this phone" || warn "Build did not finish. Run it again from the menu."
 }
 
 ipxe_own_machine_help() {
@@ -4041,6 +4109,8 @@ COMMANDS
   build-ipxe            Build iPXE at IPXE_COMMIT with the boot CA and a
                         verify-first script embedded
   import-ipxe DIR       Use iPXE binaries built on another machine
+  ipxe-phone            Build the x86_64 loader ON THIS PHONE (sets up a small compiler first)
+  xbuild-setup          Only set up that on-phone compiler (Debian via proot-distro)
   ipxe-cloud            Build the loader on GitHub instead (WEAKER trust; asks first)
   ipxe-request          Print what to paste into the GitHub build page
   ipxe-fetch            Download, verify, and install the loader GitHub built for you
@@ -4168,7 +4238,7 @@ case "$COMMAND" in
   *) guard_root; log_rotate ;;
 esac
 case "$COMMAND" in
-  deps|attest-init|self-sign|pins|build-ipxe|import-ipxe|fetch|extract|configure|attest|serve|clean|backup|restore|terabox-install|all)
+  deps|attest-init|self-sign|pins|build-ipxe|ipxe-phone|xbuild-setup|import-ipxe|fetch|extract|configure|attest|serve|clean|backup|restore|terabox-install|all)
     acquire_lock ;;
 esac
 
@@ -4206,6 +4276,8 @@ case "$COMMAND" in
     esac ;;
   build-ipxe)     build_ipxe ;;
   import-ipxe)    import_ipxe "${POSITIONAL[0]:-}" ;;
+  ipxe-phone)     ipxe_phone ;;
+  xbuild-setup)   xbox_setup ;;
   ipxe-request)   ipxe_request ;;
   ipxe-fetch)     ipxe_fetch ;;
   ipxe-cloud)     ipxe_cloud ;;

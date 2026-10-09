@@ -563,8 +563,8 @@ test_ipxe_request_prints_public_cert_only() {
   assert "request has no private key" bash -c '! grep -q "PRIVATE KEY" <<<"$1"' _ "$dec"
 }
 
-test_cross_cpu_build_error_points_to_cloud() {
-  grep -q 'ipxe-cloud' <(sed -n "/^build_ipxe() {/,/^}/p" "$SCRIPT")
+test_cross_cpu_build_error_points_to_phone_build() {
+  sed -n "/^build_ipxe() {/,/^}/p" "$SCRIPT" | grep -q 'ipxe-phone'
 }
 
 test_workflow_file_is_present_and_safe() {
@@ -573,25 +573,6 @@ test_workflow_file_is_present_and_safe() {
   assert "inputs go through env (no script injection)" grep -q 'CA_B64: ${{ inputs.ca_pem_b64 }}' "$f"
   assert "rejects private keys" grep -q 'PRIVATE KEY' "$f"
   assert "does not echo inputs inside run blocks" bash -c '! grep -E "run:|^ +[a-z]" "$1" | grep -E "\\$\\{\\{ *inputs\\." | grep -v "CA_B64\|TARGET:" | grep -q .' _ "$f"
-}
-
-test_guide_recommends_own_machine_when_cpu_differs() {
-  cat > "$T/ip.sh" <<EOF
-export NETBOOT_SOURCE_ONLY=1
-source "$SCRIPT"
-TARGET_ARCH=arm64          # this machine is x86_64, so the CPUs differ
-set_distro
-g_done_ipxe() { return 1; }
-ipxe_cloud() { echo "CLOUD-RAN"; }
-ipxe_own_machine_help() { echo "OWN-MACHINE-HELP"; }
-guided_ipxe_import() { echo "IMPORT-ASKED"; }
-guided_ipxe
-EOF
-  python3 -I -c "$PTY_PY" "|" bash "$T/ip.sh" > "$T/pty.out" 2>&1
-  assert "labels the cloud route as weaker trust" grep -q "weaker trust, not recommended" "$T/pty.out"
-  assert "Enter picks the computer you control" grep -q "OWN-MACHINE-HELP" "$T/pty.out"
-  assert "then asks for the files" grep -q "IMPORT-ASKED" "$T/pty.out"
-  assert "cloud is not run by default" bash -c '! grep -q CLOUD-RAN "$1"' _ "$T/pty.out"
 }
 
 test_cloud_route_needs_an_informed_yes() {
@@ -614,6 +595,92 @@ test_cloud_loader_is_flagged_in_status() {
   diagnose
   hit=0; for i in "${!F_TAG[@]}"; do [[ ${F_TAG[$i]} == LOADERTRUST ]] && hit=1; done
   assert "an imported loader clears it" test $hit -eq 0
+}
+
+# ---- on-phone cross build (Termux + proot-distro Debian), simulated ----
+mk_phone_sim() {   # pretend: arm64 phone in Termux, PC is x86_64
+  src; mkroot
+  ( attest_init ) >/dev/null 2>&1 || skip "gpg/openssl not usable"
+  mkdir -p "$T/bin"
+  # stand-in proot-distro: logs the call, then runs the command after "--" natively
+  cat > "$T/bin/proot-distro" <<'EOS'
+#!/bin/bash
+echo "$*" >> "$PROOT_LOG"
+case "$1" in
+  login) shift; while [[ $# -gt 0 && $1 != -- ]]; do shift; done; shift; exec "$@" ;;
+  *) exit 0 ;;
+esac
+EOS
+  # stand-in compiler probe and make (records what it was asked to do)
+  printf '#!/bin/sh\necho x86_64-linux-gnu\n' > "$T/bin/x86_64-linux-gnu-gcc"
+  cat > "$T/bin/make" <<'EOS'
+#!/bin/bash
+echo "make $*" >> "$MAKE_LOG"
+dir=.; trust=""
+while [[ $# -gt 0 ]]; do case "$1" in -C) dir=$2; shift ;; TRUST=*) trust=${1#TRUST=} ;; esac; shift; done
+[[ $dir == . ]] && exit 0
+mkdir -p "$dir/bin-x86_64-efi" "$dir/bin"
+fp=$(openssl x509 -in "$trust" -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)
+{ printf 'MZ'; head -c 100 /dev/urandom; python3 -c "import sys;sys.stdout.buffer.write(bytes.fromhex('$fp'))"; } > "$dir/bin-x86_64-efi/ipxe.efi"
+head -c 300 /dev/urandom > "$dir/bin/undionly.kpxe"
+EOS
+  chmod +x "$T/bin/"*
+  export PROOT_LOG="$T/proot.log" MAKE_LOG="$T/make.log"; : > "$PROOT_LOG"; : > "$MAKE_LOG"
+  PATH="$T/bin:$PATH"
+  # a tiny local "iPXE" repo so the pinned clone step has something to fetch
+  git init -q "$T/ipxe-src" && git -C "$T/ipxe-src" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+  IPXE_REPO="$T/ipxe-src"; IPXE_COMMIT=$(git -C "$T/ipxe-src" rev-parse HEAD)
+  git_pin_opts() { GIT_PIN_OPTS=(); }
+  HOST_ARCH=aarch64; IS_TERMUX=1; TARGET_ARCH=x86_64; IPXE_CROSS=""; set_distro
+}
+
+test_phone_builds_x86_loader_through_the_debian_box() {
+  mk_phone_sim
+  ( build_ipxe ) >"$T/b.out" 2>&1; rc=$?
+  [[ $rc -eq 0 ]] || sed 's/^/    build said: /' "$T/b.out" | tail -12
+  assert "build succeeds" test $rc -eq 0
+  assert "loader installed" test -s "$TFTP/ipxe.efi"
+  assert "ran inside the Debian box" grep -q 'login debian' "$PROOT_LOG"
+  assert "cross prefix passed to make" grep -q 'CROSS=x86_64-linux-gnu-' "$MAKE_LOG"
+  assert "no host CC= override" bash -c '! grep -q " CC=" "$1"' _ "$MAKE_LOG"
+  assert "public inputs staged inside the source folder" grep -q "TRUST=$SRC_DIR/xin/ca.crt" "$MAKE_LOG"
+}
+
+test_debian_box_cannot_see_your_keys() {
+  mk_phone_sim
+  ( build_ipxe ) >"$T/b.out" 2>&1
+  assert "only the source folder is shared" grep -q -- "--bind $SRC_DIR:$SRC_DIR" "$PROOT_LOG"
+  assert "attestation folder is never shared" bash -c '! grep -q "$1" "$2"' _ "$ATTEST" "$PROOT_LOG"
+  assert "the whole data folder is never shared" bash -c '! grep -q -- "--bind $1:$1" "$2"' _ "$ROOT" "$PROOT_LOG"
+  assert "no private key was copied in" bash -c '! ls "$1"/xin | grep -qi key' _ "$SRC_DIR"
+}
+
+test_phone_without_box_is_told_the_one_command() {
+  src; mkroot
+  ( attest_init ) >/dev/null 2>&1 || skip "gpg/openssl not usable"
+  HOST_ARCH=aarch64; IS_TERMUX=1; TARGET_ARCH=x86_64; IPXE_CROSS=""; set_distro
+  PATH="$T/emptybin:/usr/bin:/bin"; mkdir -p "$T/emptybin"
+  git_pin_opts() { GIT_PIN_OPTS=(); }
+  ( build_ipxe ) >"$T/b.out" 2>&1; rc=$?
+  assert "refuses" test $rc -ne 0
+  assert "names ipxe-phone" grep -q 'ipxe-phone' "$T/b.out"
+}
+
+test_guide_recommends_phone_build_when_cpu_differs() {
+  cat > "$T/ip.sh" <<EOF
+export NETBOOT_SOURCE_ONLY=1
+source "$SCRIPT"
+TARGET_ARCH=arm64          # this machine is x86_64, so the CPUs differ
+set_distro
+g_done_ipxe() { return 1; }
+ipxe_phone() { echo "PHONE-BUILD-RAN"; }
+ipxe_cloud() { echo "CLOUD-RAN"; }
+guided_ipxe
+EOF
+  python3 -I -c "$PTY_PY" "|" bash "$T/ip.sh" > "$T/pty.out" 2>&1
+  assert "Enter picks the on-phone build" grep -q "PHONE-BUILD-RAN" "$T/pty.out"
+  assert "cloud still labelled weaker" grep -q "weaker trust, not recommended" "$T/pty.out"
+  assert "cloud not run by default" bash -c '! grep -q CLOUD-RAN "$1"' _ "$T/pty.out"
 }
 
 # ---------------------------------------------------------------- run

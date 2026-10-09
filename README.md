@@ -119,16 +119,21 @@ Run `./netboot-android.sh guide` (or choose **1, GUIDED SETUP** in `./netboot-an
 
 ---
 
-## Phone and PC have different CPUs?
+## Phone and PC have different CPUs? The phone builds the loader itself
 
-A phone is arm64 and most PCs are x86_64, so the phone cannot compile the network loader (iPXE) for the PC. The loader decides what your PC will boot, so it should be built on a computer **you** control. The guide walks you through it:
+A phone is arm64 and most PCs are x86_64. The network loader (iPXE) must be compiled for the PC's CPU, and it decides what your PC will boot, so it should be built on a device **you** control. A phone can do that with nothing else:
 
-1. Copy your **public** certificate (`~/netboot/attest/ca.crt`, nothing else from that folder) and this script to any x86_64 Linux computer.
-2. Run `./netboot-android.sh fingerprints` on both and compare the lines, so you know both copies of the script match.
-3. On the computer: `TRUST_CA=ca.crt ./netboot-android.sh --arch x86_64 build-ipxe`
-4. Copy `ipxe.efi` and `undionly.kpxe` back to the phone and run `./netboot-android.sh import-ipxe DIR`.
+```sh
+./netboot-android.sh ipxe-phone
+```
 
-**Weaker option: cloud build.** `./netboot-android.sh ipxe-cloud` has GitHub's servers compile the loader from a workflow file in your repo. It is convenient but it puts GitHub's runner, and anyone who can change that workflow, inside the trust chain, and this script cannot detect extra trust placed inside the binary. It is off by default, asks for an informed yes (`--yes` never opts in), refuses a loader that lacks your certificate, and `status` keeps warning until you replace it with one built on your own computer. If you never want it, delete `.github/workflows/build-ipxe.yml`.
+The first time it sets up a small Debian environment (Termux `proot-distro`, about 600 MB) containing an x86_64 cross-compiler that runs on your phone's arm64 CPU. Then it builds iPXE from the pinned source commit with your certificate inside. The build takes roughly 20 to 45 minutes. The guide offers this as the default.
+
+What is trusted: Debian's signed package repository for the compiler (the same kind of trust you place in any compiler on any PC), and the iPXE commit pinned by hash in the script. The Debian environment can only see the iPXE source folder: it never sees your keys. Only your **public** certificate is copied in.
+
+Other routes, if you prefer: build on an x86_64 Linux computer you control (copy `ca.crt` over, run `TRUST_CA=ca.crt ./netboot-android.sh --arch x86_64 build-ipxe`, copy the files back, `import-ipxe DIR`), or the weaker cloud route below.
+
+**Weaker option: cloud build.** `./netboot-android.sh ipxe-cloud` has GitHub's servers compile the loader from a workflow file in your repo. It puts GitHub's runner, and anyone who can change that workflow, inside the trust chain, and this script cannot detect extra trust placed inside the binary. It is off by default, asks for an informed yes (`--yes` never opts in), refuses a loader that lacks your certificate, and `status` keeps warning until you replace it. If you never want it, delete `.github/workflows/build-ipxe.yml`.
 
 ---
 
@@ -161,7 +166,7 @@ What it does for you while it runs:
 
 Honest limits: the fast check trusts a file's size, time, and inode for a few minutes until the background check finishes, so someone with root who forges those could briefly serve a changed root image (the kernel and initrd are signed and always fully checked). The root image is unsigned on the client for most distros; see the header of the script. Android features (root, `oom_score_adj`, Wi-Fi power mode) can only be proven on a real phone.
 
-Tests: `tests/run.sh` runs 46 checks (fault injection and the easy-mode screens) (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
+Tests: `tests/run.sh` runs 48 checks (fault injection and the easy-mode screens) (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
 
 ---
 
