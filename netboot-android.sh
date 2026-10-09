@@ -44,7 +44,7 @@
 set -euo pipefail
 umask 022
 
-SCRIPT_VERSION="2026.10.09-resilient"
+SCRIPT_VERSION="2026.10.09-easy"
 RELEASE_TIME=""   # upload time (UTC epoch) set by release-stamp; must equal the upstream commit time
 
 # =============================================================================
@@ -176,6 +176,7 @@ JID_POWER=""
 POWER_TWEAKED=0
 COMMAND=""
 DRY_RUN=0
+ASSUME_YES=0
 POSITIONAL=()
 SIG_SIGNER=""
 GIT_PIN_OPTS=()
@@ -1408,6 +1409,16 @@ self_status() {   # prints: unset | bad | changed | ok   (never dies)
   rm -f "$st"
   cur=$(sha256_of "$SELF"); rec=$(awk '{print $1}' "$ATTEST/script.sha256")
   if [[ $cur != "$rec" ]]; then echo changed; else echo ok; fi
+}
+
+self_check_soft() {   # for interactive entry points: a *changed* script can be re-signed on the spot
+  [[ $(self_status) != unset ]] || return 0   # first run: the guide sets this up, no scary warning
+  if [[ $(self_status) == changed ]] && { [[ -t 0 ]] || [[ $ASSUME_YES == 1 ]]; }; then
+    warn "This script was updated since you last signed it."
+    hint "If you just updated it yourself or pulled a new version, that is normal."
+    if ask_yn "Trust this version and re-sign it now?" n; then self_sign; return 0; fi
+  fi
+  self_check
 }
 
 self_check() {
@@ -2771,6 +2782,7 @@ serve() {
   dns_alive || die "$E_ENV" "dnsmasq exited. If it could not bind a port, check: $0 selinux status, and whether a hotspot or another DHCP/TFTP service holds ports 67/69."
   protect_pid "$(run_root "cat '$RUN/dnsmasq.pid'" 2>/dev/null || true)"
   ok "Ready. Boot the PC from the network now."
+  pc_instructions
   watchdog || true
   serve_epilogue
 }
@@ -3238,6 +3250,127 @@ go_cmd() {
 }
 
 # =============================================================================
+# Easy mode: the zero-argument screen, one plain question, and a one-tap shortcut
+# =============================================================================
+pick_goal() {
+  local c=1
+  say "${C_BOLD}What do you want to do?${C_RESET}"
+  say "  1) Rescue or repair a PC          ${C_DIM}(SystemRescue: small and fast, about 4 GB of RAM)${C_RESET}"
+  say "  2) Try a full desktop             ${C_DIM}(Ubuntu: about 10 GB of RAM)${C_RESET}"
+  say "  3) Something else                 ${C_DIM}(shows the full list)${C_RESET}"
+  if [[ $ASSUME_YES != 1 ]]; then
+    read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Choose 1, 2 or 3 [1]: " c || c=1
+  fi
+  case "${c:-1}" in
+    2) DISTRO=ubuntu; TARGET_ARCH=x86_64 ;;
+    3) choose_target; choose_mode ;;
+    *) DISTRO=systemrescue; TARGET_ARCH=x86_64 ;;
+  esac
+  set_distro
+  save_profile
+  ok "OK: $P_LABEL"
+}
+
+pc_instructions() {
+  echo
+  box \
+    "NOW, ON THE PC YOU WANT TO BOOT:" \
+    "" \
+    "1. Plug it into the same network (or cable) as this phone." \
+    "2. Turn it on and tap the boot-menu key right away:" \
+    "     Dell F12   HP F9 or Esc   Lenovo F12 or Enter, then F12" \
+    "     Asus F8 or Esc   Acer F12   Microsoft Surface: hold Volume Down" \
+    "     (not sure? try F12, then Esc, then F2 to open settings)" \
+    "3. Pick: Network, PXE, or IPv4 Network Boot. UEFI is fine." \
+    "4. If it will not list network boot: in settings turn ON" \
+    "   network boot and turn OFF Secure Boot, then try again." \
+    "" \
+    "A good sign: text scrolls here when the PC asks for its files." \
+    "Stop the server with Ctrl+C when the PC has booted."
+  echo
+}
+
+shortcut_cmd() {
+  local dir="$HOME/.shortcuts" f
+  mkdir -p "$dir"
+  f="$dir/Boot-a-PC"
+  atomic_write "$f" <<EOF
+#!/usr/bin/env bash
+# Created by netboot-android.sh: one tap starts serving with your saved settings.
+exec "$SELF" --yes go
+EOF
+  chmod 700 "$f"
+  ok "Created the one-tap shortcut: $f"
+  say "To use it on Android:"
+  say "  1. Install the free app Termux:Widget (same place you got Termux)."
+  say "  2. Long-press your home screen > Widgets > Termux:Widget > add it."
+  say "  3. Tap 'Boot-a-PC' in that widget. That is it."
+  hint "Needs root already granted to Termux. It never starts by itself; you tap it."
+}
+
+# Picks the one screen that makes sense for the current state.
+easy_home() {
+  if [[ ! -t 0 || ! -t 1 ]]; then interactive; return; fi
+  local i key setup_bad=0 note="" fixcmd=""
+  load_profile && set_distro || true
+  clear 2>/dev/null || true
+  banner
+  if [[ ! -r $PROFILE && -z $(attest_fpr) ]]; then
+    box \
+      "FIRST TIME HERE? I'll set everything up for you." \
+      "" \
+      "It takes about 20-40 minutes, mostly downloading." \
+      "You only answer a couple of simple questions." \
+      "Nothing is deleted. Type q at any question to stop."
+    echo
+    ask_yn "Start now?" y || { info "OK. Run me again whenever you are ready."; return 0; }
+    echo
+    pick_goal
+    GUIDE_WELCOMED=1 guided
+    return 0
+  fi
+  diagnose
+  for i in "${!F_LVL[@]}"; do
+    [[ ${F_LVL[$i]} == FAIL ]] || continue
+    case "${F_TAG[$i]}" in
+      ATTEST|IPXE|ISO|EXTRACT|CONFIG) setup_bad=1; note=${note:-${F_MSG[$i]}} ;;
+      SELF) note=${F_MSG[$i]}; fixcmd=self ;;
+      *) note=${note:-${F_MSG[$i]}}; fixcmd=${fixcmd:-heal} ;;
+    esac
+  done
+  if (( setup_bad )); then
+    box "SETUP ISN'T FINISHED" "" "$note"
+    echo
+    ask_yn "Continue the guided setup (it skips what is already done)?" y && guided
+    return 0
+  fi
+  if [[ $fixcmd == self ]]; then
+    self_check_soft || true
+    return 0
+  fi
+  if [[ -n $fixcmd ]]; then
+    box "ONE THING NEEDS ATTENTION" "" "$note"
+    echo
+    if ask_yn "Try to fix it automatically?" y; then heal || true; fi
+    return 0
+  fi
+  heal_safe >/dev/null 2>&1 || true
+  box \
+    "READY.  $P_LABEL" \
+    "" \
+    "Enter = boot a PC now      m = full menu" \
+    "s = status                 q = quit"
+  echo
+  read -r -p "${C_BOLD}${C_BLUE}>${C_RESET} " key || key=q
+  case "${key,,}" in
+    "")  with_lock go_cmd ;;
+    m)   interactive ;;
+    s)   status || true ;;
+    *)   info "Bye." ;;
+  esac
+}
+
+# =============================================================================
 # Guided mode: walks through everything, one plain step at a time
 # =============================================================================
 GSTEP=0; GTOTAL=13
@@ -3249,6 +3382,9 @@ hint() { printf '%s    %s%s\n' "$C_DIM" "$*" "$C_RESET"; }
 ask_yn() {
   local q=$1 d=${2:-y} a h="[y/N]"
   [[ $d == y ]] && h="[Y/n]"
+  if [[ $ASSUME_YES == 1 ]]; then   # --yes takes the suggested answer; it never overrides a "no" default
+    printf '%s %s %s\n' "$q" "$h" "(--yes: ${d})"; [[ $d == y ]]; return
+  fi
   while true; do
     read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} $q $h " a || { echo; a=""; }
     a=${a,,}
@@ -3301,7 +3437,7 @@ guided_ipxe() {
   local host_cpu want c dir
   gstep_head "Get the network-boot loader (iPXE)" \
     "iPXE is the tiny program the PC runs first. It is built with YOUR key inside," \
-    "so it only boots files you signed."
+    "so it only boots files you signed. Building takes 10-30 minutes on a phone."
   if g_done_ipxe; then ok "Already done."; ask_yn "Do it again anyway?" n || return 0; fi
   host_cpu=$(uname -m); [[ $host_cpu == aarch64 ]] && host_cpu=arm64
   if [[ $host_cpu == "$TARGET_ARCH" ]]; then want=1
@@ -3427,39 +3563,46 @@ offsite_wizard() {
 }
 
 guided() {
-  [[ -t 0 ]] || die "Guided mode needs a terminal. Run it directly in Termux or a shell."
-  clear 2>/dev/null || true
-  printf '\n'
-  box \
-    "WELCOME. I will walk you through, one small step at a time." \
-    "" \
-    "- Every step says what it does, in plain words." \
-    "- Press Enter to accept the suggested answer (shown in capitals)." \
-    "- Type q at any question to stop safely." \
-    "- Nothing is deleted. A backup of your working folder is taken" \
-    "  before the server starts."
-  say ""
-  ask_yn "Ready to begin?" y || { info "OK. Come back any time."; return 0; }
+  [[ -t 0 || $ASSUME_YES == 1 ]] || die "Guided mode needs a terminal. Run it directly in Termux or a shell."
+  if [[ ${GUIDE_WELCOMED:-0} != 1 ]]; then
+    clear 2>/dev/null || true
+    printf '\n'
+    box \
+      "WELCOME. I will walk you through, one small step at a time." \
+      "" \
+      "- Every step says what it does, in plain words." \
+      "- Press Enter to accept the suggested answer (shown in capitals)." \
+      "- Type q at any question to stop safely." \
+      "- Nothing is deleted. A backup of your working folder is taken" \
+      "  before the server starts."
+    say ""
+    ask_yn "Ready to begin?" y || { info "OK. Come back any time."; return 0; }
+  fi
 
-  gstep_head "Choose what to boot and how it connects" \
-    "Now: $P_LABEL on a $TARGET_ARCH PC, network mode '$DHCP_MODE'."
-  if ask_yn "Change that?" n; then choose_target; choose_mode; set_distro; fi
+  load_profile && set_distro || true
+  gstep_head "Choose what to boot" \
+    "Now: $P_LABEL on a $TARGET_ARCH PC."
+  if [[ -r $PROFILE ]]; then
+    if ask_yn "Change that?" n; then pick_goal; fi
+  else
+    pick_goal
+  fi
 
   guided_run "Check this device" \
-    "Looks for root, tools, free space and network. Safe: it only reads things." "" check
+    "Looks for root, tools, free space and network. Safe: it only reads things. (under a minute)" "" check
   guided_run "Install the tools needed" \
-    "Installs packages such as dnsmasq, python, gpg. Needs internet." "" deps
+    "Installs packages such as dnsmasq, python, gpg. Needs internet. (2-5 minutes)" "" deps
   guided_run "Create your private keys" \
     "Makes a signing key and a small certificate authority that live only on this device." g_done_attest attest_init
   guided_run "Sign this script" \
     "Records the script's fingerprint so any later tampering is noticed." g_done_sign self_sign
   guided_run "Check the download servers" \
-    "Confirms each vendor's server identity against public logs before trusting it." "" pins_refresh
+    "Confirms each vendor's server identity against public logs before trusting it. (about a minute)" "" pins_refresh
   guided_ipxe
   guided_run "Download and verify the Linux image" \
-    "Downloads $P_LABEL and checks the vendor's signature. Large download: use Wi-Fi." g_done_fetch fetch
+    "Downloads $P_LABEL and checks the vendor's signature. Large download, so use Wi-Fi. (10-40 minutes; safe to stop and resume)" g_done_fetch fetch
   guided_run "Unpack the boot files" \
-    "Pulls the kernel and files the PC needs out of the image." g_done_extract extract
+    "Pulls the kernel and files the PC needs out of the image. (1-5 minutes)" g_done_extract extract
   guided_run "Sign and prepare everything" \
     "Signs the boot files with your key and writes the server settings for your current network." "" configure
 
@@ -3623,10 +3766,18 @@ usage() {
 netboot-android.sh $SCRIPT_VERSION
 Verified PXE live boot of Linux ISOs from a rooted Android phone or any Linux host.
 
+START HERE
+  $0                         Run with no arguments and press Enter. It asks one simple
+                             question the first time, then sets everything up for you.
+  $0 go                      Already set up? Start serving a PC right now.
+  $0 status                  What is ready, and what needs attention.
+  $0 shortcut                Make a one-tap "Boot-a-PC" button (Termux:Widget).
+
 USAGE
   $0 [--distro NAME] [--arch ARCH] [--mode MODE] [--iface IF] COMMAND [args]
   $0 -h | --help
-  $0                         (no arguments starts the interactive menu)
+  $0                         (no arguments: the easy screen for your situation)
+  $0 --yes COMMAND           (accept suggested answers; never trusts a changed script)
 
 FIRST RUN, IN ORDER
   check, deps, attest-init, self-sign, pins refresh, build-ipxe (or import-ipxe),
@@ -3638,6 +3789,9 @@ COMMANDS
   heal                  Fix safe problems automatically (stale locks, leftovers, address change)
   doctor                Same report as status, with the exact fix command for each problem
   verify [deep]         Re-check served files now (deep = full re-hash of everything)
+  easy                  The zero-argument screen (same as running with no arguments)
+  menu                  Full menu of every step
+  shortcut              Create the one-tap Termux:Widget "Boot-a-PC" shortcut
   guide                 Step-by-step guided setup (best for first time)
   ui, interactive       Menu of every step (no arguments does this too)
   backup-setup          Guided setup of Google One / Terabox cloud backups
@@ -3757,6 +3911,7 @@ parse_args() {
     case "$1" in
       -h|--help)  usage; exit 0 ;;
       --dry-run)  DRY_RUN=1 ;;
+      -y|--yes)   ASSUME_YES=1 ;;
       --distro)   [[ $# -ge 2 ]] || die "--distro requires a value"; DISTRO="$2"; CLI_SET+=" DISTRO"; shift ;;
       --distro=*) DISTRO="${1#*=}"; CLI_SET+=" DISTRO" ;;
       --arch)     [[ $# -ge 2 ]] || die "--arch requires a value"; TARGET_ARCH="$2"; CLI_SET+=" TARGET_ARCH"; shift ;;
@@ -3786,12 +3941,15 @@ case "$COMMAND" in
 esac
 
 case "$COMMAND" in
-  help|attest-init|self-sign|fingerprints|deps|release-stamp|verify-upstream|status|doctor) ;;
+  help|attest-init|self-sign|fingerprints|deps|release-stamp|verify-upstream|status|doctor|shortcut) ;;
+  ui|easy|guide|guided|go) self_check_soft ;;
   *) self_check ;;
 esac
 
 case "$COMMAND" in
-  ui|interactive) interactive ;;
+  ui|easy)       easy_home ;;
+  menu|interactive) interactive ;;
+  shortcut)      shortcut_cmd ;;
   guide|guided)   guided ;;
   go)             acquire_lock; go_cmd ;;
   status)         status || exit 1 ;;
@@ -3840,5 +3998,11 @@ case "$COMMAND" in
     configure
     attest_report
     serve ;;
-  *) usage; die "Unknown command: $COMMAND" ;;
+  *)
+    known_cmds="go status heal doctor guide easy menu check deps fetch extract configure serve backup restore shortcut verify clean logs"
+    sugg=$( { compgen -W "$known_cmds" -- "${COMMAND:0:2}" || compgen -W "$known_cmds" -- "${COMMAND:0:1}" || true; } | tr '\n' ' ')
+    err "Unknown command: $COMMAND"
+    say "Did you mean: ${sugg:-go, status, heal, guide}"
+    say "Start here: run  $0  with no arguments, and press Enter."
+    exit "$E_USAGE" ;;
 esac

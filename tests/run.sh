@@ -288,6 +288,109 @@ test_error_hint_and_log() {
   assert "event logged" grep -q "exit code=50" "$NETBOOT_HOME/state/netboot.log"
 }
 
+# ---- easy mode (driven through a pseudo-terminal) ----
+PTY_PY=$(cat <<'PY'
+import os, pty, re, select, sys, time
+answers = sys.argv[1].split("|") if sys.argv[1] else []
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp(sys.argv[2], sys.argv[2:])
+out = b""; i = 0; end = time.time() + 40
+while time.time() < end:
+    r, _, _ = select.select([fd], [], [], 0.6)
+    if r:
+        try:
+            d = os.read(fd, 4096)
+        except OSError:
+            break
+        if not d:
+            break
+        out += d
+    elif i < len(answers):
+        os.write(fd, (answers[i] + "\n").encode()); i += 1
+    else:
+        break
+print(re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", out.decode(errors="replace")).replace("\r", ""))
+PY
+)
+
+pty_run() {   # pty_run "answer1|answer2|..." command args...   -> output in $T/pty.out
+  local answers=$1; shift
+  python3 -I -c "$PTY_PY" "$answers" "$@" > "$T/pty.out" 2>&1
+}
+
+test_easy_first_run_asks_one_question() {
+  pty_run "y|1|q" "$SCRIPT"
+  assert "welcome shown" grep -q "FIRST TIME HERE" "$T/pty.out"
+  assert "plain question shown" grep -q "What do you want to do?" "$T/pty.out"
+  assert "rescue offered" grep -q "SystemRescue" "$T/pty.out"
+  assert "no scary attestation warning" bash -c '! grep -q "Self-attestation is not set up" "$1"' _ "$T/pty.out"
+  assert "choice remembered" grep -q "DISTRO='systemrescue'" "$NETBOOT_HOME/state/profile"
+}
+
+test_easy_ready_enter_runs_go() {
+  cat > "$T/ready.sh" <<EOF
+export NETBOOT_SOURCE_ONLY=1
+source "$SCRIPT"
+set_distro
+mkdir -p "\$STATE"; echo "DISTRO='systemrescue'" > "\$PROFILE"
+diagnose() { F_LVL=(OK); F_TAG=(DISK); F_MSG=(fine); F_FIX=(""); }
+heal_safe() { :; }
+go_cmd() { echo "GO-RAN"; }
+easy_home
+EOF
+  pty_run "" bash "$T/ready.sh"
+  assert "ready screen" grep -q "READY" "$T/pty.out"
+  assert "waits instead of running" bash -c '! grep -q GO-RAN "$1"' _ "$T/pty.out"
+  pty_run "" bash "$T/ready.sh" >/dev/null
+  python3 -I -c "$PTY_PY" "|" bash "$T/ready.sh" > "$T/pty.out" 2>&1
+  assert "Enter starts go" grep -q "GO-RAN" "$T/pty.out"
+}
+
+mk_signed_copy() {   # a private copy of the script, signed, then edited so its hash differs
+  cp "$SCRIPT" "$T/nb.sh"; chmod +x "$T/nb.sh"
+  "$T/nb.sh" attest-init >/dev/null 2>&1 || skip "gpg/openssl not usable"
+  "$T/nb.sh" self-sign >/dev/null 2>&1 || exit 1
+  echo "# edited" >> "$T/nb.sh"
+}
+
+test_changed_script_offers_resign() {
+  mk_signed_copy
+  pty_run "n" "$T/nb.sh" go
+  assert "offers re-sign" grep -q "re-sign it now" "$T/pty.out"
+  assert "declined: still refuses" grep -q "changed since it was last self-signed" "$T/pty.out"
+  mk_signed_copy
+  pty_run "y|q" "$T/nb.sh" go
+  new=$(sha256sum "$T/nb.sh" | cut -d' ' -f1)
+  assert "yes re-signs the edited script" grep -q "^$new" "$NETBOOT_HOME/attest/script.sha256"
+}
+
+test_yes_never_trusts_changed_script() {
+  mk_signed_copy
+  old=$(cat "$NETBOOT_HOME/attest/script.sha256")
+  "$T/nb.sh" --yes go >/dev/null 2>&1 < /dev/null; rc=$?
+  assert "refuses with integrity code" test $rc -eq 30
+  assert "signature record unchanged" test "$(cat "$NETBOOT_HOME/attest/script.sha256")" = "$old"
+}
+
+test_shortcut_creates_executable() {
+  "$SCRIPT" shortcut >/dev/null 2>&1 || { echo "shortcut failed"; exit 1; }
+  assert "file exists and is executable" test -x "$HOME/.shortcuts/Boot-a-PC"
+  assert "runs go with --yes" grep -q -- '--yes go' "$HOME/.shortcuts/Boot-a-PC"
+}
+
+test_unknown_command_suggests() {
+  out=$("$SCRIPT" gx 2>&1); rc=$?
+  assert "usage exit code" test $rc -eq 2
+  assert "suggests go" grep -q "go" <<<"$out"
+  assert "points to start here" grep -q "no arguments" <<<"$out"
+}
+
+test_help_has_start_here() {
+  out=$("$SCRIPT" --help)
+  assert "start here block" grep -q "START HERE" <<<"$out"
+}
+
 # ---------------------------------------------------------------- run
 for t in $(declare -F | awk '{print $3}' | grep '^test_'); do run_test "$t"; done
 

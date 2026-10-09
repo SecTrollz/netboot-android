@@ -91,13 +91,31 @@ This is a file-level archive, not a Clonezilla or Shadow Copy block image. To im
 
 ---
 
-## Easiest way: let it hold your hand
+## Start here (the whole thing in three lines)
 
 ```sh
 ./netboot-android.sh
 ```
 
-Choose **1, GUIDED SETUP**. It goes one small step at a time, says in plain words what each step does, and asks before it does anything. Press Enter to accept the suggested answer, type `q` to stop safely at any question. Steps you already finished are noticed and offered as "do it again?" with the answer No. If a step fails, you get retry, skip, or quit instead of a crash. The guide also covers the optional Google One and Terabox cloud backups. Run just that part with `./netboot-android.sh backup-setup`, or the guide alone with `./netboot-android.sh guide`.
+1. Press **Enter**. The first time, it asks one plain question (rescue a PC, try Ubuntu, or something else) and then sets everything up, about 20 to 40 minutes, mostly downloading.
+2. Every time after that, the same command shows **READY**. Press **Enter** and boot your PC from the network. Press Ctrl+C when you are done.
+3. If something is wrong, it says so in plain words and offers to fix it. Press Enter to accept.
+
+When the server starts, a box tells you what to press on the PC (boot-menu keys for Dell, HP, Lenovo, Asus, Acer, and Surface, and what to turn on in firmware).
+
+**One tap on Android.** Run `./netboot-android.sh shortcut`, then add the free Termux:Widget app to your home screen. A **Boot-a-PC** button starts serving with your saved settings. It never starts by itself.
+
+`--yes` accepts the suggested answers for scripts. It will never trust a script that has changed since you signed it; only you can say yes to that.
+
+---
+
+## The guided setup, in detail
+
+```sh
+./netboot-android.sh
+```
+
+Run `./netboot-android.sh guide` (or choose **1, GUIDED SETUP** in `./netboot-android.sh menu`). It goes one small step at a time, says in plain words what each step does, and asks before it does anything. Press Enter to accept the suggested answer, type `q` to stop safely at any question. Steps you already finished are noticed and offered as "do it again?" with the answer No. If a step fails, you get retry, skip, or quit instead of a crash. The guide also covers the optional Google One and Terabox cloud backups. Run just that part with `./netboot-android.sh backup-setup`, or the guide alone with `./netboot-android.sh guide`.
 
 ---
 
@@ -130,7 +148,7 @@ What it does for you while it runs:
 
 Honest limits: the fast check trusts a file's size, time, and inode for a few minutes until the background check finishes, so someone with root who forges those could briefly serve a changed root image (the kernel and initrd are signed and always fully checked). The root image is unsigned on the client for most distros; see the header of the script. Android features (root, `oom_score_adj`, Wi-Fi power mode) can only be proven on a real phone.
 
-Tests: `tests/run.sh` runs 21 fault-injection checks (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
+Tests: `tests/run.sh` runs 28 checks (fault injection and the easy-mode screens) (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
 
 ---
 
