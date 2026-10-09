@@ -77,6 +77,16 @@ export BACKUP_GPG_PASSFILE=~/.nb-pass                     # archive passphrase
 
 The archive holds your signing keys, so it is AES256-encrypted first and never uploaded without the passphrase file. A failed upload only warns; the local backup stays. To restore from Terabox, fetch the `.gpg` file with `tbc get`, decrypt it with `gpg -d FILE.gpg > FILE`, and then run `restore FILE` after putting the matching `.sha256` next to it (or unpack it with `tar -xzf`). For any other uploader, set `BACKUP_UPLOAD_CMD` instead.
 
+**Offsite copy to Google One storage.** Google One storage is your Google Drive space, and rclone has an official Drive backend. Install rclone (`pkg install rclone` in Termux), run `rclone config` once and create a remote of type `drive` (pick the `drive.file` scope so it only sees files it creates), then:
+
+```sh
+export GDRIVE_REMOTE=gdrive:netboot-backups
+export BACKUP_GPG_PASSFILE=~/.nb-pass
+./netboot-android.sh serve        # backs up, encrypts, uploads
+```
+
+Terabox, Google Drive, and `BACKUP_UPLOAD_CMD` can all be on at once; each gets the same encrypted file. To restore, `rclone copy gdrive:netboot-backups/FILE.gpg .`, then `gpg -d`, as above. On a phone with no browser for rclone's login, run `rclone authorize drive` on another machine and paste the token.
+
 This is a file-level archive, not a Clonezilla or Shadow Copy block image. To image the whole phone or disk, do that separately. Editing the script changes its hash, so run `self-sign` again after pulling this change.
 
 ---

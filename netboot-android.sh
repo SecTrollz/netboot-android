@@ -135,6 +135,7 @@ TERABOX_DIR="${TERABOX_DIR:-/netboot-backups}" # remote folder on Terabox
 TBC_REPO="${TBC_REPO:-https://github.com/fcr--/tbc.git}"   # unofficial Terabox CLI (MIT, Go)
 TBC_COMMIT="${TBC_COMMIT:-4f1fb75d0defd5edfda9ae819873503af565055c}"
 TBC_BIN="${TBC_BIN:-}"
+GDRIVE_REMOTE="${GDRIVE_REMOTE:-}"        # rclone Drive remote and folder for Google One storage, e.g. gdrive:netboot-backups
 
 # User overrides, captured before presets so they always win
 U_ISO_URL="${ISO_URL:-}"
@@ -2034,10 +2035,22 @@ terabox_cmd() {
 # Optional offsite copy. The archive holds the attestation GPG key and CA key, so it
 # is encrypted first and nothing is uploaded without a passphrase file. A failure here
 # only warns: the verified local backup already exists.
+# Google One storage is Google Drive storage. Uses rclone's official Drive backend:
+# create a remote once with `rclone config` (type "drive", scope drive.file), then set
+# GDRIVE_REMOTE=NAME:folder, for example gdrive:netboot-backups.
+gdrive_cmd() {
+  [[ -n $GDRIVE_REMOTE ]] || return 1
+  command -v rclone >/dev/null 2>&1 || { warn "GDRIVE_REMOTE is set but rclone is not installed (Termux: pkg install rclone)"; return 1; }
+  printf 'rclone copy --retries 3 -- "$1" %q' "$GDRIVE_REMOTE"
+}
+
 backup_upload() {
-  local f=$1 enc="$1.gpg" cmd=$BACKUP_UPLOAD_CMD
-  [[ -n $cmd ]] || cmd=$(terabox_cmd || true)
-  [[ -n $cmd ]] || return 0
+  local f=$1 enc="$1.gpg" c
+  local -a labels=() cmds=()
+  if [[ -n $BACKUP_UPLOAD_CMD ]]; then labels+=("custom"); cmds+=("$BACKUP_UPLOAD_CMD \"\$1\""); fi
+  if c=$(terabox_cmd); then labels+=("Terabox"); cmds+=("$c \"\$1\""); fi
+  if c=$(gdrive_cmd); then labels+=("Google One (Drive)"); cmds+=("$c"); fi
+  (( ${#cmds[@]} )) || return 0
   if [[ -z $BACKUP_GPG_PASSFILE || ! -s $BACKUP_GPG_PASSFILE ]]; then
     warn "Offsite upload is configured but BACKUP_GPG_PASSFILE is missing or empty. Not uploading an unencrypted archive."
     return 0
@@ -2048,8 +2061,11 @@ backup_upload() {
          --symmetric --cipher-algo AES256 --output "$enc" "$f" ) >/dev/null 2>&1; then
     rm -f "$enc"; warn "Encryption failed. Offsite upload skipped."; return 0
   fi
-  info "Uploading $(basename "$enc") offsite"
-  if bash -c "$cmd \"\$1\"" _ "$enc"; then ok "Offsite upload done"; else warn "Offsite upload failed. Local backup is intact: $f"; fi
+  local i
+  for i in "${!cmds[@]}"; do
+    info "Uploading $(basename "$enc") to ${labels[$i]}"
+    if bash -c "${cmds[$i]}" _ "$enc"; then ok "${labels[$i]} upload done"; else warn "${labels[$i]} upload failed. Local backup is intact: $f"; fi
+  done
   rm -f "$enc"
 }
 
@@ -2565,6 +2581,7 @@ ENVIRONMENT VARIABLES
   BACKUP_GPG_PASSFILE   Passphrase file; the archive is AES256-encrypted before upload
   TERABOX_COOKIE_FILE   File with your Terabox ndus cookie (or export TERABOX_COOKIE)
   TERABOX_DIR           Remote Terabox folder                     (default: /netboot-backups)
+  GDRIVE_REMOTE         rclone Drive remote:folder for Google One storage (needs rclone)
   UPSTREAM_REPO         Repo for verify-upstream    (default: $DEFAULT_UPSTREAM_REPO)
   UPSTREAM_BRANCH       Branch for verify-upstream                (default: main)
   EXPECT_CODE           Release code you recorded; verify-upstream must match it
