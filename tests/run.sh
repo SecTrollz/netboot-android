@@ -425,6 +425,45 @@ test_guide_check_softens_only_fixable_failures() {
   check_soft >/dev/null 2>&1; assert "clean check passes" test $? -eq 0
 }
 
+# ---- regressions seen on a real phone ----
+test_lock_is_seen_alive_by_a_child_process() {
+  src; mkroot
+  acquire_lock
+  NETBOOT_SOURCE_ONLY=0 "$SCRIPT" backup >/dev/null 2>&1; rc=$?
+  assert "a second run is refused (exit 50), not treated as stale" test $rc -eq 50
+  assert "lock still there" test -d "$LOCK_DIR"
+}
+
+test_lock_survives_subshell_and_nested_use() {
+  src; mkroot
+  acquire_lock
+  ( with_lock true )
+  assert "subshell using with_lock does not free the parent's lock" test -d "$LOCK_DIR"
+  ( serve_like() { release_lock; }; serve_like )
+  assert "subshell release is a no-op for the parent's lock" test -d "$LOCK_DIR"
+  release_lock
+  assert "owner can release" test ! -d "$LOCK_DIR"
+  ( with_lock true )
+  assert "a lock taken only inside a subshell is freed again" test ! -d "$LOCK_DIR"
+}
+
+test_fix_commands_are_runnable_text() {
+  src; mkroot
+  diagnose
+  for f in "${F_FIX[@]}"; do
+    [[ $f == *"("* ]] && { echo "fix text has prose in parentheses: $f"; exit 1; }
+  done
+  exit 0
+}
+
+test_missing_tools_reported_first() {
+  src; mkroot
+  DNSMASQ=""; PYTHON=""
+  diagnose
+  hit=0; for i in "${!F_TAG[@]}"; do [[ ${F_TAG[$i]} == TOOLS && ${F_LVL[$i]} == FAIL ]] && hit=1; done
+  assert "TOOLS finding is a FAIL" test $hit -eq 1
+}
+
 # ---------------------------------------------------------------- run
 for t in $(declare -F | awk '{print $3}' | grep '^test_'); do run_test "$t"; done
 

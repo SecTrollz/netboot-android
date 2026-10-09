@@ -244,17 +244,20 @@ trap 'on_err $? $LINENO "$BASH_COMMAND"' ERR
 
 # ---- lock: one mutating command at a time; stale locks (dead owner) clear themselves
 LOCK_DIR="$STATE/lock.d"
-LOCK_HELD=""
 proc_start() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'; }
 lock_owner_alive() {
   local pid st
   read -r pid st < "$LOCK_DIR/owner" 2>/dev/null || return 1
   [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null && [[ $(proc_start "$pid") == "$st" ]]
 }
+# Ownership is the whole process tree ($$ is the same in every subshell). Only the shell
+# that took the lock (LOCK_AT) removes it, so a subshell finishing never frees its parent's lock.
+LOCK_TREE=""
+LOCK_AT=""
 acquire_lock() {
-  [[ $LOCK_HELD == "$BASHPID" ]] && return 0
+  [[ $LOCK_TREE == "$$" ]] && return 0
   mkdir -p "$STATE"
-  local tries=0 age
+  local tries=0 age me=$BASHPID
   while ! mkdir "$LOCK_DIR" 2>/dev/null; do
     if [[ -f $LOCK_DIR/owner ]]; then
       if ! lock_owner_alive; then warn "Clearing a stale lock left by a run that died."; rm -rf "$LOCK_DIR"; continue; fi
@@ -267,15 +270,21 @@ acquire_lock() {
     fi
     sleep 1
   done
-  printf '%s %s\n' "$BASHPID" "$(proc_start "$BASHPID")" > "$LOCK_DIR/owner"
-  LOCK_HELD=$BASHPID
+  printf '%s %s\n' "$$" "$(proc_start "$$")" > "$LOCK_DIR/owner"
+  LOCK_TREE=$$; LOCK_AT=$me
   trap release_lock EXIT
 }
 release_lock() {
-  if [[ $LOCK_HELD == "${BASHPID:-x}" ]]; then rm -rf "$LOCK_DIR"; fi
-  LOCK_HELD=""
+  if [[ $LOCK_TREE == "$$" && $LOCK_AT == "$BASHPID" ]]; then rm -rf "$LOCK_DIR"; LOCK_TREE=""; LOCK_AT=""; fi
 }
-with_lock() { acquire_lock; local rc=0; "$@" || rc=$?; release_lock; return "$rc"; }
+with_lock() {
+  local mine=1 rc=0
+  [[ $LOCK_TREE == "$$" ]] && mine=0
+  acquire_lock
+  "$@" || rc=$?
+  (( mine )) && release_lock
+  return "$rc"
+}
 
 # ---- refuse to operate on dangerous locations (we rm -rf and chown -R under ROOT)
 guard_root() {
@@ -3097,7 +3106,7 @@ orphans_running() {
 
 diagnose() {
   F_LVL=(); F_TAG=(); F_MSG=(); F_FIX=()
-  local other=0 cfg_ip cur n avail ft ma last age st f
+  local other=0 cfg_ip cur n avail ft ma last age st f missing t
   # lock
   if [[ -f $LOCK_DIR/owner ]] && lock_owner_alive; then
     read -r n _ < "$LOCK_DIR/owner"
@@ -3129,6 +3138,13 @@ diagnose() {
   ma=$(mem_avail_mb)
   if (( ma > 0 && ma < 300 )); then finding WARN MEM "Only $ma MB of RAM free: close other apps so Android keeps the servers alive" ""
   elif (( ma > 0 )); then finding OK MEM "Memory: $ma MB free"; fi
+  # required programs (installed by the "deps" step)
+  missing=""
+  for t in curl gpg openssl bsdtar; do command -v "$t" >/dev/null 2>&1 || missing+="$t "; done
+  [[ -n ${DNSMASQ:-} && -x ${DNSMASQ:-} ]] || missing+="dnsmasq "
+  [[ -n ${PYTHON:-} ]] || missing+="python3 "
+  if [[ -n $missing ]]; then finding FAIL TOOLS "Missing programs: ${missing% }. Setup installs them" "$0 deps"
+  else finding OK TOOLS "Required programs are installed" ""; fi
   # trust chain
   if [[ -z $(attest_fpr) ]]; then
     last=$(ls -1t "$BACKUP_DIR"/netboot-*.tar.gz 2>/dev/null | head -n1 || true)
@@ -3143,7 +3159,7 @@ diagnose() {
       bad)     finding FAIL SELF "Signed script record failed verification (possible tampering)" "$0 fingerprints" ;;
     esac
   fi
-  [[ -s $TFTP/ipxe.efi ]] && finding OK IPXE "iPXE loader present" "" || finding FAIL IPXE "iPXE loader missing" "$0 build-ipxe   (or import-ipxe DIR)"
+  [[ -s $TFTP/ipxe.efi ]] && finding OK IPXE "iPXE loader present" "" || finding FAIL IPXE "iPXE loader missing (build it here, or import one built elsewhere)" "$0 build-ipxe"
   iso_is_verified && finding OK ISO "$P_LABEL image verified" "" || finding FAIL ISO "$P_LABEL image not downloaded/verified" "$0 --distro $DISTRO --arch $TARGET_ARCH fetch"
   [[ -f $LAYOUT ]] && finding OK EXTRACT "Boot files extracted" "" || finding FAIL EXTRACT "Boot files not extracted" "$0 --distro $DISTRO --arch $TARGET_ARCH extract"
   if [[ -f $MANIFEST && -f $TFTP/boot.ipxe ]]; then
@@ -3233,11 +3249,14 @@ heal() {
   fi
   print_findings
   verdict || {
-    if [[ -t 0 ]]; then
-      for i in "${!F_LVL[@]}"; do
-        [[ ${F_LVL[$i]} == FAIL && -n ${F_FIX[$i]} && ${F_FIX[$i]} == "$0 "* ]] || continue
-        ask_yn "Run now: ${F_FIX[$i]#"$0 "}?" n && { ( with_lock bash -c "${F_FIX[$i]}" ) || warn "That did not finish."; }
-      done
+    local setup_bad=0
+    for i in "${!F_LVL[@]}"; do
+      [[ ${F_LVL[$i]} == FAIL ]] || continue
+      case "${F_TAG[$i]}" in TOOLS|ATTEST|IPXE|ISO|EXTRACT|CONFIG) setup_bad=1 ;; esac
+    done
+    if (( setup_bad )) && [[ -t 0 ]]; then
+      say "The missing pieces are setup steps. The guide does them in the right order and skips what is done."
+      ask_yn "Run the guided setup now?" y && GUIDE_WELCOMED=1 guided
     fi
     return 1
   }
@@ -3345,7 +3364,7 @@ easy_home() {
   for i in "${!F_LVL[@]}"; do
     [[ ${F_LVL[$i]} == FAIL ]] || continue
     case "${F_TAG[$i]}" in
-      ATTEST|IPXE|ISO|EXTRACT|CONFIG) setup_bad=1; note=${note:-${F_MSG[$i]}} ;;
+      TOOLS|ATTEST|IPXE|ISO|EXTRACT|CONFIG) setup_bad=1; note=${note:-${F_MSG[$i]}} ;;
       SELF) note=${F_MSG[$i]}; fixcmd=self ;;
       *) note=${note:-${F_MSG[$i]}}; fixcmd=${fixcmd:-heal} ;;
     esac
