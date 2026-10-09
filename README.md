@@ -119,6 +119,14 @@ Run `./netboot-android.sh guide` (or choose **1, GUIDED SETUP** in `./netboot-an
 
 ---
 
+## Running inside a "Linux on your phone" (proot)? Read this
+
+If your prompt shows a Linux such as Ubuntu or Debian started with `proot-distro`, that environment **cannot serve a PC**: it cannot see the phone's Wi-Fi and cannot open the DHCP/TFTP ports. Serve from **Termux itself** (rooted). The script detects this and says so.
+
+A proot Linux is, however, a good place to **build the loader**, because `apt` can install an x86_64 cross-compiler there. Run `./netboot-android.sh proot-build` inside it and follow the on-screen steps: copy only your **public** `ca.crt` from Termux into the proot, build, then copy `ipxe.efi` and `undionly.kpxe` back and run `import-ipxe`. Do not use keys created inside the proot: the loader must contain the certificate of the install that serves.
+
+---
+
 ## Phone and PC have different CPUs? One safe GitHub build, then pinned
 
 A phone is arm64 and most PCs are x86_64. The network loader (iPXE) must be compiled for the PC's CPU, and it decides what your PC will boot. The guide's default for a phone is a **one-time build on GitHub that the script then pins forever**:
@@ -172,7 +180,7 @@ What it does for you while it runs:
 
 Honest limits: the fast check trusts a file's size, time, and inode for a few minutes until the background check finishes, so someone with root who forges those could briefly serve a changed root image (the kernel and initrd are signed and always fully checked). The root image is unsigned on the client for most distros; see the header of the script. Android features (root, `oom_score_adj`, Wi-Fi power mode) can only be proven on a real phone.
 
-Tests: `tests/run.sh` runs 57 checks (fault injection and the easy-mode screens) (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
+Tests: `tests/run.sh` runs 62 checks (fault injection and the easy-mode screens) (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
 
 ---
 

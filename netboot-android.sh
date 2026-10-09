@@ -51,6 +51,8 @@ RELEASE_TIME=""   # upload time (UTC epoch) set by release-stamp; must equal the
 # Platform detection
 # =============================================================================
 IS_TERMUX=0; [[ ${PREFIX:-} == *com.termux* ]] && IS_TERMUX=1
+IS_PROOT=0
+if [[ -n ${PROOT_TMP_DIR:-}${PROOT_L2S_DIR:-} ]] || grep -q '^TracerPid:[[:space:]]*[1-9]' /proc/self/status 2>/dev/null; then IS_PROOT=1; fi
 IS_ANDROID=0; [[ -e /system/build.prop || -n ${ANDROID_ROOT:-} ]] && IS_ANDROID=1
 HOST_ARCH=$(uname -m)
 SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
@@ -66,6 +68,9 @@ find_bin() {
 
 DNSMASQ="${DNSMASQ:-$(find_bin dnsmasq || true)}"
 PYTHON="${PYTHON:-$(find_bin python3 || find_bin python || true)}"
+
+# Is an x86_64 cross-compiler installed on this (arm64) system? Kept as a function so tests can stub it.
+have_cross_gcc() { command -v x86_64-linux-gnu-gcc >/dev/null 2>&1; }
 
 # Programs the whole flow needs. Prints the missing ones, space separated.
 missing_tools() {
@@ -187,6 +192,7 @@ U_MIN_FREE_MB="${MIN_FREE_MB:-}"
 
 # Runtime state
 SERVE_HTTP_PID=""
+TAIL_PID=""
 DNS_LOG=""
 DIRECT_ADDED=0
 JID_DIRECT=""
@@ -354,7 +360,7 @@ journal_replay() {   # newest first; entries that succeed are removed
   while IFS= read -r f; do
     cmd=$(cat "$f" 2>/dev/null) || continue
     if run_root "$cmd" >/dev/null 2>&1; then rm -f "$f"; n=$((n+1)); else warn "Could not undo: $cmd"; fi
-  done < <(ls -1r "$JOURNAL"/* 2>/dev/null || true)
+  done <<<"$(ls -1r "$JOURNAL"/* 2>/dev/null || true)"
   (( n == 0 )) || { ok "Undid $n leftover system change(s) from an earlier run"; log_event INFO "journal replayed $n"; }
   return 0
 }
@@ -396,7 +402,7 @@ free_mb() {
   kb=$(df -Pk "$p" 2>/dev/null | awk 'NR==2{print $4}')
   [[ $kb =~ ^[0-9]+$ ]] || kb=$(df -k "$p" 2>/dev/null | awk 'END{print $4}')
   if ! [[ $kb =~ ^[0-9]+$ ]]; then
-    read -r a b < <(stat -f -c '%a %S' "$p" 2>/dev/null) || true
+    read -r a b <<<"$(stat -f -c '%a %S' "$p" 2>/dev/null || true)"
     [[ ${a:-} =~ ^[0-9]+$ && ${b:-} =~ ^[0-9]+$ ]] && kb=$(( a * b / 1024 )) || kb=0
   fi
   echo $(( kb / 1024 ))
@@ -956,7 +962,7 @@ auto_iface() {
       *)                score=10 ;;
     esac
     if (( score > bestscore )); then best=$name; bestscore=$score; fi
-  done < <(ip_q -4 -o addr show | awk '{print $2, $4}')
+  done <<<"$(ip_q -4 -o addr show | awk '{print $2, $4}')"
 
   if [[ -z $best && $DHCP_MODE == direct ]]; then
     best=$(ip_q -o link show | awk -F': ' '{print $2}' | sed 's/@.*//' \
@@ -1155,7 +1161,8 @@ ct_current() {
     while (( page < 40 )); do
       f="$tmp/ct.$dom.$page.json"
       ct_get "$CT_API?domain=$dom&expand=dns_names&expand=issuer&expand=revocation${after:+&after=$after}" "$f" || return 1
-      read -r n last < <("$PYTHON" "$LIB/ct_parse.py" page "$f") || return 1
+      page=$("$PYTHON" "$LIB/ct_parse.py" page "$f") || return 1
+      read -r n last <<<"$page"
       if (( n == 0 )); then rm -f "$f"; break; fi
       files+=("$f")
       after=$last
@@ -1186,7 +1193,7 @@ pins_refresh() {
   mkdir -p "$PIN_DIR" "$STATE"
 
   local -a hosts=("$@")
-  if (( ${#hosts[@]} == 0 )); then mapfile -t hosts < <(pin_hosts_for_target); fi
+  if (( ${#hosts[@]} == 0 )); then mapfile -t hosts <<<"$(pin_hosts_for_target)"; fi
 
   local tmp h served fails=0 n
   tmp=$(mktemp -d)
@@ -1289,7 +1296,8 @@ sig_ok() {
   local st=$1 sigkey="" primary="" count=0 rest
   grep -q '^\[GNUPG:\] GOODSIG ' "$st" || return 1
   if grep -qE '^\[GNUPG:\] (BADSIG|EXPKEYSIG|REVKEYSIG|EXPSIG|ERRSIG) ' "$st"; then return 1; fi
-  read -r sigkey primary < <(awk '$2=="VALIDSIG"{print $3, $NF}' "$st" | head -n1) || return 1
+  validsig=$(awk '$2=="VALIDSIG"{print $3, $NF}' "$st" | head -n1) || return 1
+  read -r sigkey primary <<<"$validsig"
   [[ $primary == "$KEY_FPR" ]] || return 1
   while read -r _ rest; do
     if grep -qw "$sigkey" <<<"$rest"; then count=$((count+1)); fi
@@ -1510,6 +1518,11 @@ deps() {
     termux-wake-lock 2>/dev/null || warn "termux-wake-lock unavailable (install Termux:API to keep the CPU awake)"
   elif command -v apt-get >/dev/null 2>&1; then
     run_root "apt-get update && apt-get install -y dnsmasq python3 libarchive-tools curl iproute2 openssl gnupg git build-essential perl liblzma-dev"
+    if [[ $(uname -m) == aarch64 && $TARGET_ARCH == x86_64 ]]; then
+      info "This is an arm64 system and the PC is x86_64: adding the x86_64 cross-compiler"
+      run_root "apt-get install -y gcc-x86-64-linux-gnu binutils-x86-64-linux-gnu" \
+        || warn "Could not install the x86_64 cross-compiler here. Try: apt-get install gcc-x86-64-linux-gnu binutils-x86-64-linux-gnu"
+    fi
   elif command -v dnf >/dev/null 2>&1; then
     run_root "dnf install -y dnsmasq python3 bsdtar curl iproute openssl gnupg2 git gcc make perl xz-devel"
   elif command -v pacman >/dev/null 2>&1; then
@@ -1583,7 +1596,8 @@ release_stamp() {
   grep -q "^RELEASE_TIME=\"$epoch\"" "$SELF" || die "Could not write RELEASE_TIME into $SELF"
   RELEASE_TIME=$epoch
 
-  read -r _ code < <(release_code "$SELF" "$epoch") || die "Could not compute the release code"
+  rc_out=$(release_code "$SELF" "$epoch") || die "Could not compute the release code"
+  read -r _ code <<<"$rc_out"
   ok "RELEASE_TIME set to $epoch ($(epoch_to_iso "$epoch"))"
   [[ -n $(attest_fpr) ]] && self_sign
 
@@ -1624,8 +1638,9 @@ verify_upstream() {
     || die "Fetch of branch $UPSTREAM_BRANCH failed"
 
   local commit ctime up
-  read -r commit ctime < <(git -C "$repo" log -1 --format='%H %ct' "upstream/$UPSTREAM_BRANCH" -- "$UPSTREAM_PATH") \
+  gl_out=$(git -C "$repo" log -1 --format='%H %ct' "upstream/$UPSTREAM_BRANCH" -- "$UPSTREAM_PATH") \
     || die "No commit touching $UPSTREAM_PATH on $UPSTREAM_BRANCH"
+  read -r commit ctime <<<"$gl_out"
   up=$(mktemp)
   git -C "$repo" show "$commit:$UPSTREAM_PATH" > "$up" || { rm -f "$up"; die "Cannot read $UPSTREAM_PATH at $commit"; }
   info "Upstream: $UPSTREAM_BRANCH @ $commit, committed $(epoch_to_iso "$ctime")"
@@ -1637,8 +1652,10 @@ verify_upstream() {
   fi
 
   local lhex lcode uhex ucode
-  read -r lhex lcode < <(release_code "$SELF" "$RELEASE_TIME") || die "Could not hash $SELF"
-  read -r uhex ucode < <(release_code "$up" "$ctime") || die "Could not hash the upstream copy"
+  rc_l=$(release_code "$SELF" "$RELEASE_TIME") || die "Could not hash $SELF"
+  read -r lhex lcode <<<"$rc_l"
+  rc_u=$(release_code "$up" "$ctime") || die "Could not hash the upstream copy"
+  read -r uhex ucode <<<"$rc_u"
 
   local bad=0
   [[ $lhex == "$uhex" ]] || bad=1
@@ -1651,15 +1668,17 @@ verify_upstream() {
     err "This script is NOT the copy uploaded at $(epoch_to_iso "$ctime")"
     err "  local code    $lcode"
     err "  upstream code $ucode"
+    local tb_up tb_self
+    tb_up=$(mktemp); tb_self=$(mktemp)
     if [[ $lhex == "$uhex" ]]; then
       err "The local file matches upstream, but upstream is not the release you recorded."
-    elif ! diff <(trust_block "$up") <(trust_block "$SELF") >/dev/null; then
+    elif ! { trust_block "$up" > "$tb_up"; trust_block "$SELF" > "$tb_self"; diff "$tb_up" "$tb_self" >/dev/null; }; then
       err "Hard-coded trust data differs (upstream '<', local '>'):"
-      diff <(trust_block "$up") <(trust_block "$SELF") >&2 || true
+      diff "$tb_up" "$tb_self" >&2 || true
     else
       err "Trust data is identical; other lines differ."
     fi
-    rm -f "$up"
+    rm -f "$up" "$tb_up" "$tb_self"
     audit "UPSTREAM MISMATCH commit=$commit local=$lcode upstream=$ucode"
     die "Upstream verification FAILED"
   fi
@@ -1781,7 +1800,10 @@ build_ipxe() {
   local xin="" ca_use="" embed_use=""
   local -a runner=()
   if (( ! native )) && [[ -z $IPXE_CROSS ]]; then
-    if (( IS_TERMUX )) && [[ $TARGET_ARCH == x86_64 ]] && xbox_ready; then
+    if [[ $TARGET_ARCH == x86_64 ]] && have_cross_gcc; then
+      IPXE_CROSS=x86_64-linux-gnu-
+      info "Using the x86_64 cross-compiler found on this system"
+    elif (( IS_TERMUX )) && [[ $TARGET_ARCH == x86_64 ]] && xbox_ready; then
       IPXE_CROSS=x86_64-linux-gnu-
       xin="$SRC_DIR/xin"
       runner=(xbox_exec "$SRC_DIR")
@@ -2642,7 +2664,7 @@ write_manifest() {
     fi
     printf '%s %s %s\n' "$h" "$sz" "$rel" >> "$tmp"
     printf '%s %s\n' "$fp" "$rel" >> "$fpt"
-  done < <(manifest_files)
+  done <<<"$(manifest_files)"
   sync_file "$tmp"; sync_file "$fpt"
   mv -f "$fpt" "$MANIFEST.fp"
   mv -f "$tmp" "$MANIFEST"
@@ -2927,7 +2949,7 @@ backup_prune() {
   while IFS= read -r f; do
     n=$((n+1))
     if (( n > BACKUP_KEEP )); then rm -f -- "$f" "$f.sha256" "$f.meta"; fi
-  done < <(ls -1t "$BACKUP_DIR"/netboot-*.tar.gz 2>/dev/null || true)
+  done <<<"$(ls -1t "$BACKUP_DIR"/netboot-*.tar.gz 2>/dev/null || true)"
   return 0
 }
 
@@ -3063,6 +3085,7 @@ cleanup() {
   power_save_restore
   (( IS_TERMUX )) && termux-wake-unlock 2>/dev/null || true
   run_root "chown -R $(id -u):$(id -g) '$RUN'" >/dev/null 2>&1 || true
+  if [[ -n $TAIL_PID ]]; then kill "$TAIL_PID" 2>/dev/null || true; fi
   if [[ -n $DEEP_PID ]]; then pkill -P "$DEEP_PID" 2>/dev/null || true; kill "$DEEP_PID" 2>/dev/null || true; fi
   note_serve "stopped"
   release_lock
@@ -3071,6 +3094,9 @@ cleanup() {
 }
 
 serve() {
+  if (( IS_PROOT )); then
+    die "$E_ENV" "You are inside a proot Linux environment. It cannot see the phone's network or open the DHCP/TFTP ports, so it cannot serve a PC. Type 'exit' to return to Termux and run this there (rooted). This environment is good for building the loader: $0 proot-build"
+  fi
   resolve_network
   require_ready
   [[ $MODE == direct ]] && setup_direct
@@ -3128,6 +3154,7 @@ serve() {
 
   info "Starting dnsmasq ($MODE DHCP + TFTP) as root"
   start_dns
+  tail -n 0 -F "$DNS_LOG" 2>/dev/null & TAIL_PID=$!
   sleep 1
   dns_alive || die "$E_ENV" "dnsmasq exited. If it could not bind a port, check: $0 selinux status, and whether a hotspot or another DHCP/TFTP service holds ports 67/69."
   protect_pid "$(run_root "cat '$RUN/dnsmasq.pid'" 2>/dev/null || true)"
@@ -3156,7 +3183,7 @@ http_stats()  { curl -fsS -m 2 "http://$PHONE_IP:$HTTP_PORT/healthz" 2>/dev/null
 start_dns() {
   local ldp=""
   (( IS_TERMUX )) && ldp="LD_LIBRARY_PATH=$PREFIX/lib "
-  { run_root "${ldp}$DNSMASQ --no-daemon --conf-file=$DNSMASQ_CONF" || true; } > >(tee -a "$DNS_LOG") 2>&1 &
+  { run_root "${ldp}$DNSMASQ --no-daemon --conf-file=$DNSMASQ_CONF" || true; } >> "$DNS_LOG" 2>&1 &
 }
 
 dns_alive() {
@@ -3341,6 +3368,8 @@ check() {
     if [[ $MODE == proxy ]]; then
       info "Proxy mode needs the PC on the same network segment as $IFACE. Guest Wi-Fi and AP client isolation block PXE."
     fi
+  elif (( IS_PROOT )); then
+    warn "Inside a proot Linux: the phone's network and ports 67/69 are not reachable from here. Use this environment to BUILD the loader (run: $0 proot-build). Serve from Termux itself."
   else
     err "No usable network interface (set IFACE=..., or --mode direct for a cable)"; fails=$((fails+1))
   fi
@@ -3621,6 +3650,51 @@ go_cmd() {
 }
 
 # =============================================================================
+# Inside a proot Linux on the phone: build the loader for the Termux install
+# =============================================================================
+proot_build_flow() {
+  echo
+  box \
+    "YOU ARE INSIDE A PROOT LINUX ON THE PHONE" \
+    "" \
+    "This environment can compile the loader but cannot run the PXE" \
+    "server (no access to the phone's network or ports 67/69)." \
+    "" \
+    "Important: the loader must contain the certificate of the install" \
+    "that will SERVE, i.e. your Termux one. Keys made in here are not" \
+    "used. So we build with a copy of Termux's PUBLIC certificate."
+  echo
+  say "${C_BOLD}Step A, in Termux (not here):${C_RESET} copy the public certificate into this environment"
+  say "  cp ~/netboot/attest/ca.crt \"\$PREFIX\"/var/lib/proot-distro/installed-rootfs/*/root/ca.crt"
+  hint "If you have more than one proot Linux, replace * with this one's folder name."
+  echo
+  local ca="${TRUST_CA:-/root/ca.crt}" ans
+  read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Path to that ca.crt inside this environment [$ca]: " ans || ans=""
+  ca=${ans:-$ca}
+  [[ -s $ca ]] || die "$E_ENV" "No file at $ca. Do Step A in Termux first, then run: $0 proot-build"
+  if grep -q 'PRIVATE KEY' "$ca"; then die "$E_INTEGRITY" "That file contains a PRIVATE KEY. Never copy private keys around. Use ca.crt only."; fi
+  openssl x509 -in "$ca" -noout -text 2>/dev/null | grep -q 'CA:TRUE' || die "$E_INTEGRITY" "$ca is not a CA certificate. Copy ~/netboot/attest/ca.crt from Termux."
+  ok "Certificate: $(openssl x509 -in "$ca" -noout -fingerprint -sha256 | cut -d= -f2 | cut -c1-23)..."
+  if ! have_cross_gcc && [[ $TARGET_ARCH == x86_64 && $(uname -m) == aarch64 ]]; then
+    ask_yn "Install the x86_64 compiler and build tools now?" y || return 0
+    ( deps ) || die "$E_ENV" "Tool install failed. See the messages above."
+  fi
+  say "Building. On a phone this takes roughly 20 to 45 minutes."
+  ( export TRUST_CA="$ca" FALLBACK_SERVER=""; build_ipxe ) || die "$E_ENV" "The build did not finish. Run $0 proot-build again."
+  echo
+  box \
+    "DONE. NOW, BACK IN TERMUX:" \
+    "" \
+    "mkdir -p ~/loader" \
+    "cp \"\$PREFIX\"/var/lib/proot-distro/installed-rootfs/*$TFTP/ipxe.efi ~/loader/" \
+    "cp \"\$PREFIX\"/var/lib/proot-distro/installed-rootfs/*$TFTP/undionly.kpxe ~/loader/" \
+    "cd ~/netboot-android && ./netboot-android.sh import-ipxe ~/loader" \
+    "" \
+    "import-ipxe checks that the loader contains your certificate."
+  echo
+}
+
+# =============================================================================
 # Easy mode: the zero-argument screen, one plain question, and a one-tap shortcut
 # =============================================================================
 pick_goal() {
@@ -3682,6 +3756,7 @@ EOF
 # Picks the one screen that makes sense for the current state.
 easy_home() {
   if [[ ! -t 0 || ! -t 1 ]]; then interactive; return; fi
+  if (( IS_PROOT )); then proot_build_flow; return; fi
   local i key setup_bad=0 note="" fixcmd=""
   load_profile && set_distro || true
   clear 2>/dev/null || true
@@ -4002,6 +4077,7 @@ offsite_wizard() {
 
 guided() {
   [[ -t 0 || $ASSUME_YES == 1 ]] || die "Guided mode needs a terminal. Run it directly in Termux or a shell."
+  if (( IS_PROOT )); then proot_build_flow; return; fi
   if [[ ${GUIDE_WELCOMED:-0} != 1 ]]; then
     clear 2>/dev/null || true
     printf '\n'
@@ -4251,6 +4327,7 @@ COMMANDS
                         verify-first script embedded
   import-ipxe DIR       Use iPXE binaries built on another machine
   ipxe-phone            Build the x86_64 loader ON THIS PHONE (sets up a small compiler first)
+  proot-build           Inside a proot Linux on the phone: build the loader for your Termux install
   xbuild-setup          Only set up that on-phone compiler (Debian via proot-distro)
   ipxe-cloud            Build the loader on GitHub instead (WEAKER trust; asks first)
   ipxe-request          Print what to paste into the GitHub build page
@@ -4379,7 +4456,7 @@ case "$COMMAND" in
   *) guard_root; log_rotate ;;
 esac
 case "$COMMAND" in
-  deps|attest-init|self-sign|pins|build-ipxe|ipxe-phone|xbuild-setup|import-ipxe|fetch|extract|configure|attest|serve|clean|backup|restore|terabox-install|all)
+  deps|attest-init|self-sign|pins|build-ipxe|ipxe-phone|xbuild-setup|import-ipxe|proot-build|fetch|extract|configure|attest|serve|clean|backup|restore|terabox-install|all)
     acquire_lock ;;
 esac
 
@@ -4418,6 +4495,7 @@ case "$COMMAND" in
   build-ipxe)     build_ipxe ;;
   import-ipxe)    import_ipxe "${POSITIONAL[0]:-}" ;;
   ipxe-phone)     ipxe_phone ;;
+  proot-build)    proot_build_flow ;;
   xbuild-setup)   xbox_setup ;;
   ipxe-request)   ipxe_request ;;
   ipxe-fetch)     ipxe_fetch "${POSITIONAL[0]:-}" ;;

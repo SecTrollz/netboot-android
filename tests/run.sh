@@ -734,12 +734,14 @@ mk_phone_sim() {   # pretend: arm64 phone in Termux, PC is x86_64
 #!/bin/bash
 echo "$*" >> "$PROOT_LOG"
 case "$1" in
-  login) shift; while [[ $# -gt 0 && $1 != -- ]]; do shift; done; shift; exec "$@" ;;
+  login) shift; while [[ $# -gt 0 && $1 != -- ]]; do shift; done; shift; PATH="$GUEST_BIN:$PATH" exec "$@" ;;
   *) exit 0 ;;
 esac
 EOS
-  # stand-in compiler probe and make (records what it was asked to do)
-  printf '#!/bin/sh\necho x86_64-linux-gnu\n' > "$T/bin/x86_64-linux-gnu-gcc"
+  # the cross-compiler exists only inside the Debian guest, as on a real phone
+  export GUEST_BIN="$T/guestbin"; mkdir -p "$GUEST_BIN"
+  have_cross_gcc() { [[ :$PATH: == *":$GUEST_BIN:"* ]]; }
+  printf '#!/bin/sh\necho x86_64-linux-gnu\n' > "$GUEST_BIN/x86_64-linux-gnu-gcc"; chmod +x "$GUEST_BIN/x86_64-linux-gnu-gcc"
   cat > "$T/bin/make" <<'EOS'
 #!/bin/bash
 echo "make $*" >> "$MAKE_LOG"
@@ -786,6 +788,7 @@ test_phone_without_box_is_told_the_one_command() {
   src; mkroot
   ( attest_init ) >/dev/null 2>&1 || skip "gpg/openssl not usable"
   HOST_ARCH=aarch64; IS_TERMUX=1; TARGET_ARCH=x86_64; IPXE_CROSS=""; set_distro
+  have_cross_gcc() { return 1; }
   PATH="$T/emptybin:/usr/bin:/bin"; mkdir -p "$T/emptybin"
   git_pin_opts() { GIT_PIN_OPTS=(); }
   ( build_ipxe ) >"$T/b.out" 2>&1; rc=$?
@@ -808,6 +811,59 @@ EOF
   assert "Enter picks the one-time GitHub build" grep -q "CLOUD-RAN" "$T/pty.out"
   assert "on-phone build is still offered" grep -q "x86_64 compiler" "$T/pty.out"
   assert "phone build not run by default" bash -c '! grep -q PHONE-BUILD-RAN "$1"' _ "$T/pty.out"
+}
+
+# ---- seen on a real phone: running inside a proot Linux (no /dev/fd, no phone network) ----
+test_script_never_uses_process_substitution() {
+  # <( ) needs /dev/fd, which a proot Linux may not have
+  hits=$(grep -nE '(^|[^<])<\(|>\(' "$SCRIPT" | grep -vE '^[0-9]+:[[:space:]]*#' || true)
+  [[ -z $hits ]] || { echo "process substitution found:"; echo "$hits"; exit 1; }
+}
+
+test_serve_refuses_inside_proot_with_a_clear_reason() {
+  src; mkroot
+  IS_PROOT=1
+  ( serve ) >"$T/s.out" 2>&1; rc=$?
+  assert "refuses with the environment exit code" test $rc -eq 10
+  assert "says proot" grep -q 'proot' "$T/s.out"
+  assert "tells you to go back to Termux" grep -q 'Termux' "$T/s.out"
+}
+
+test_build_uses_a_cross_compiler_already_on_the_system() {
+  mk_phone_sim
+  rm -f "$T/bin/proot-distro"; IS_TERMUX=0          # a plain arm64 Linux with the cross-compiler installed
+  PATH="$GUEST_BIN:$PATH"
+  ( build_ipxe ) >"$T/b.out" 2>&1; rc=$?
+  [[ $rc -eq 0 ]] || sed 's/^/    build said: /' "$T/b.out" | tail -10
+  assert "build succeeds" test $rc -eq 0
+  assert "cross prefix used" grep -q 'CROSS=x86_64-linux-gnu-' "$MAKE_LOG"
+  assert "no proot-distro involved" bash -c '! test -s "$1"' _ "$PROOT_LOG"
+}
+
+test_proot_build_flow_uses_the_termux_certificate() {
+  mk_phone_sim
+  rm -f "$T/bin/proot-distro"; IS_TERMUX=0; IS_PROOT=1; PATH="$GUEST_BIN:$PATH"
+  cp "$ATTEST/ca.crt" "$T/termux-ca.crt"
+  ( proot_build_flow <<<"$T/termux-ca.crt" ) >"$T/b.out" 2>&1; rc=$?
+  [[ $rc -eq 0 ]] || sed 's/^/    flow said: /' "$T/b.out" | tail -10
+  assert "flow succeeds" test $rc -eq 0
+  assert "loader built" test -s "$TFTP/ipxe.efi"
+  assert "builds with the copied certificate" grep -q "TRUST=$T/termux-ca.crt" "$MAKE_LOG"
+  assert "prints the copy-back steps" grep -q 'import-ipxe' "$T/b.out"
+  assert "never asks for private keys" bash -c '! grep -qi "private key" "$1" || grep -q "PRIVATE KEY" "$1"' _ "$T/b.out"
+}
+
+test_proot_build_flow_refuses_private_keys_and_non_ca() {
+  mk_phone_sim
+  rm -f "$T/bin/proot-distro"; IS_TERMUX=0; IS_PROOT=1; PATH="$GUEST_BIN:$PATH"
+  { echo "-----BEGIN PRIVATE KEY-----"; echo abc; echo "-----END PRIVATE KEY-----"; } > "$T/bad.key"
+  ( proot_build_flow <<<"$T/bad.key" ) >"$T/b.out" 2>&1; rc=$?
+  assert "private key refused (30)" test $rc -eq 30
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$T/leaf.key" -out "$T/leaf.crt" -subj /CN=leaf -days 2 \
+    -addext basicConstraints=critical,CA:FALSE >/dev/null 2>&1 || skip "openssl cannot make the test certificate"
+  ( proot_build_flow <<<"$T/leaf.crt" ) >"$T/b2.out" 2>&1; rc=$?
+  assert "a non-CA certificate is refused (30)" test $rc -eq 30
+  assert "nothing built" test ! -s "$TFTP/ipxe.efi"
 }
 
 # ---------------------------------------------------------------- run
