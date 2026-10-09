@@ -349,7 +349,13 @@ box() {
 need()       { command -v "$1" >/dev/null 2>&1 || die "$E_ENV" "Missing '$1'. Run: $0 deps"; }
 today()      { date -u +%F; }
 now_iso()    { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
-sha256_of()  { sha256sum "$1" | awk '{print $1}'; }
+sha256_of()  {
+  if [[ -n ${PYTHON:-} && -f ${LIB:-/nonexistent}/hashfile.py ]] && (( $(file_size "$1") >= 67108864 )); then
+    "$PYTHON" "$LIB/hashfile.py" "$1" sha256 | awk '{print $2}'
+  else
+    sha256sum "$1" | awk '{print $1}'
+  fi
+}
 sha512_of()  { sha512sum "$1" | awk '{print $1}'; }
 file_size()  { stat -c %s "$1" 2>/dev/null || wc -c <"$1" | tr -d ' '; }
 file_mtime() { stat -c %Y "$1" 2>/dev/null || echo 0; }
@@ -690,9 +696,52 @@ server.serve_forever()
 PYEOF
 
   cat > "$LIB/findbytes.py" <<'PYEOF'
-import sys
-data = open(sys.argv[1], "rb").read()
-sys.exit(0 if bytes.fromhex(sys.argv[2]) in data else 1)
+import mmap, sys
+needle = bytes.fromhex(sys.argv[2])
+with open(sys.argv[1], "rb") as f:
+    try:
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+            sys.exit(0 if m.find(needle) >= 0 else 1)
+    except ValueError:      # empty file
+        sys.exit(1)
+PYEOF
+
+  # One pass over a big file: several digests at once, without evicting the page cache.
+  cat > "$LIB/hashfile.py" <<'PYEOF'
+import hashlib, os, sys
+
+path = sys.argv[1]
+names = sys.argv[2].split(",") if len(sys.argv) > 2 else ["sha256"]
+digests = [hashlib.new(n) for n in names]
+CHUNK = 4 << 20
+DROP_EVERY = 256 << 20
+buf = bytearray(CHUNK)
+view = memoryview(buf)
+fd = os.open(path, os.O_RDONLY)
+try:
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_SEQUENTIAL)
+    except (AttributeError, OSError):
+        pass
+    done = dropped = 0
+    while True:
+        n = os.readv(fd, [view])
+        if n == 0:
+            break
+        part = view[:n]
+        for d in digests:
+            d.update(part)
+        done += n
+        if done - dropped >= DROP_EVERY:
+            try:
+                os.posix_fadvise(fd, dropped, done - dropped, os.POSIX_FADV_DONTNEED)
+            except (AttributeError, OSError):
+                pass
+            dropped = done
+finally:
+    os.close(fd)
+for name, d in zip(names, digests):
+    print(name, d.hexdigest())
 PYEOF
 }
 
@@ -1639,10 +1688,16 @@ verify_download() {
     iso_sig=1
   fi
 
-  info "Hashing the ISO"
-  sha256=$(sha256_of "$file")
+  info "Hashing the ISO (one pass)"
+  write_libs
+  if [[ -n $PYTHON && $SUMS_ALGO == sha512 ]]; then
+    local both; both=$("$PYTHON" "$LIB/hashfile.py" "$file" sha256,sha512)
+    sha256=$(awk '$1=="sha256"{print $2}' <<<"$both"); algohash=$(awk '$1=="sha512"{print $2}' <<<"$both")
+  else
+    sha256=$(sha256_of "$file"); algohash=$sha256
+    [[ -z $list || $SUMS_ALGO == sha256 ]] || algohash=$(sha512_of "$file")
+  fi
   if [[ -n $list ]]; then
-    if [[ $SUMS_ALGO == sha256 ]]; then algohash=$sha256; else algohash=$(sha512_of "$file"); fi
     expect=$(sums_lookup "$list" "$orig" "$SUMS_ALGO")
     if [[ -z $expect ]]; then
       err "$orig is not listed in the checksum file. The vendor may have published a newer release; set ISO_URL."
@@ -1677,21 +1732,42 @@ fetch() {
     die "No checksum or signature source for $DISTRO. Set SUMS_URL or ISO_SIG_URL, or ALLOW_UNVERIFIED=1."
   fi
 
-  local target code rc
+  local target code rc attempt=0 resumed=0 remote have need_mb avail_mb
   if [[ -s $ISO ]]; then
     target=$ISO
     info "ISO present but not verified. Verifying now."
   else
     target="$ISO.part"
-    info "Downloading $ISO_NAME (about ${P_ISO_MB} MB). Resumable: re-run to continue."
-    rc=0
-    code=$(curl -L --proto-redir '=https' -C - --retry 5 --retry-delay 5 --connect-timeout 30 \
-                -# -o "$ISO.part" -w '%{http_code}' "$ISO_URL") || rc=$?
-    if [[ $code == 416 ]]; then
-      info "Download was already complete"
-    elif (( rc != 0 )); then
-      die "$E_NET" "Download interrupted (curl error $rc). Re-run fetch to resume."
+    [[ -s $ISO.part ]] && resumed=1
+    remote=$(curl -sIL --proto-redir '=https' --connect-timeout 20 "$ISO_URL" 2>/dev/null \
+             | awk 'tolower($1)=="content-length:" {gsub("\r","",$2); n=$2} END{print n+0}' || echo 0)
+    have=$(file_size "$ISO.part" 2>/dev/null || echo 0)
+    if (( remote > 0 )); then
+      need_mb=$(( (remote - have) / 1048576 + 1 )); avail_mb=$(df -Pm "$DL" | awk 'NR==2{print $4}')
+      if (( avail_mb < need_mb + 256 )); then
+        die "$E_DISK" "Not enough space for the download: need about $need_mb MB more, only $avail_mb MB free."
+      fi
     fi
+    info "Downloading $ISO_NAME (about ${P_ISO_MB} MB). Resumable: re-run to continue."
+    while :; do
+      rc=0
+      code=$(curl -L --proto-redir '=https' -C - --retry 5 --retry-delay 5 --connect-timeout 30 \
+                  --speed-limit 10240 --speed-time 60 \
+                  -# -o "$ISO.part" -w '%{http_code}' "$ISO_URL") || rc=$?
+      if [[ $code == 416 ]]; then info "Download was already complete"; break; fi
+      if (( rc == 0 )) && [[ $code =~ ^[23] ]]; then break; fi
+      if (( rc == 0 )) && [[ $code =~ ^[45] ]]; then
+        rm -f "$ISO.part"; die "$E_NET" "The server answered HTTP $code for $ISO_URL. The partial file was discarded."
+      fi
+      attempt=$((attempt+1))
+      (( attempt < 5 )) || die "$E_NET" "Download kept failing (curl error $rc). Your progress is saved; re-run fetch to resume."
+      warn "Download interrupted (curl error $rc). Retrying in $((attempt*5))s (attempt $attempt of 5); progress is kept."
+      sleep $((attempt*5))
+    done
+    if (( remote > 0 )) && [[ $(file_size "$ISO.part") != "$remote" ]]; then
+      warn "Downloaded size $(file_size "$ISO.part") differs from the server's $remote; verification will decide."
+    fi
+    sync_file "$ISO.part"
   fi
 
   if [[ -z $SUMS_URL && -z $ISO_SIG_URL ]]; then
@@ -1710,6 +1786,10 @@ fetch() {
   else
     rm -f "$VERIFY_REC.tmp" "$VERIFY_REC.sha"
     if [[ $target == "$ISO.part" ]]; then rm -f "$ISO.part"; fi
+    if (( resumed )) && [[ ${FETCH_RETRIED:-0} != 1 ]]; then
+      warn "A resumed download failed verification (a stale partial file is the usual cause). Downloading again from scratch, once."
+      FETCH_RETRIED=1; fetch; return
+    fi
     die "$E_INTEGRITY" "Verification FAILED. The download was discarded."
   fi
 }
@@ -1784,7 +1864,32 @@ extract() {
 
   info "Extracting (the root image can be several GB)"
   mkdir -p "$HTTP"
-  bsdtar -xf "$ISO" -C "$HTTP" "${files[@]}" || die "Extraction failed"
+  local stage="$HTTP.new" need_mb avail_mb rel f
+  rm -rf "$stage"; mkdir -p "$stage"
+  need_mb=$(bsdtar -tvf "$ISO" 2>/dev/null | awk -v want="$(printf '%s\n' "${files[@]#./}")" '
+      BEGIN{n=split(want,a,"\n"); for(i=1;i<=n;i++) w[a[i]]=1}
+      { name=$NF; sub(/^\.\//,"",name); if (name in w) sum+=$5 } END{printf "%d", sum/1048576 + 1}' || echo 0)
+  avail_mb=$(df -Pm "$HTTP" | awk 'NR==2{print $4}')
+  if (( need_mb > 1 && avail_mb < need_mb + need_mb/20 + 64 )); then
+    rm -rf "$stage"
+    die "$E_DISK" "Not enough space to extract: need about $need_mb MB, only $avail_mb MB free. Nothing was changed."
+  fi
+  if ! bsdtar -xf "$ISO" -C "$stage" "${files[@]}"; then
+    rm -rf "$stage"
+    die "Extraction failed. Your previous boot files were not touched."
+  fi
+  for f in "${files[@]}"; do
+    rel=${f#./}
+    [[ -f $stage/$rel ]] || { rm -rf "$stage"; die "Extraction incomplete: $rel is missing. Your previous boot files were not touched."; }
+  done
+  # every file is complete: move each into place (renames are atomic; other distros' files stay)
+  for f in "${files[@]}"; do
+    rel=${f#./}
+    mkdir -p "$HTTP/$(dirname "$rel")"
+    sync_file "$stage/$rel"
+    mv -f "$stage/$rel" "$HTTP/$rel"
+  done
+  rm -rf "$stage"
 
   local root_rel=$R
   if [[ $FAMILY == casper ]]; then
@@ -1805,7 +1910,7 @@ extract() {
     printf 'SHA_REL=%q\n' "$S"
     printf 'BASEDIR=%q\n' "$B"
     printf 'UCODE_RELS=%q\n' "$U"
-  } > "$LAYOUT"
+  } | atomic_write "$LAYOUT"
   ok "Boot files ready in $HTTP"
 }
 
