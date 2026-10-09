@@ -2094,7 +2094,7 @@ for a in json.load(sys.stdin).get("assets", []):
   fi
 
   # the files verified above are the ones installed
-  ( import_ipxe "$dir" ) || { rm -rf "$dir"; die "$E_INTEGRITY" "Import refused the files."; }
+  ( IMPORT_KEEP_PIN=1; import_ipxe "$dir" ) || { rm -rf "$dir"; die "$E_INTEGRITY" "Import refused the files."; }
   { echo "source=cloud:$tag"; echo "fetched=$(now_iso)"; } >> "$IPXE_BUILT"
   if (( ! pinned )); then
     {
@@ -2163,6 +2163,10 @@ import_ipxe() {
     check_ca_embedded "$TFTP/$(ipxe_files_for_arch | head -n1)" "$ATTEST/ca.crt"
   else
     warn "VERIFIED_BOOT=0: imported binaries are trusted as-is"
+  fi
+  if [[ ${IMPORT_KEEP_PIN:-0} != 1 && -s $(loader_pin_path) ]]; then
+    rm -f "$(loader_pin_path)" "$(loader_pin_path).asc"
+    info "Your earlier GitHub-loader approval was cleared because you imported a different loader."
   fi
   {
     echo "commit=imported"

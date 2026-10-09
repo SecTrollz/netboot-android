@@ -866,6 +866,20 @@ test_proot_build_flow_refuses_private_keys_and_non_ca() {
   assert "nothing built" test ! -s "$TFTP/ipxe.efi"
 }
 
+test_importing_your_own_loader_replaces_the_github_approval() {
+  mk_fake_github
+  ( ipxe_fetch <<<"y" ) >/dev/null 2>&1
+  assert "pinned first" test -s "$STATE/loader-x86_64.pin"
+  mkdir -p "$T/mine"; cp "$TFTP/ipxe.efi" "$T/mine/ipxe.efi"; cp "$TFTP/undionly.kpxe" "$T/mine/undionly.kpxe"
+  printf 'x' >> "$T/mine/undionly.kpxe"          # a different, self-built file
+  ( import_ipxe "$T/mine" ) >"$T/i.out" 2>&1
+  stop_fake_github
+  assert "approval cleared" test ! -s "$STATE/loader-x86_64.pin"
+  assert "tells you" grep -q 'approval was cleared' "$T/i.out"
+  heal_safe >/dev/null 2>&1
+  assert "heal does not overwrite your own loader" test "$(sha256sum "$TFTP/undionly.kpxe" | cut -d' ' -f1)" = "$(sha256sum "$T/mine/undionly.kpxe" | cut -d' ' -f1)"
+}
+
 # ---------------------------------------------------------------- run
 for t in $(declare -F | awk '{print $3}' | grep '^test_'); do run_test "$t"; done
 
