@@ -134,6 +134,8 @@ ACCEPT_SCRIPT_CHANGE="${ACCEPT_SCRIPT_CHANGE:-0}"
 CT_BOOTSTRAP="${CT_BOOTSTRAP:-0}"
 UPSTREAM_REPO="${UPSTREAM_REPO:-$DEFAULT_UPSTREAM_REPO}"
 UPSTREAM_BRANCH="${UPSTREAM_BRANCH:-main}"
+GITHUB_API_BASE="${GITHUB_API_BASE:-https://api.github.com}"
+IPXE_CURL_OPTS="${IPXE_CURL_OPTS---proto =https --tlsv1.2}"   # tests may set this empty to talk to a local server
 EXPECT_CODE="${EXPECT_CODE:-}"
 # Settings saved by the guided offsite-backup setup. Read as plain NAME='value' lines
 # (never executed); a variable already set in the environment wins.
@@ -1708,6 +1710,9 @@ check_ca_embedded() {
   write_libs
   if "$PYTHON" "$LIB/findbytes.py" "$bin" "$fp"; then
     ok "Trust anchor found inside $(basename "$bin")"
+  elif [[ ${3:-} == strict ]]; then
+    err "$(basename "$bin") does not contain your certificate."
+    return 1
   else
     warn "Could not confirm the trust anchor inside $(basename "$bin"). If it is missing, every boot will fail closed at imgverify."
   fi
@@ -1729,7 +1734,7 @@ build_ipxe() {
     x86_64:x86_64|aarch64:arm64|arm64:arm64) native=1 ;;
   esac
   if (( ! native )) && [[ -z $IPXE_CROSS ]]; then
-    die "This device is $HOST_ARCH and the target is $TARGET_ARCH. Build on a $TARGET_ARCH Linux machine with this same script, or set IPXE_CROSS (for example IPXE_CROSS=x86_64-linux-gnu-). Then copy the binaries over with: $0 import-ipxe DIR"
+    die "$E_ENV" "This device is $HOST_ARCH and the target is $TARGET_ARCH, so it cannot compile the loader. Easiest: run  $0 ipxe-cloud  (GitHub builds it free, no other computer). Or build on a $TARGET_ARCH Linux machine and copy it back with: $0 import-ipxe DIR"
   fi
 
   git_pin_opts
@@ -1806,6 +1811,115 @@ build_ipxe() {
     for f in $(ipxe_files_for_arch); do echo "file=$f sha256=$(sha256_of "$TFTP/$f")"; done
   } > "$IPXE_BUILT"
   ok "iPXE installed to $TFTP (record: $IPXE_BUILT)"
+}
+
+# =============================================================================
+# iPXE built in the cloud (for a phone whose CPU differs from the PC's)
+# =============================================================================
+upstream_slug() {   # https://github.com/Owner/Repo.git -> Owner/Repo
+  local u=${UPSTREAM_REPO%.git}
+  printf '%s' "${u#*github.com/}"
+}
+
+ipxe_request() {
+  [[ -s $ATTEST/ca.crt ]] || die "$E_ENV" "Your boot certificate does not exist yet. Run the guide first (it creates your keys)."
+  local b64 slug fp url
+  b64=$(base64 < "$ATTEST/ca.crt" | tr -d '\n')
+  slug=$(upstream_slug)
+  fp=$(openssl x509 -in "$ATTEST/ca.crt" -noout -fingerprint -sha256 | cut -d= -f2)
+  url="https://github.com/$slug/actions/workflows/build-ipxe.yml"
+  printf '%s\n' "$b64" | atomic_write "$HOME/ipxe-request.txt"
+  local copied=0
+  if command -v termux-clipboard-set >/dev/null 2>&1 && printf '%s' "$b64" | termux-clipboard-set 2>/dev/null; then copied=1; fi
+  echo
+  box \
+    "BUILD THE LOADER FREE ON GITHUB (about 5 minutes)" \
+    "" \
+    "1. Open the page below and sign in to GitHub." \
+    "2. Tap 'Run workflow'." \
+    "3. In the first box, paste the certificate text" \
+    "   $( ((copied)) && echo "(already copied for you)" || echo "(saved in ~/ipxe-request.txt)" )" \
+    "4. Choose the PC's CPU (x86_64 for most PCs) and tap 'Run workflow'." \
+    "5. When the run turns green, come back here."
+  echo
+  say "${C_BOLD}The page:${C_RESET}"
+  say "$url"
+  echo
+  hint "The text is only your PUBLIC certificate. Your private key never leaves this device."
+  hint "Certificate fingerprint: ${fp:0:47}..."
+  if (( ! copied )); then
+    echo
+    say "The certificate text (long line):"
+    printf '%s\n' "$b64"
+  fi
+}
+
+ipxe_fetch() {
+  need curl
+  [[ -n $PYTHON ]] || die "$E_ENV" "python3 is required. Run: $0 deps"
+  local slug api json tag lines name url dir f
+  slug=$(upstream_slug)
+  api="$GITHUB_API_BASE/repos/$slug/releases?per_page=30"
+  info "Looking for a loader built for your certificate"
+  # shellcheck disable=SC2086
+  json=$(curl -fsS $IPXE_CURL_OPTS --connect-timeout 20 --max-time 60 -H 'Accept: application/vnd.github+json' "$api") \
+    || die "$E_NET" "Could not reach GitHub. Check your internet and try again."
+  lines=$("$PYTHON" -I -c '
+import json, sys
+arch, want = sys.argv[1], sys.argv[2]
+for rel in json.load(sys.stdin):
+    tag = rel.get("tag_name", "")
+    if not tag.startswith("ipxe-" + arch + "-") or rel.get("draft"):
+        continue
+    if want not in (rel.get("name") or ""):
+        continue
+    print("TAG", tag)
+    for a in rel.get("assets", []):
+        print("ASSET", a["name"], a["browser_download_url"])
+    break
+' "$TARGET_ARCH" "$(openssl x509 -in "$ATTEST/ca.crt" -noout -fingerprint -sha256 | cut -d= -f2)" <<<"$json")
+  tag=$(awk '$1=="TAG"{print $2}' <<<"$lines")
+  if [[ -z $tag ]]; then
+    err "No loader for THIS certificate and CPU ($TARGET_ARCH) has been built yet."
+    next_step "run '$0 ipxe-request', follow the 5 steps, wait for the green check, then run '$0 ipxe-fetch'."
+    return 1
+  fi
+  ok "Found build $tag"
+  mkdir -p "$DL"; dir=$(mktemp -d "$DL/ipxe-cloud.XXXXXX")
+  while read -r _ name url; do
+    case "$name" in ipxe.efi|undionly.kpxe|ipxe-arm64.efi|SHA256SUMS) ;; *) continue ;; esac
+    # shellcheck disable=SC2086
+    curl -fsSL $IPXE_CURL_OPTS --connect-timeout 20 --max-time 600 -o "$dir/$name" "$url" \
+      || { rm -rf "$dir"; die "$E_NET" "Download of $name failed. Try again."; }
+  done < <(awk '$1=="ASSET"' <<<"$lines")
+  [[ -s $dir/SHA256SUMS ]] || { rm -rf "$dir"; die "$E_INTEGRITY" "The build has no checksum list. Not using it."; }
+  ( cd "$dir" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ) || { rm -rf "$dir"; die "$E_INTEGRITY" "Downloaded files do not match their checksums. Not using them."; }
+  ok "Checksums match"
+  f=$(ipxe_files_for_arch | head -n1)
+  # strict for downloads: the loader must contain YOUR certificate or it is refused
+  check_ca_embedded "$dir/$f" "$ATTEST/ca.crt" strict \
+    || { rm -rf "$dir"; die "$E_INTEGRITY" "The loader does not contain YOUR certificate, so it was refused. Run ipxe-request again and paste the right certificate."; }
+  ( import_ipxe "$dir" ) || { rm -rf "$dir"; die "$E_INTEGRITY" "The loader does not contain YOUR certificate, so it was refused. Run ipxe-request again with the right certificate."; }
+  f=$(ipxe_files_for_arch | head -n1)
+  { echo "source=cloud:$tag"; echo "fetched=$(now_iso)"; } >> "$IPXE_BUILT"
+  rm -rf "$dir"
+  ok "Loader installed ($f). It was checked to contain your certificate."
+  hint "Trust note: this loader was compiled by GitHub's runner from the pinned iPXE commit, not on your device."
+  hint "For the strictest chain, build it yourself on an x86_64 Linux computer instead (README)."
+}
+
+ipxe_cloud() {   # the whole thing as one friendly flow
+  ipxe_request
+  local a
+  while :; do
+    read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Press Enter once the run is green (or type s to skip, q to quit): " a || a=s
+    case "${a,,}" in
+      q) exit 0 ;;
+      s) warn "Skipped. Later: $0 ipxe-fetch"; return 0 ;;
+    esac
+    if ( ipxe_fetch ); then return 0; fi
+    warn "Not ready yet. A run takes about 5 minutes; check the Actions page, then press Enter again."
+  done
 }
 
 import_ipxe() {
@@ -3173,7 +3287,7 @@ diagnose() {
       bad)     finding FAIL SELF "Signed script record failed verification (possible tampering)" "$0 fingerprints" ;;
     esac
   fi
-  [[ -s $TFTP/ipxe.efi ]] && finding OK IPXE "iPXE loader present" "" || finding FAIL IPXE "iPXE loader missing (build it here, or import one built elsewhere)" "$0 build-ipxe"
+  [[ -s $TFTP/ipxe.efi ]] && finding OK IPXE "iPXE loader present" "" || finding FAIL IPXE "iPXE loader missing (the guide can build it free on GitHub)" "$0 ipxe-cloud"
   iso_is_verified && finding OK ISO "$P_LABEL image verified" "" || finding FAIL ISO "$P_LABEL image not downloaded/verified" "$0 --distro $DISTRO --arch $TARGET_ARCH fetch"
   [[ -f $LAYOUT ]] && finding OK EXTRACT "Boot files extracted" "" || finding FAIL EXTRACT "Boot files not extracted" "$0 --distro $DISTRO --arch $TARGET_ARCH extract"
   if [[ -f $MANIFEST && -f $TFTP/boot.ipxe ]]; then
@@ -3498,29 +3612,44 @@ g_done_fetch()   { iso_is_verified; }
 g_done_extract() { [[ -f $LAYOUT ]]; }
 
 guided_ipxe() {
-  local host_cpu want c dir
+  local host_cpu c
   gstep_head "Get the network-boot loader (iPXE)" \
     "iPXE is the tiny program the PC runs first. It is built with YOUR key inside," \
     "so it only boots files you signed. Building takes 10-30 minutes on a phone."
   if g_done_ipxe; then ok "Already done."; ask_yn "Do it again anyway?" n || return 0; fi
   host_cpu=$(uname -m); [[ $host_cpu == aarch64 ]] && host_cpu=arm64
-  if [[ $host_cpu == "$TARGET_ARCH" ]]; then want=1
+  if [[ $host_cpu == "$TARGET_ARCH" ]]; then
     hint "This device matches the PC's CPU ($TARGET_ARCH), so building here works."
-  else want=2
-    hint "This device is $host_cpu but the PC is $TARGET_ARCH. Easiest: build on any x86_64 Linux"
-    hint "computer (see README, 'Building iPXE for a different CPU'), then choose 2."
+    say "  1) Build it here (slow on a phone, but automatic)"
+    say "  2) Build it free in the cloud on GitHub"
+    say "  3) I already built it on another computer: import it"
+    say "  4) Skip for now"
+    read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Choose 1-4 [1]: " c || c=""
+    case "${c:-1}" in
+      1) ( build_ipxe ) && ok "iPXE built" || warn "Build did not finish. Run it again from the menu." ;;
+      2) ipxe_cloud ;;
+      3) guided_ipxe_import ;;
+      *) warn "Skipped. configure will stop until iPXE is in place." ;;
+    esac
+  else
+    hint "This phone is $host_cpu but the PC is $TARGET_ARCH, so it cannot compile the loader itself."
+    hint "That is fine: GitHub can build it for you in about 5 minutes, free, with no other computer."
+    say "  1) Build it free in the cloud on GitHub (recommended)"
+    say "  2) I already built it on another computer: import it"
+    say "  3) Skip for now"
+    read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Choose 1, 2 or 3 [1]: " c || c=""
+    case "${c:-1}" in
+      1) ipxe_cloud ;;
+      2) guided_ipxe_import ;;
+      *) warn "Skipped. configure will stop until iPXE is in place." ;;
+    esac
   fi
-  say "  1) Build it here (slow on a phone, but automatic)"
-  say "  2) I already built it on another computer: import it"
-  say "  3) Skip for now"
-  read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Choose 1, 2 or 3 [$want]: " c || c=""
-  c=${c:-$want}
-  case "$c" in
-    1) ( build_ipxe ) && ok "iPXE built" || warn "Build did not finish. Run it again from the menu." ;;
-    2) read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Folder holding ipxe.efi and undionly.kpxe: " dir || dir=""
-       ( import_ipxe "$dir" ) && ok "iPXE imported" || warn "Import did not finish. Check the folder and retry from the menu." ;;
-    *) warn "Skipped. configure will stop until iPXE is in place." ;;
-  esac
+}
+
+guided_ipxe_import() {
+  local dir
+  read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Folder holding ipxe.efi and undionly.kpxe: " dir || dir=""
+  ( import_ipxe "$dir" ) && ok "iPXE imported" || warn "Import did not finish. Check the folder and retry from the menu."
 }
 
 # ---- offsite backup wizard ---------------------------------------------------
@@ -3876,6 +4005,9 @@ COMMANDS
   build-ipxe            Build iPXE at IPXE_COMMIT with the boot CA and a
                         verify-first script embedded
   import-ipxe DIR       Use iPXE binaries built on another machine
+  ipxe-cloud            Build the loader free on GitHub (no other computer): request, wait, fetch
+  ipxe-request          Print what to paste into the GitHub build page
+  ipxe-fetch            Download, verify, and install the loader GitHub built for you
   fetch                 Download the ISO and verify it against the vendor key
   extract               Pull kernel, initrd, root image (and microcode) from the ISO
   configure             Sign boot files, write boot.ipxe, dnsmasq.conf, and the manifest
@@ -4038,6 +4170,9 @@ case "$COMMAND" in
     esac ;;
   build-ipxe)     build_ipxe ;;
   import-ipxe)    import_ipxe "${POSITIONAL[0]:-}" ;;
+  ipxe-request)   ipxe_request ;;
+  ipxe-fetch)     ipxe_fetch ;;
+  ipxe-cloud)     ipxe_cloud ;;
   fetch)          fetch ;;
   extract)        extract ;;
   configure)      configure ;;

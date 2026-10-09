@@ -1,0 +1,74 @@
+name: build-ipxe
+
+# Builds the iPXE network loader with YOUR boot CA certificate inside, so a phone
+# (arm64) can get an x86_64 loader without another computer.
+# Run it from the phone: ./netboot-android.sh ipxe-cloud   (it prints what to paste here).
+# The CA *certificate* is public. The private key never leaves your device.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ca_pem_b64:
+        description: "Your boot CA certificate, base64 on one line (printed by: ./netboot-android.sh ipxe-request)"
+        required: true
+        type: string
+      arch:
+        description: "CPU of the PC that will boot"
+        required: true
+        default: x86_64
+        type: choice
+        options:
+          - x86_64
+          - arm64
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CA_B64: ${{ inputs.ca_pem_b64 }}
+      TARGET: ${{ inputs.arch }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git make perl gcc liblzma-dev libarchive-tools gnupg openssl python3 curl
+          if [ "$TARGET" = arm64 ]; then sudo apt-get install -y gcc-aarch64-linux-gnu; fi
+
+      - name: Check the certificate you pasted
+        run: |
+          pem=$(printf '%s' "$CA_B64" | tr -d ' \n\r' | base64 -d)
+          # a private key pasted by mistake must never be accepted or kept
+          if printf '%s' "$pem" | grep -q 'PRIVATE KEY'; then
+            echo "::error::You pasted a PRIVATE KEY. Stop: that must stay on your device. Rotate the CA."; exit 1
+          fi
+          printf '%s\n' "$pem" > "$RUNNER_TEMP/ca.crt"
+          openssl x509 -in "$RUNNER_TEMP/ca.crt" -noout -subject -enddate
+          openssl x509 -in "$RUNNER_TEMP/ca.crt" -noout -text | grep -q 'CA:TRUE' \
+            || { echo "::error::That certificate is not a CA certificate"; exit 1; }
+
+      - name: Build iPXE with that CA inside
+        run: |
+          export NETBOOT_HOME="$RUNNER_TEMP/nb" TRUST_CA="$RUNNER_TEMP/ca.crt" ALLOW_UNPINNED=1
+          # the iPXE commit is pinned by hash in the script; that pins the content
+          if [ "$TARGET" = arm64 ]; then export IPXE_CROSS=aarch64-linux-gnu-; fi
+          ./netboot-android.sh --arch "$TARGET" build-ipxe
+          mkdir -p "$RUNNER_TEMP/out"
+          cp "$NETBOOT_HOME"/tftp/*.efi "$NETBOOT_HOME"/tftp/*.kpxe "$RUNNER_TEMP/out/" 2>/dev/null || true
+          cp "$NETBOOT_HOME"/state/ipxe-*.built-from "$RUNNER_TEMP/out/build-record.txt"
+          ( cd "$RUNNER_TEMP/out" && sha256sum *.efi *.kpxe 2>/dev/null > SHA256SUMS; cat SHA256SUMS )
+
+      - name: Publish as a release the phone can download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          fp=$(openssl x509 -in "$RUNNER_TEMP/ca.crt" -noout -fingerprint -sha256 | cut -d= -f2)
+          tag="ipxe-$TARGET-${{ github.run_id }}"
+          gh release create "$tag" "$RUNNER_TEMP"/out/* \
+            --title "iPXE loader ($TARGET) for CA $fp" \
+            --notes "Built from the pinned iPXE commit in netboot-android.sh with the boot CA whose SHA-256 is $fp. Build log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

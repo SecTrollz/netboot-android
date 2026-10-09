@@ -481,6 +481,116 @@ test_termux_package_list_has_split_packages() {
   assert "deps verifies the result" grep -q 'still missing' "$SCRIPT"
 }
 
+# ---- cloud-built iPXE (phone gets the loader from a GitHub release) ----
+mk_fake_github() {   # serves /repos/o/r/releases and the asset files on localhost
+  src; mkroot
+  ( attest_init ) >/dev/null 2>&1 || skip "gpg/openssl not usable"
+  TARGET_ARCH=x86_64; set_distro
+  PORT=$((20000 + RANDOM % 20000)); WEB="$T/web"; mkdir -p "$WEB"
+  # a "built" loader that contains the CA fingerprint, like the real one
+  fp=$(ca_fpr_hex "$ATTEST/ca.crt")
+  { printf 'MZ'; head -c 200 /dev/urandom; printf '%s' "$fp" | xxd -r -p 2>/dev/null || python3 -c "import sys;sys.stdout.buffer.write(bytes.fromhex('$fp'))"; } > "$WEB/ipxe.efi"
+  head -c 5000 /dev/urandom > "$WEB/undionly.kpxe"
+  ( cd "$WEB" && sha256sum ipxe.efi undionly.kpxe > SHA256SUMS )
+  cafp=$(openssl x509 -in "$ATTEST/ca.crt" -noout -fingerprint -sha256 | cut -d= -f2)
+  python3 - "$WEB" "$PORT" "$cafp" <<'PY'
+import json, sys
+web, port, cafp = sys.argv[1], sys.argv[2], sys.argv[3]
+assets = [{"name": n, "browser_download_url": "http://127.0.0.1:%s/%s" % (port, n)}
+          for n in ("ipxe.efi", "undionly.kpxe", "SHA256SUMS")]
+rels = [{"tag_name": "ipxe-x86_64-111", "draft": False, "name": "iPXE loader (x86_64) for CA " + cafp, "assets": assets},
+        {"tag_name": "ipxe-x86_64-100", "draft": False, "name": "iPXE loader (x86_64) for CA 00:11", "assets": []}]
+import os
+os.makedirs(web + "/repos/SecTrollz/netboot-android", exist_ok=True)
+json.dump(rels, open(web + "/repos/SecTrollz/netboot-android/releases", "w"))
+PY
+  ( cd "$WEB" && python3 -m http.server "$PORT" --bind 127.0.0.1 >/dev/null 2>&1 ) & WEBPID=$!
+  sleep 1
+  export GITHUB_API_BASE="http://127.0.0.1:$PORT" IPXE_CURL_OPTS=""
+}
+
+test_ipxe_fetch_installs_matching_loader() {
+  mk_fake_github
+  ( ipxe_fetch ) >"$T/f.out" 2>&1; rc=$?
+  kill $WEBPID 2>/dev/null
+  [[ $rc -eq 0 ]] || sed 's/^/    fetch said: /' "$T/f.out"
+  assert "fetch succeeds" test $rc -eq 0
+  assert "loader installed" test -s "$TFTP/ipxe.efi"
+  assert "note records the cloud source" grep -q 'source=cloud:ipxe-x86_64-111' "$STATE/ipxe-x86_64.built-from"
+}
+
+test_ipxe_fetch_refuses_bad_checksum() {
+  mk_fake_github
+  printf 'tamper' >> "$WEB/ipxe.efi"
+  ( ipxe_fetch ) >"$T/f.out" 2>&1; rc=$?
+  kill $WEBPID 2>/dev/null
+  assert "tampered download refused with exit 30" test $rc -eq 30
+  assert "nothing installed" test ! -s "$TFTP/ipxe.efi"
+}
+
+test_ipxe_fetch_refuses_loader_without_my_ca() {
+  mk_fake_github
+  { printf 'MZ'; head -c 400 /dev/urandom; } > "$WEB/ipxe.efi"
+  ( cd "$WEB" && sha256sum ipxe.efi undionly.kpxe > SHA256SUMS )
+  ( ipxe_fetch ) >"$T/f.out" 2>&1; rc=$?
+  kill $WEBPID 2>/dev/null
+  assert "foreign loader refused with exit 30" test $rc -eq 30
+  assert "nothing installed" test ! -s "$TFTP/ipxe.efi"
+}
+
+test_ipxe_fetch_ignores_builds_for_other_certificates() {
+  mk_fake_github
+  python3 - "$WEB" <<'PY'
+import json, sys
+f = sys.argv[1] + "/repos/SecTrollz/netboot-android/releases"
+rels = json.load(open(f)); rels[0]["name"] = "iPXE loader (x86_64) for CA AA:BB"
+json.dump(rels, open(f, "w"))
+PY
+  ( ipxe_fetch ) >"$T/f.out" 2>&1; rc=$?
+  kill $WEBPID 2>/dev/null
+  assert "no loader for my certificate: not installed" test $rc -ne 0
+  assert "tells what to do" grep -q "ipxe-request" "$T/f.out"
+}
+
+test_ipxe_request_prints_public_cert_only() {
+  src; mkroot
+  ( attest_init ) >/dev/null 2>&1 || skip "gpg/openssl not usable"
+  out=$(ipxe_request 2>&1)
+  assert "has the workflow page link" grep -q 'actions/workflows/build-ipxe.yml' <<<"$out"
+  assert "request file written" test -s "$HOME/ipxe-request.txt"
+  dec=$(base64 -d < "$HOME/ipxe-request.txt")
+  assert "request is a certificate" grep -q 'BEGIN CERTIFICATE' <<<"$dec"
+  assert "request has no private key" bash -c '! grep -q "PRIVATE KEY" <<<"$1"' _ "$dec"
+}
+
+test_cross_cpu_build_error_points_to_cloud() {
+  grep -q 'ipxe-cloud' <(sed -n "/^build_ipxe() {/,/^}/p" "$SCRIPT")
+}
+
+test_workflow_file_is_present_and_safe() {
+  f="$HERE/../.github/workflows/build-ipxe.yml"
+  assert "workflow exists" test -s "$f"
+  assert "inputs go through env (no script injection)" grep -q 'CA_B64: ${{ inputs.ca_pem_b64 }}' "$f"
+  assert "rejects private keys" grep -q 'PRIVATE KEY' "$f"
+  assert "does not echo inputs inside run blocks" bash -c '! grep -E "run:|^ +[a-z]" "$1" | grep -E "\\$\\{\\{ *inputs\\." | grep -v "CA_B64\|TARGET:" | grep -q .' _ "$f"
+}
+
+test_guide_defaults_to_cloud_when_cpu_differs() {
+  cat > "$T/ip.sh" <<EOF
+export NETBOOT_SOURCE_ONLY=1
+source "$SCRIPT"
+TARGET_ARCH=arm64          # this machine is x86_64, so the CPUs differ
+set_distro
+g_done_ipxe() { return 1; }
+ipxe_cloud() { echo "CLOUD-RAN"; }
+guided_ipxe
+EOF
+  pty_run "" bash "$T/ip.sh"
+  assert "recommends the cloud build" grep -q "free in the cloud on GitHub (recommended)" "$T/pty.out"
+  python3 -I -c "$PTY_PY" "|" bash "$T/ip.sh" > "$T/pty.out" 2>&1
+  assert "Enter picks the cloud build" grep -q "CLOUD-RAN" "$T/pty.out"
+}
+
 # ---------------------------------------------------------------- run
 for t in $(declare -F | awk '{print $3}' | grep '^test_'); do run_test "$t"; done
 
