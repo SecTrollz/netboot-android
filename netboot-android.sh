@@ -134,7 +134,11 @@ IPXE_CC="${IPXE_CC:-}"
 FALLBACK_SERVER="${FALLBACK_SERVER:-}"
 TRUST_CA="${TRUST_CA:-}"
 ALLOW_UNPINNED="${ALLOW_UNPINNED:-0}"
-BOOT_LOADER="${BOOT_LOADER:-ipxe}"            # ipxe (your own signed chain) | shim (Ubuntu's Secure Boot chain)
+# auto (default): Ubuntu's signed chain where it exists, so Secure Boot never has to be touched; otherwise iPXE.
+# ipxe (your own signed chain, needs Secure Boot off) | shim (Ubuntu's Secure Boot chain)
+BOOT_LOADER_AUTO=1
+[[ -n ${BOOT_LOADER:-} && $BOOT_LOADER != auto ]] && BOOT_LOADER_AUTO=0
+BOOT_LOADER="${BOOT_LOADER:-auto}"
 UBUNTU_ARCHIVE="${UBUNTU_ARCHIVE:-https://archive.ubuntu.com/ubuntu}"
 # Ubuntu Archive Automatic Signing Keys (2018, 2012): the only keys accepted for archive metadata
 UBUNTU_ARCHIVE_FPRS="${UBUNTU_ARCHIVE_FPRS:-F6ECB3762474EDA9D21B7022871920D1991BC93C 790BC7277767219C42C86F933B4FE6ACC0B21F32}"
@@ -676,6 +680,11 @@ set_distro() {
   MANIFEST="$STATE/$DISTRO-$TARGET_ARCH.manifest"
   GNUPG_HOME="$ROOT/gnupg/$DISTRO"
   IPXE_BUILT="$STATE/ipxe-$TARGET_ARCH.built-from"
+  # No choice for you to make: the signed route is used whenever it exists
+  if [[ $BOOT_LOADER_AUTO == 1 || $BOOT_LOADER == auto ]]; then
+    BOOT_LOADER_AUTO=1
+    if shim_supported; then BOOT_LOADER=shim; else BOOT_LOADER=ipxe; fi
+  fi
 }
 
 # iPXE binaries served for the current target architecture
@@ -3469,8 +3478,7 @@ serve() {
   info "Starting dnsmasq ($MODE DHCP + TFTP) as root"
   start_dns
   tail -n 0 -F "$DNS_LOG" 2>/dev/null & TAIL_PID=$!
-  sleep 1
-  dns_alive || die "$E_ENV" "dnsmasq exited. If it could not bind a port, check: $0 selinux status, and whether a hotspot or another DHCP/TFTP service holds ports 67/69."
+  wait_dns_up || die "$E_ENV" "dnsmasq exited right after starting. Its last words: $(tail -n 3 "$DNS_LOG" 2>/dev/null | tr '\n' ' ' | cut -c1-300). If it could not bind a port, check: $0 selinux status, and whether a hotspot or another DHCP/TFTP service holds ports 67/69."
   protect_pid "$(run_root "cat '$RUN/dnsmasq.pid'" 2>/dev/null || true)"
   ok "Ready. Boot the PC from the network now."
   pc_instructions
@@ -3494,14 +3502,30 @@ start_http() {
 http_health() { curl -fsS -m 2 -o /dev/null "http://$PHONE_IP:$HTTP_PORT/healthz" 2>/dev/null; }
 http_stats()  { curl -fsS -m 2 "http://$PHONE_IP:$HTTP_PORT/healthz" 2>/dev/null || true; }
 
+DNS_JOB=""
 start_dns() {
   local ldp=""
   (( IS_TERMUX )) && ldp="LD_LIBRARY_PATH=$PREFIX/lib "
+  run_root "rm -f '$RUN/dnsmasq.pid'" >/dev/null 2>&1 || true     # a leftover file must not vouch for a dead dnsmasq
   { run_root "${ldp}$DNSMASQ --no-daemon --conf-file=$DNSMASQ_CONF" || true; } >> "$DNS_LOG" 2>&1 &
+  DNS_JOB=$!
 }
 
+# dnsmasq runs in the foreground under that job, so the job being alive means dnsmasq is alive.
+# (The PID file is only a fallback: on some phones it appears late or cannot be read.)
 dns_alive() {
+  if [[ -n $DNS_JOB ]] && kill -0 "$DNS_JOB" 2>/dev/null; then return 0; fi
   run_root "p=\$(cat '$RUN/dnsmasq.pid' 2>/dev/null); [ -n \"\$p\" ] && kill -0 \"\$p\" 2>/dev/null" >/dev/null 2>&1
+}
+
+# dnsmasq that cannot bind a port exits within a fraction of a second; give it a few seconds of proof
+wait_dns_up() {
+  local i
+  for i in 1 2 3 4 5 6 7 8; do
+    sleep 0.5
+    dns_alive || return 1
+  done
+  return 0
 }
 
 stop_dns() {
@@ -3537,8 +3561,8 @@ wd_restart() {   # http | dns
   case "$1" in
     http) kill "$SERVE_HTTP_PID" 2>/dev/null || true
           if start_http; then ok "HTTP server restarted"; log_event WARN "watchdog restarted http"; else warn "HTTP restart failed; will retry"; fi ;;
-    dns)  stop_dns; start_dns; sleep 1
-          if dns_alive; then ok "dnsmasq restarted"; log_event WARN "watchdog restarted dnsmasq"; protect_pid "$(run_root "cat '$RUN/dnsmasq.pid'" 2>/dev/null || true)"; else warn "dnsmasq restart failed; will retry"; fi ;;
+    dns)  stop_dns; start_dns
+          if wait_dns_up; then ok "dnsmasq restarted"; log_event WARN "watchdog restarted dnsmasq"; protect_pid "$(run_root "cat '$RUN/dnsmasq.pid'" 2>/dev/null || true)"; else warn "dnsmasq restart failed; will retry"; fi ;;
   esac
   return 0
 }
@@ -3715,7 +3739,11 @@ check() {
   if iso_is_verified; then ok "ISO present and verified"; elif [[ -s $ISO ]]; then warn "ISO present but not verified"; else warn "ISO not downloaded"; fi
   if [[ -f $LAYOUT ]]; then ok "Boot files extracted"; else warn "Not extracted yet"; fi
   if [[ -f $MANIFEST ]]; then ok "Configured (manifest present)"; else warn "Not configured yet"; fi
-  info "Client needs about $CLIENT_RAM_GB GB RAM. Disable Secure Boot and enable network (PXE) boot in its firmware."
+  if [[ $BOOT_LOADER == shim ]]; then
+    info "Client needs about $CLIENT_RAM_GB GB RAM and network (PXE) boot enabled. Leave Secure Boot as it is."
+  else
+    info "Client needs about $CLIENT_RAM_GB GB RAM and network (PXE) boot enabled. This loader is not Secure Boot signed: only Ubuntu has a signed route."
+  fi
 
   echo
   if (( fails == 0 )); then ok "All required checks passed"; else err "$fails required check(s) failed"; return 1; fi
@@ -3751,7 +3779,8 @@ save_profile() {
   mkdir -p "$STATE"
   { printf "DISTRO='%s'\n" "$DISTRO"; printf "TARGET_ARCH='%s'\n" "$TARGET_ARCH"
     printf "DHCP_MODE='%s'\n" "$DHCP_MODE"; printf "IFACE='%s'\n" "${IFACE:-}"
-    printf "HTTP_PORT='%s'\n" "$HTTP_PORT"; printf "BOOT_LOADER='%s'\n" "$BOOT_LOADER"; } | atomic_write "$PROFILE" || true
+    printf "HTTP_PORT='%s'\n" "$HTTP_PORT"; 
+    [[ $BOOT_LOADER_AUTO == 1 ]] || printf "BOOT_LOADER_PICK='%s'\n" "$BOOT_LOADER"; } | atomic_write "$PROFILE" || true
 }
 load_profile() {   # applies only values you did not give on the command line / environment
   [[ -r $PROFILE ]] || return 1
@@ -3762,8 +3791,12 @@ load_profile() {   # applies only values you did not give on the command line / 
     val=${val:1:${#val}-2}
     [[ $val != *\'* && -n $val ]] || continue
     case "$name" in
-      DISTRO|TARGET_ARCH|DHCP_MODE|IFACE|HTTP_PORT|BOOT_LOADER)
+      DISTRO|TARGET_ARCH|DHCP_MODE|IFACE|HTTP_PORT)
         [[ " $CLI_SET " == *" $name "* || -n ${PRE_ENV[$name]:-} ]] || printf -v "$name" '%s' "$val" ;;
+      BOOT_LOADER_PICK)   # only a choice you made yourself is remembered; older profiles stored a default here
+        [[ $val == shim || $val == ipxe ]] || continue
+        [[ " $CLI_SET " == *" BOOT_LOADER "* || -n ${PRE_ENV[BOOT_LOADER]:-} ]] && continue
+        BOOT_LOADER=$val; BOOT_LOADER_AUTO=0 ;;
     esac
   done < "$PROFILE"
   return 0
@@ -4040,8 +4073,8 @@ pick_goal() {
 }
 
 pc_instructions() {
-  local sb_line="Secure Boot must be OFF for this route (the iPXE loader is not signed)."
-  [[ $BOOT_LOADER == shim ]] && sb_line="Secure Boot may stay ON (Ubuntu route). BIOS-only PCs cannot."
+  local sb_line="Secure Boot: this distro has no signed network route, so it must be OFF (only Ubuntu works with it on)."
+  [[ $BOOT_LOADER == shim ]] && sb_line="Do NOT touch Secure Boot. Leave it as it is. (BIOS-only PCs cannot network-boot this way.)"
   echo
   box \
     "NOW, ON THE PC YOU WANT TO BOOT:" \
@@ -4302,15 +4335,15 @@ guided_ipxe() {
     echo
     say "${C_BOLD}Ubuntu can use its own signed boot files, which is the easy way:${C_RESET}"
     say "  1) Ubuntu's signed boot files  ${C_GREEN}recommended: nothing to build, ready in about a minute${C_RESET}"
-    hint "   Works with Secure Boot ON or OFF. For UEFI PCs (almost all since about 2012), not very old BIOS-only ones."
+    hint "   You never touch Secure Boot, on or off. For UEFI PCs (almost all since about 2012), not very old BIOS-only ones."
     say "  2) iPXE with your own certificate  ${C_DIM}(a signed chain you control; has to be built or fetched)${C_RESET}"
     read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Choose 1 or 2 [1]: " c || c=""
     if [[ ${c:-1} != 2 ]]; then
-      BOOT_LOADER=shim; save_profile
+      BOOT_LOADER=shim; BOOT_LOADER_AUTO=0; save_profile
       ( shim_fetch ) && ok "Ubuntu's signed boot files are ready" || warn "That did not finish. Run it again: $0 shim-fetch"
       return 0
     fi
-    BOOT_LOADER=ipxe; save_profile
+    BOOT_LOADER=ipxe; BOOT_LOADER_AUTO=0; save_profile
   fi
   host_cpu=$(uname -m); [[ $host_cpu == aarch64 ]] && host_cpu=arm64
   if [[ $host_cpu == "$TARGET_ARCH" ]]; then
@@ -4557,8 +4590,8 @@ guided() {
 
   (( GUIDE_SKIPPED == 0 )) || info "Skipped $GUIDE_SKIPPED step(s) that were already done. (--redo shows them again.)"
   gstep_head "Start the boot server" \
-    "Plug the PC into the same network (or cable), set it to network (PXE) boot," \
-    "Secure Boot off, then power it on. Press Ctrl+C here to stop the server."
+    "Plug the PC into the same network (or cable) and set it to network (PXE)" \
+    "boot, then power it on. Press Ctrl+C here to stop the server."
   hint "No backup is taken unless you ask for one (./netboot-android.sh backup, or --backup)."
   if ask_yn "Start the server now?" y; then
     run_step serve
@@ -4868,7 +4901,7 @@ parse_args() {
       --no-backup) AUTO_BACKUP=0 ;;
       --redo)      GUIDE_REDO=1 ;;
       --backup)    AUTO_BACKUP=1 ;;
-      --shim|--secure-boot) BOOT_LOADER=shim; CLI_SET+=" BOOT_LOADER" ;;
+      --shim|--secure-boot) BOOT_LOADER=shim; BOOT_LOADER_AUTO=0; CLI_SET+=" BOOT_LOADER" ;;
       --iso)      [[ $# -ge 2 ]] || die "--iso requires a path"; ISO_FILE="$2"; shift ;;
       --iso=*)    ISO_FILE="${1#*=}" ;;
       --distro)   [[ $# -ge 2 ]] || die "--distro requires a value"; DISTRO="$2"; CLI_SET+=" DISTRO"; shift ;;

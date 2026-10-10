@@ -105,7 +105,7 @@ test_heal_leftovers() {
 mk_gate_env() {
   src; mkroot
   ( attest_init ) >/dev/null 2>&1 || skip "gpg/openssl not usable"
-  BIG_BYTES=1000; VERIFIED_BOOT=0; FAMILY=squash
+  BIG_BYTES=1000; VERIFIED_BOOT=0; FAMILY=squash; BOOT_LOADER=ipxe; BOOT_LOADER_AUTO=0
   KERNEL_REL=k; INITRD_REL=i; ROOTFS_REL=r.img; SHA_REL=""; UCODE_RELS=""
   echo b > "$TFTP/boot.ipxe"; echo e > "$TFTP/ipxe.efi"; echo u > "$TFTP/undionly.kpxe"
   head -c 5000 /dev/urandom > "$HTTP/r.img"; echo k > "$HTTP/k"; echo i > "$HTTP/i"
@@ -231,6 +231,28 @@ test_watchdog_restarts_httpd() {
   curl -fsS "$B/healthz" >/dev/null; rc=$?
   stop_dns; kill "$SERVE_HTTP_PID" "$w" 2>/dev/null
   assert "http answers again after kill -9" test $rc -eq 0
+}
+
+test_dnsmasq_without_a_pid_file_still_counts_as_alive() {
+  can_root || skip "needs root or sudo"
+  src; mkroot; mkdir -p "$RUN"
+  printf '#!/bin/sh\nexec sleep 600\n' > "$T/fake-dnsmasq"; chmod +x "$T/fake-dnsmasq"
+  DNSMASQ="$T/fake-dnsmasq"; DNSMASQ_CONF="$T/dm.conf"; touch "$DNSMASQ_CONF"; DNS_LOG="$ROOT/dnsmasq.log"
+  start_dns
+  wait_dns_up || { stop_dns; echo "healthy dnsmasq without a pid file was judged dead"; exit 1; }
+  dns_alive || { stop_dns; echo "dns_alive false for a running dnsmasq"; exit 1; }
+  stop_dns; kill "$DNS_JOB" 2>/dev/null
+  exit 0
+}
+
+test_dnsmasq_that_exits_at_once_is_reported_dead() {
+  can_root || skip "needs root or sudo"
+  src; mkroot; mkdir -p "$RUN"
+  printf '#!/bin/sh\necho "dnsmasq: failed to bind DHCP server socket" >&2\nexit 2\n' > "$T/fake-dnsmasq"; chmod +x "$T/fake-dnsmasq"
+  DNSMASQ="$T/fake-dnsmasq"; DNSMASQ_CONF="$T/dm.conf"; touch "$DNSMASQ_CONF"; DNS_LOG="$ROOT/dnsmasq.log"
+  start_dns
+  wait_dns_up && { stop_dns; echo "a dnsmasq that exited was judged alive"; exit 1; }
+  assert "its words are in the log" grep -q 'failed to bind' "$DNS_LOG"
 }
 
 test_restart_budget_gives_up() {
@@ -1299,7 +1321,8 @@ EOT
   python3 -I -c "$PTY_PY" "|" bash "$T/ip.sh" > "$T/pty.out" 2>&1
   assert "Enter picks Ubuntu's signed files" grep -q "SHIM-FETCH-RAN" "$T/pty.out"
   assert "mentions Secure Boot" grep -q "Secure Boot" "$T/pty.out"
-  assert "route remembered in the profile" grep -q "BOOT_LOADER='shim'" "$T/pty.out"
+  assert "never tells you to turn it off" bash -c '! grep -qi "secure boot off\|disable secure boot" "$1"' _ "$T/pty.out"
+  assert "route remembered in the profile" grep -q "BOOT_LOADER_PICK='shim'" "$T/pty.out"
 }
 
 test_other_distros_never_see_the_shim_offer() {
@@ -1317,10 +1340,38 @@ EOT
 
 test_shim_flag_beats_a_saved_ipxe_profile() {
   src; mkroot
-  printf "DISTRO='ubuntu'\nBOOT_LOADER='ipxe'\n" > "$PROFILE"
+  printf "DISTRO='ubuntu'\nBOOT_LOADER_PICK='ipxe'\n" > "$PROFILE"
   CLI_SET=" BOOT_LOADER"; BOOT_LOADER=shim
   load_profile
   assert "command line wins" test "$BOOT_LOADER" = shim
+}
+
+test_secure_boot_never_needs_touching_on_ubuntu_by_default() {
+  src; mkroot
+  DISTRO=ubuntu; TARGET_ARCH=x86_64; BOOT_LOADER=auto; BOOT_LOADER_AUTO=1; set_distro
+  assert "Ubuntu defaults to the signed route" test "$BOOT_LOADER" = shim
+  DISTRO=debian; set_distro
+  assert "other distros fall back to iPXE" test "$BOOT_LOADER" = ipxe
+  DISTRO=ubuntu; set_distro
+  assert "and back again" test "$BOOT_LOADER" = shim
+  # an old profile that merely stored the old default must not pin iPXE
+  printf "DISTRO='ubuntu'\nBOOT_LOADER='ipxe'\n" > "$PROFILE"; BOOT_LOADER=auto; BOOT_LOADER_AUTO=1
+  load_profile; set_distro
+  assert "old default is ignored" test "$BOOT_LOADER" = shim
+  # a deliberate pick is kept
+  printf "DISTRO='ubuntu'\nBOOT_LOADER_PICK='ipxe'\n" > "$PROFILE"; BOOT_LOADER=auto; BOOT_LOADER_AUTO=1
+  load_profile; set_distro
+  assert "deliberate pick wins" test "$BOOT_LOADER" = ipxe
+  save_profile
+  assert "auto is not written down" bash -c '! grep -q "BOOT_LOADER=.shim" "$1"' _ "$PROFILE"
+}
+
+test_pc_instructions_do_not_ask_for_secure_boot_changes_on_the_signed_route() {
+  src; mkroot
+  DISTRO=ubuntu; TARGET_ARCH=x86_64; BOOT_LOADER=auto; BOOT_LOADER_AUTO=1; set_distro
+  PHONE_IP=192.168.0.5; IFACE=wlan0
+  pc_instructions > "$T/pc.out" 2>&1 || true
+  assert "says leave it alone" grep -q "Do NOT touch Secure Boot" "$T/pc.out"
 }
 
 test_backups_are_off_unless_asked_for() {
@@ -1420,7 +1471,7 @@ test_done_checks_tell_the_truth() {
 }
 
 test_configure_is_redone_only_when_the_network_or_extraction_changed() {
-  src; mkroot
+  src; mkroot; BOOT_LOADER=ipxe; BOOT_LOADER_AUTO=0
   mkdir -p "$TFTP"
   echo "set base http://192.168.0.5:8000" > "$TFTP/boot.ipxe"
   : > "$LAYOUT"; sleep 1.1; : > "$MANIFEST"
