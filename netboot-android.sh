@@ -3481,6 +3481,27 @@ ln -sf \"\$G/functions/mass_storage.0\" \"\$G/configs/c.1/mass_storage.0\"" >/de
   [[ -e $RUN/usb.ok ]]
 }
 
+# Second way, if the phone refuses a gadget of our own: add the drive to the gadget Android already runs,
+# the same way Android's own init scripts do (their folder names, our function name).
+USB_REUSE_G=""
+usb_prepare_reuse() {
+  local cfgdir
+  rm -f "$RUN/usb.ok"
+  cfgdir=$(run_root "ls -d '$USB_CFG'/*/configs/* 2>/dev/null | grep -v '/$USB_GNAME/' | head -n1" 2>/dev/null || true)
+  [[ -n $cfgdir ]] || { echo "the phone has no USB setup of its own to reuse" > "$RUN/usb.err"; return 1; }
+  USB_REUSE_G=${cfgdir%/configs/*}
+  run_root "set -e
+G='$USB_REUSE_G'
+mkdir -p \"\$G/functions/mass_storage.nb0\"
+F=\"\$G/functions/mass_storage.nb0/lun.0\"
+mkdir -p \"\$F\"
+echo 1 > \"\$F/ro\"
+echo '$USB_CDROM' > \"\$F/cdrom\"
+echo '$ISO' > \"\$F/file\"
+ln -sf \"\$G/functions/mass_storage.nb0\" '$cfgdir/f_nb'" >/dev/null 2>"$RUN/usb.err" && : > "$RUN/usb.ok"
+  [[ -e $RUN/usb.ok ]]
+}
+
 usb_boot_start() {
   local udc g saved="" rebind="" prev_cfg="" g_path undo size_mb
   (( IS_PROOT )) && die "$E_ENV" "You are inside proot. Leave it ('exit') and run this in Termux."
@@ -3498,7 +3519,7 @@ usb_boot_start() {
   done
   prev_cfg=$(run_root "getprop sys.usb.config 2>/dev/null" 2>/dev/null || true)
   g_path="$USB_CFG/$USB_GNAME"
-  undo="echo '' > '$g_path/UDC' 2>/dev/null; rm -f '$g_path/configs/c.1/mass_storage.0'; rmdir '$g_path/configs/c.1/strings/0x409' '$g_path/configs/c.1' '$g_path/functions/mass_storage.0' '$g_path/strings/0x409' '$g_path' 2>/dev/null; "
+  undo="for g in '$USB_CFG'/*; do [ -f \"\$g/UDC\" ] && echo '' > \"\$g/UDC\" 2>/dev/null; rm -f \"\$g\"/configs/*/f_nb; rmdir \"\$g/functions/mass_storage.nb0\" 2>/dev/null; done; echo '' > '$g_path/UDC' 2>/dev/null; rm -f '$g_path/configs/c.1/mass_storage.0'; rmdir '$g_path/configs/c.1/strings/0x409' '$g_path/configs/c.1' '$g_path/functions/mass_storage.0' '$g_path/strings/0x409' '$g_path' 2>/dev/null; "
   [[ -z $prev_cfg ]] || undo+="setprop sys.usb.config '$prev_cfg' 2>/dev/null; "
   undo+="${rebind}true"
   JID_USB=$(journal_push "$undo")
@@ -3523,6 +3544,11 @@ usb_boot_start() {
       fi
     fi
     if [[ ! -e $RUN/usb.ok ]]; then
+      info "The phone refused a USB drive of our own. Trying the phone's own USB setup instead (the way Android does it)."
+      if usb_prepare_reuse; then g_path=$USB_REUSE_G; ok "Using the phone's own USB setup: ${g_path##*/}"; fi
+    fi
+    if [[ ! -e $RUN/usb.ok ]]; then
+      why="$why / second try: $(tr '\n' ' ' < "$RUN/usb.err" 2>/dev/null | cut -c1-160)"
       usb_diag
       usb_boot_stop
       die "$E_ENV" "Could not switch on USB drive mode: ${why:-unknown error}. If SELinux was already permissive, this phone's kernel or vendor setup does not allow a USB drive gadget here."

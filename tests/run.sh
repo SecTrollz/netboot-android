@@ -1464,6 +1464,26 @@ test_usb_selinux_block_with_a_no_answer_stays_enforcing_and_explains() {
   assert "mentions the blocker" grep -q 'Operation not permitted' <<<"$out"
 }
 
+test_usb_falls_back_to_the_phones_own_gadget_when_ours_is_refused() {
+  src; mkroot; mk_fake_usb; IS_TERMUX=0
+  mkdir -p "$USB_CFG/android0/configs/b.1"
+  run_root() {   # a phone whose kernel refuses links inside our own gadget only
+    case "$1" in
+      *"ln -sf"*"configs/c.1"*) echo "ln: cannot create symbolic link: Operation not permitted" >&2; return 1 ;;
+      *) bash -c "$1" ;;
+    esac
+  }
+  ( usb_boot_start ) > "$T/usb.out" 2>&1 & u=$!
+  for _ in $(seq 1 40); do grep -q 'USB DRIVE MODE' "$T/usb.out" 2>/dev/null && break; sleep 0.5; done
+  assert "tells what it is doing" grep -q "phone's own USB setup" "$T/usb.out"
+  assert "the drive lives in the phone's own gadget" test "$(cat "$USB_CFG/android0/functions/mass_storage.nb0/lun.0/file")" = "$ISO"
+  assert "linked into its configuration" test -L "$USB_CFG/android0/configs/b.1/f_nb"
+  assert "connected" test "$(cat "$USB_CFG/android0/UDC")" = fake.udc
+  kill -TERM "$u" 2>/dev/null; wait "$u" 2>/dev/null || true
+  assert "link removed at the end" test ! -e "$USB_CFG/android0/configs/b.1/f_nb"
+  assert "phone's own USB handed back" test "$(cat "$USB_CFG/android0/UDC")" = fake.udc
+}
+
 test_usb_check_reports_a_phone_without_gadget_support() {
   can_root || skip "needs root or sudo"
   src; mkroot; USB_CFG="$T/none/usb_gadget"; USB_UDC_DIR="$T/none/udc"
