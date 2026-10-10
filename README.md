@@ -131,6 +131,22 @@ A proot Linux is, however, a good place to **build the loader**, because `apt` c
 
 ---
 
+## Ubuntu with Secure Boot (and no building): Ubuntu's own signed boot files
+
+For Ubuntu on a UEFI PC you can skip iPXE completely:
+
+```sh
+./netboot-android.sh --distro ubuntu --shim shim-fetch      # or choose option 1 in the guide
+```
+
+This downloads Ubuntu's **shim** (signed by Microsoft) and **grub** (signed by Canonical) straight from Ubuntu's archive, then serves them. The PC's firmware verifies shim, shim verifies grub and the kernel, so it works with **Secure Boot ON or OFF** and needs no compiler, no GitHub, and no other computer.
+
+How the download is checked, the same way `apt` does it: Ubuntu's archive signing key comes from the `ubuntu-keyring` package; the release file must be signed by one of the two pinned Ubuntu archive key fingerprints; the package list must match the hash in that signed release file; and each package must match the hash in the package list. Anything that does not match is refused. The newest version across the release, `-updates` and `-security` pockets is used.
+
+What this route does *not* give you: your own certificate chain (iPXE is not used), a signed `grub.cfg` (a person who can spoof DHCP/TFTP on your LAN could change the kernel arguments, though the kernel itself must still carry Canonical's signature), or a verified root image (same limit as before). Old BIOS-only PCs cannot use it. Remembered in the profile; `--shim` on the command line wins over a saved choice. Not tested against real Secure Boot hardware from this repository: try it and tell me what the PC says.
+
+---
+
 ## Phone and PC have different CPUs? One safe GitHub build, then pinned
 
 A phone is arm64 and most PCs are x86_64. The network loader (iPXE) must be compiled for the PC's CPU, and it decides what your PC will boot. The guide's default for a phone is a **one-time build on GitHub that the script then pins forever**:
@@ -196,7 +212,7 @@ What it does for you while it runs:
 
 Honest limits: the fast check trusts a file's size, time, and inode for a few minutes until the background check finishes, so someone with root who forges those could briefly serve a changed root image (the kernel and initrd are signed and always fully checked). The root image is unsigned on the client for most distros; see the header of the script. Android features (root, `oom_score_adj`, Wi-Fi power mode) can only be proven on a real phone.
 
-Tests: `tests/run.sh` runs 85 checks (fault injection and the easy-mode screens) (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
+Tests: `tests/run.sh` runs 96 checks (fault injection and the easy-mode screens) (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
 
 ---
 

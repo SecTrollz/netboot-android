@@ -117,7 +117,7 @@ UPSTREAM_PATH="netboot-android.sh"
 # =============================================================================
 # Settings (environment overrides)
 # =============================================================================
-declare -A PRE_ENV=( [DISTRO]="${DISTRO:-}" [TARGET_ARCH]="${TARGET_ARCH:-}" [DHCP_MODE]="${DHCP_MODE:-}" [IFACE]="${IFACE:-}" [HTTP_PORT]="${HTTP_PORT:-}" )
+declare -gA PRE_ENV=( [BOOT_LOADER]="${BOOT_LOADER:-}" [DISTRO]="${DISTRO:-}" [TARGET_ARCH]="${TARGET_ARCH:-}" [DHCP_MODE]="${DHCP_MODE:-}" [IFACE]="${IFACE:-}" [HTTP_PORT]="${HTTP_PORT:-}" )
 CLI_SET=""
 IFACE="${IFACE:-}"
 HTTP_PORT="${HTTP_PORT:-8000}"
@@ -134,6 +134,10 @@ IPXE_CC="${IPXE_CC:-}"
 FALLBACK_SERVER="${FALLBACK_SERVER:-}"
 TRUST_CA="${TRUST_CA:-}"
 ALLOW_UNPINNED="${ALLOW_UNPINNED:-0}"
+BOOT_LOADER="${BOOT_LOADER:-ipxe}"            # ipxe (your own signed chain) | shim (Ubuntu's Secure Boot chain)
+UBUNTU_ARCHIVE="${UBUNTU_ARCHIVE:-https://archive.ubuntu.com/ubuntu}"
+# Ubuntu Archive Automatic Signing Keys (2018, 2012): the only keys accepted for archive metadata
+UBUNTU_ARCHIVE_FPRS="${UBUNTU_ARCHIVE_FPRS:-F6ECB3762474EDA9D21B7022871920D1991BC93C 790BC7277767219C42C86F933B4FE6ACC0B21F32}"
 ISO_FILE="${ISO_FILE:-}"                       # a file you already have (--iso PATH); it is verified before use
 EXTRA_ISO_DIRS="${EXTRA_ISO_DIRS:-}"          # more folders to search for an earlier download, colon separated
 KEY_MIN_SOURCES="${KEY_MIN_SOURCES:-2}"       # independent places that must agree on the vendor key
@@ -673,6 +677,12 @@ set_distro() {
 }
 
 # iPXE binaries served for the current target architecture
+# Files the PC downloads first. In shim mode these are Ubuntu's signed shim and grub.
+boot_files() {
+  if [[ $BOOT_LOADER == shim ]]; then echo shimx64.efi; echo grubx64.efi; echo mmx64.efi; else ipxe_files_for_arch; fi
+}
+shim_supported() { [[ $TARGET_ARCH == x86_64 && ( $DISTRO == ubuntu || $DISTRO == ubuntu24 ) ]]; }
+
 ipxe_files_for_arch() {
   if [[ $TARGET_ARCH == x86_64 ]]; then
     echo ipxe.efi; echo undionly.kpxe
@@ -2224,6 +2234,135 @@ import_ipxe() {
 # Fetch and verify the ISO
 # =============================================================================
 # =============================================================================
+# Ubuntu's own signed boot files (shim + grub). No compiling, works with Secure Boot on or off.
+# The PC's firmware verifies shim (Microsoft-signed), shim verifies grub and the kernel (Canonical-signed).
+# =============================================================================
+ubuntu_suite() { case $DISTRO in ubuntu) echo resolute ;; ubuntu24) echo noble ;; *) return 1 ;; esac; }
+
+# Verifies a clearsigned InRelease against Ubuntu's archive keys; prints the signed text to OUT
+archive_release_verify() {   # archive_release_verify HOMEDIR INRELEASE OUT
+  local home=$1 in=$2 out=$3 st fpr ok=0
+  st=$(mktemp)
+  gpg --homedir "$home" --batch --no-tty --yes --status-file "$st" --output "$out" --decrypt "$in" >/dev/null 2>&1 || true
+  if ! grep -qE '^\[GNUPG:\] (BADSIG|EXPKEYSIG|REVKEYSIG|ERRSIG) ' "$st"; then
+    for fpr in $UBUNTU_ARCHIVE_FPRS; do
+      if awk -v f="$fpr" '$2=="VALIDSIG" && $NF==f {found=1} END{exit !found}' "$st"; then ok=1; fi
+    done
+  fi
+  rm -f "$st"
+  (( ok )) && [[ -s $out ]]
+}
+
+# hash of FILE as listed in a verified Release text (SHA256 section)
+release_hash() {   # release_hash RELEASE_TEXT PATH
+  awk -v want="$2" '
+    /^SHA256:/ {in256=1; next}
+    /^[A-Za-z0-9-]+:/ {in256=0}
+    in256 && $3==want {print $1; exit}' "$1"
+}
+
+# Prints "version filename sha256" of PKG in a Packages file
+packages_entry() {   # packages_entry PACKAGES_FILE PKG
+  awk -v pkg="$2" 'BEGIN{RS="";FS="\n"}
+    { name=""; ver=""; fn=""; sum="";
+      for(i=1;i<=NF;i++){ if($i ~ /^Package: /){name=substr($i,10)} else if($i ~ /^Version: /){ver=substr($i,10)}
+                          else if($i ~ /^Filename: /){fn=substr($i,11)} else if($i ~ /^SHA256: /){sum=substr($i,9)} }
+      if(name==pkg) print ver, fn, sum }' "$1"
+}
+
+shim_fetch() {
+  shim_supported || die "$E_USAGE" "Ubuntu's signed boot files are available for Ubuntu on x86_64 PCs only."
+  need gpg; need curl; need bsdtar; need xz; need sha256sum
+  local suite work home keyf pkg pocket relf relt ph pf best ver fn sum debdir
+  suite=$(ubuntu_suite)
+  work=$(mktemp -d); chmod 700 "$work"; home="$work/gnupg"; mkdir -p "$home"; chmod 700 "$home"
+  mkdir -p "$TFTP/grub" "$STATE"
+
+  info "Getting Ubuntu's archive signing key from the ubuntu-keyring package"
+  keyf="$work/archive-keyring.gpg"
+  fetch_key_source "deb:$UBUNTU_ARCHIVE/pool/main/u/ubuntu-keyring/|ubuntu-keyring|usr/share/keyrings/ubuntu-archive-keyring.gpg" "$keyf" \
+    || { rm -rf "$work"; die "$E_NET" "Could not get Ubuntu's archive keyring. Check your internet and run again."; }
+  gpg --homedir "$home" --batch --no-tty --quiet --import "$keyf" 2>/dev/null || true
+  local have=0 fpr
+  for fpr in $UBUNTU_ARCHIVE_FPRS; do gpg --homedir "$home" --batch --list-keys "$fpr" >/dev/null 2>&1 && have=1; done
+  (( have )) || { rm -rf "$work"; die "$E_INTEGRITY" "The keyring does not contain Ubuntu's archive signing keys. Refusing."; }
+
+  declare -A got_ver=() got_fn=() got_sum=()
+  for pkg in shim-signed grub-efi-amd64-signed; do got_ver[$pkg]=""; done
+  for pocket in "$suite" "$suite-updates" "$suite-security"; do
+    relf="$work/InRelease.$pocket"; relt="$work/Release.$pocket"
+    vfetch "$UBUNTU_ARCHIVE/dists/$pocket/InRelease" "$relf" protected || { warn "Could not read $pocket; skipping it"; continue; }
+    archive_release_verify "$home" "$relf" "$relt" \
+      || { rm -rf "$work"; die "$E_INTEGRITY" "The signature on Ubuntu's $pocket release file did not verify. Refusing."; }
+    ph="$work/Packages.$pocket.xz"
+    vfetch "$UBUNTU_ARCHIVE/dists/$pocket/main/binary-amd64/Packages.xz" "$ph" protected || { warn "No package list for $pocket"; continue; }
+    sum=$(release_hash "$relt" main/binary-amd64/Packages.xz)
+    [[ -n $sum && $(sha256sum "$ph" | cut -d' ' -f1) == "$sum" ]] \
+      || { rm -rf "$work"; die "$E_INTEGRITY" "The package list for $pocket does not match Ubuntu's signed release file. Refusing."; }
+    pf="$work/Packages.$pocket"; xz -dc "$ph" > "$pf" || { rm -rf "$work"; die "$E_ENV" "Could not unpack the package list (is xz installed?)"; }
+    for pkg in shim-signed grub-efi-amd64-signed; do
+      best=$(packages_entry "$pf" "$pkg" | head -n1)
+      [[ -n $best ]] || continue
+      read -r ver fn sum <<<"$best"
+      if [[ -z ${got_ver[$pkg]} || $(printf '%s\n%s\n' "${got_ver[$pkg]}" "$ver" | sort -V | tail -n1) == "$ver" ]]; then
+        got_ver[$pkg]=$ver; got_fn[$pkg]=$fn; got_sum[$pkg]=$sum
+      fi
+    done
+  done
+  for pkg in shim-signed grub-efi-amd64-signed; do
+    [[ -n ${got_ver[$pkg]} ]] || { rm -rf "$work"; die "$E_ENV" "Ubuntu's archive has no $pkg for $suite."; }
+    ok "$pkg ${got_ver[$pkg]} (listed in Ubuntu's signed package list)"
+  done
+
+  debdir="$work/debs"; mkdir -p "$debdir"
+  for pkg in shim-signed grub-efi-amd64-signed; do
+    vfetch "$UBUNTU_ARCHIVE/${got_fn[$pkg]}" "$debdir/$pkg.deb" protected \
+      || { rm -rf "$work"; die "$E_NET" "Download of $pkg failed. Try again."; }
+    [[ $(sha256sum "$debdir/$pkg.deb" | cut -d' ' -f1) == "${got_sum[$pkg]}" ]] \
+      || { rm -rf "$work"; die "$E_INTEGRITY" "$pkg does not match the checksum in Ubuntu's signed package list. Refusing."; }
+  done
+  ok "Both packages match Ubuntu's signed package list"
+
+  deb_extract_member "$debdir/shim-signed.deb" usr/lib/shim/shimx64.efi.signed.latest "$work/shimx64.efi" \
+    && deb_extract_member "$debdir/shim-signed.deb" usr/lib/shim/mmx64.efi "$work/mmx64.efi" \
+    && deb_extract_member "$debdir/grub-efi-amd64-signed.deb" usr/lib/grub/x86_64-efi-signed/grubnetx64.efi.signed "$work/grubx64.efi" \
+    || { rm -rf "$work"; die "$E_ENV" "Could not find the boot files inside the packages (Ubuntu may have changed the layout)."; }
+  local f
+  for f in shimx64.efi mmx64.efi grubx64.efi; do
+    head -c 2 "$work/$f" | grep -q 'MZ' || { rm -rf "$work"; die "$E_INTEGRITY" "$f is not a UEFI program. Refusing."; }
+  done
+  for f in shimx64.efi mmx64.efi grubx64.efi; do sync_file "$work/$f"; mv -f "$work/$f" "$TFTP/$f"; done
+  chmod a+r "$TFTP"/shimx64.efi "$TFTP"/mmx64.efi "$TFTP"/grubx64.efi
+  {
+    echo "suite=$suite"; echo "fetched=$(now_iso)"
+    echo "shim-signed=${got_ver[shim-signed]}"; echo "grub-efi-amd64-signed=${got_ver[grub-efi-amd64-signed]}"
+    for f in shimx64.efi mmx64.efi grubx64.efi; do echo "file=$f sha256=$(sha256_of "$TFTP/$f")"; done
+  } | atomic_write "$STATE/shim-x86_64.built-from"
+  rm -rf "$work"
+  ok "Ubuntu's signed boot files are ready in $TFTP"
+  hint "The PC's firmware checks shim (signed by Microsoft); shim checks grub and the kernel (signed by Canonical)."
+}
+
+shim_ready() { [[ -s $TFTP/shimx64.efi && -s $TFTP/grubx64.efi ]]; }
+
+# grub reads this over TFTP. The kernel is signed by Canonical; Secure Boot refuses anything else.
+write_grub_cfg() {
+  local args; args=$(kernel_args)
+  mkdir -p "$TFTP/grub"
+  {
+    echo "# netboot-android $SCRIPT_VERSION - generated $(now_iso)"
+    echo "set default=0"
+    echo "set timeout=3"
+    echo "menuentry \"$P_LABEL (netboot-android)\" {"
+    echo "  echo \"Loading the kernel from $PHONE_IP ...\""
+    echo "  linux (http,$PHONE_IP:$HTTP_PORT)/$KERNEL_REL $args"
+    echo "  echo \"Loading the initial RAM disk ...\""
+    echo "  initrd (http,$PHONE_IP:$HTTP_PORT)/$INITRD_REL"
+    echo "}"
+  } | atomic_write "$TFTP/grub/grub.cfg"
+}
+
+# =============================================================================
 # Reuse an earlier download instead of fetching it again
 # =============================================================================
 # Prints candidate files (complete images first), best first.
@@ -2608,7 +2747,13 @@ configure() {
   resolve_network
   load_layout
   write_libs
-  require_ipxe_matches_ca
+  if [[ $BOOT_LOADER == shim ]]; then
+    shim_supported || die "$E_USAGE" "Ubuntu's signed boot files work for Ubuntu on x86_64 only. Use the iPXE route for $DISTRO / $TARGET_ARCH."
+    shim_ready || die "$E_ENV" "Ubuntu's signed boot files are missing. Run: $0 shim-fetch"
+    VERIFIED_BOOT=0    # iPXE's own signature chain is not used; the firmware checks Ubuntu's signatures instead
+  else
+    require_ipxe_matches_ca
+  fi
   if [[ $VERIFIED_BOOT == 1 ]]; then
     [[ -s $ATTEST/codesign.key ]] || die "Run: $0 attest-init"
   fi
@@ -2647,9 +2792,12 @@ configure() {
     local u
     for u in $UCODE_RELS; do cms_sign "$HTTP/$u"; done
     ok "Signed: boot.ipxe, kernel, initrd${UCODE_RELS:+, microcode}"
+  elif [[ $BOOT_LOADER == shim ]]; then
+    info "Secure Boot route: Ubuntu's own signatures protect shim, grub and the kernel; nothing of yours needs signing"
   else
     warn "VERIFIED_BOOT=0: boot files are NOT signed and the client will not check them"
   fi
+  [[ $BOOT_LOADER == shim ]] && write_grub_cfg
 
   # dnsmasq appends ".0" to pxe-service basenames that have no extension
   [[ -s $TFTP/undionly.kpxe ]] && cp -f "$TFTP/undionly.kpxe" "$TFTP/undionly.0"
@@ -2685,7 +2833,10 @@ configure() {
     echo "dhcp-match=set:efi64,option:client-arch,9"
     echo "dhcp-match=set:arm64,option:client-arch,11"
     echo "pxe-prompt=\"netboot-android\",0"
-    if [[ $TARGET_ARCH == x86_64 ]]; then
+    if [[ $BOOT_LOADER == shim ]]; then
+      echo "pxe-service=tag:!ipxe,X86-64_EFI,\"netboot-android (UEFI, Secure Boot ok)\",shimx64.efi"
+      echo "pxe-service=tag:!ipxe,BC_EFI,\"netboot-android (UEFI, Secure Boot ok)\",shimx64.efi"
+    elif [[ $TARGET_ARCH == x86_64 ]]; then
       echo "pxe-service=tag:!ipxe,x86PC,\"netboot-android (BIOS)\",undionly"
       echo "pxe-service=tag:!ipxe,X86-64_EFI,\"netboot-android (UEFI)\",ipxe.efi"
       echo "pxe-service=tag:!ipxe,BC_EFI,\"netboot-android (UEFI)\",ipxe.efi"
@@ -2694,7 +2845,9 @@ configure() {
     fi
     echo "# First match wins"
     echo "dhcp-boot=tag:ipxe,boot.ipxe"
-    if [[ $TARGET_ARCH == x86_64 ]]; then
+    if [[ $BOOT_LOADER == shim ]]; then
+      echo "dhcp-boot=tag:efi64,shimx64.efi"
+    elif [[ $TARGET_ARCH == x86_64 ]]; then
       echo "dhcp-boot=tag:efi64,tag:!ipxe,ipxe.efi"
       echo "dhcp-boot=tag:!efi64,tag:!arm64,tag:!ipxe,undionly.kpxe"
     else
@@ -2709,7 +2862,7 @@ configure() {
   write_manifest
   {
     echo "configured=$(now_iso)"
-    echo "iface=$IFACE mode=$MODE net=$NET/$PREFIX_LEN phone=$PHONE_IP port=$HTTP_PORT"
+    echo "iface=$IFACE mode=$MODE net=$NET/$PREFIX_LEN phone=$PHONE_IP port=$HTTP_PORT loader=$BOOT_LOADER"
     echo "args=$args"
   } > "$STATE/$DISTRO-$TARGET_ARCH.config"
 
@@ -2727,8 +2880,9 @@ manifest_files() {
   local f u
   echo "tftp/boot.ipxe"
   [[ $VERIFIED_BOOT == 1 ]] && echo "tftp/boot.ipxe.sig"
-  for f in $(ipxe_files_for_arch); do echo "tftp/$f"; done
-  [[ -s $TFTP/undionly.0 ]] && echo "tftp/undionly.0"
+  for f in $(boot_files); do echo "tftp/$f"; done
+  [[ $BOOT_LOADER == shim ]] && echo "tftp/grub/grub.cfg"
+  [[ $BOOT_LOADER != shim && -s $TFTP/undionly.0 ]] && echo "tftp/undionly.0"
   echo "http/$KERNEL_REL"
   echo "http/$INITRD_REL"
   [[ -n $ROOTFS_REL ]] && echo "http/$ROOTFS_REL"
@@ -3176,7 +3330,11 @@ require_ready() {
   [[ -n $PYTHON ]] || die "python3 not found. Run: $0 deps"
   [[ -f $DNSMASQ_CONF && -f $LIB/httpd.py ]] || die "Not configured. Run: $0 --distro $DISTRO --arch $TARGET_ARCH configure"
   load_layout
-  require_ipxe_matches_ca
+  if [[ $BOOT_LOADER == shim ]]; then
+    shim_ready || die "$E_ENV" "Ubuntu's signed boot files are missing. Run: $0 shim-fetch"
+  else
+    require_ipxe_matches_ca
+  fi
 }
 
 setup_direct() {
@@ -3282,6 +3440,7 @@ serve() {
 
   local vb_text="ON (signed, client verifies)"
   [[ $VERIFIED_BOOT == 1 ]] || vb_text="OFF"
+  [[ $BOOT_LOADER == shim ]] && vb_text="Ubuntu signed chain (Secure Boot ok)"
   echo
   box \
     "PXE SERVER STATUS: RUNNING" \
@@ -3548,7 +3707,9 @@ check() {
   (( expired == 0 )) && ok "Valid pins for all hosts in use"
   [[ -s $PIN_AUDIT ]] && grep -q INTERCEPTION "$PIN_AUDIT" && warn "Pin audit log contains INTERCEPTION entries: $PIN_AUDIT"
 
-  if [[ -s $IPXE_BUILT ]]; then ok "iPXE: $(head -n1 "$IPXE_BUILT")"; else warn "iPXE not built or imported yet"; fi
+  if [[ $BOOT_LOADER == shim ]]; then
+    if shim_ready; then ok "Ubuntu's signed boot files (shim + grub) present"; else warn "Ubuntu's signed boot files not fetched yet (run: $0 shim-fetch)"; fi
+  elif [[ -s $IPXE_BUILT ]]; then ok "iPXE: $(head -n1 "$IPXE_BUILT")"; else warn "iPXE not built or imported yet"; fi
   if iso_is_verified; then ok "ISO present and verified"; elif [[ -s $ISO ]]; then warn "ISO present but not verified"; else warn "ISO not downloaded"; fi
   if [[ -f $LAYOUT ]]; then ok "Boot files extracted"; else warn "Not extracted yet"; fi
   if [[ -f $MANIFEST ]]; then ok "Configured (manifest present)"; else warn "Not configured yet"; fi
@@ -3588,7 +3749,7 @@ save_profile() {
   mkdir -p "$STATE"
   { printf "DISTRO='%s'\n" "$DISTRO"; printf "TARGET_ARCH='%s'\n" "$TARGET_ARCH"
     printf "DHCP_MODE='%s'\n" "$DHCP_MODE"; printf "IFACE='%s'\n" "${IFACE:-}"
-    printf "HTTP_PORT='%s'\n" "$HTTP_PORT"; } | atomic_write "$PROFILE" || true
+    printf "HTTP_PORT='%s'\n" "$HTTP_PORT"; printf "BOOT_LOADER='%s'\n" "$BOOT_LOADER"; } | atomic_write "$PROFILE" || true
 }
 load_profile() {   # applies only values you did not give on the command line / environment
   [[ -r $PROFILE ]] || return 1
@@ -3599,7 +3760,7 @@ load_profile() {   # applies only values you did not give on the command line / 
     val=${val:1:${#val}-2}
     [[ $val != *\'* && -n $val ]] || continue
     case "$name" in
-      DISTRO|TARGET_ARCH|DHCP_MODE|IFACE|HTTP_PORT)
+      DISTRO|TARGET_ARCH|DHCP_MODE|IFACE|HTTP_PORT|BOOT_LOADER)
         [[ " $CLI_SET " == *" $name "* || -n ${PRE_ENV[$name]:-} ]] || printf -v "$name" '%s' "$val" ;;
     esac
   done < "$PROFILE"
@@ -3677,7 +3838,12 @@ diagnose() {
   elif [[ -s $TFTP/ipxe.efi && -f $IPXE_BUILT ]] && grep -q '^source=cloud' "$IPXE_BUILT"; then
     finding WARN LOADERTRUST "The iPXE loader came from GitHub without a saved approval" "$0 ipxe-fetch new"
   fi
+  if [[ $BOOT_LOADER == shim ]]; then
+    if shim_ready; then finding OK IPXE "Ubuntu's signed boot files present (Secure Boot ok)" ""
+    else finding FAIL IPXE "Ubuntu's signed boot files not fetched yet" "$0 shim-fetch"; fi
+  else
   [[ -s $TFTP/ipxe.efi ]] && finding OK IPXE "iPXE loader present" "" || finding FAIL IPXE "iPXE loader missing (this phone can build it itself)" "$([[ $HOST_ARCH == aarch64 && $TARGET_ARCH == x86_64 ]] && echo "$0 ipxe-phone" || echo "$0 build-ipxe")"
+  fi
   iso_is_verified && finding OK ISO "$P_LABEL image verified" "" || finding FAIL ISO "$P_LABEL image not downloaded/verified" "$0 --distro $DISTRO --arch $TARGET_ARCH fetch"
   [[ -f $LAYOUT ]] && finding OK EXTRACT "Boot files extracted" "" || finding FAIL EXTRACT "Boot files not extracted" "$0 --distro $DISTRO --arch $TARGET_ARCH extract"
   if [[ -f $MANIFEST && -f $TFTP/boot.ipxe ]]; then
@@ -3727,6 +3893,7 @@ verdict() {   # 0 ready, 1 attention
 }
 
 status() {
+  load_profile && set_distro || true
   printf '%sStatus: %s / %s  (network mode %s)%s\n' "$C_BOLD" "$P_LABEL" "$TARGET_ARCH" "$DHCP_MODE" "$C_RESET"
   diagnose; print_findings; verdict
 }
@@ -3759,6 +3926,7 @@ heal_safe() {
 }
 
 heal() {
+  load_profile && set_distro || true
   info "Checking and repairing (safe fixes only; nothing is deleted that you cannot rebuild)"
   heal_safe
   diagnose
@@ -3870,6 +4038,8 @@ pick_goal() {
 }
 
 pc_instructions() {
+  local sb_line="Secure Boot must be OFF for this route (the iPXE loader is not signed)."
+  [[ $BOOT_LOADER == shim ]] && sb_line="Secure Boot may stay ON (Ubuntu route). BIOS-only PCs cannot."
   echo
   box \
     "NOW, ON THE PC YOU WANT TO BOOT:" \
@@ -3881,8 +4051,9 @@ pc_instructions() {
     "     (not sure? try F12, then Esc, then F2 to open settings)" \
     "3. Pick: Network, PXE, or IPv4 Network Boot. UEFI is fine." \
     "4. If it will not list network boot: in settings turn ON" \
-    "   network boot and turn OFF Secure Boot, then try again." \
+    "   network boot, then try again." \
     "" \
+    "$sb_line" \
     "A good sign: text scrolls here when the PC asks for its files." \
     "Stop the server with Ctrl+C when the PC has booted."
   echo
@@ -4047,7 +4218,7 @@ guided_run() {
 
 g_done_attest()  { [[ -n $(attest_fpr) ]]; }
 g_done_sign()    { [[ -s $ATTEST/script.sha256.asc ]]; }
-g_done_ipxe()    { [[ -s $TFTP/ipxe.efi ]]; }
+g_done_ipxe()    { if [[ $BOOT_LOADER == shim ]]; then shim_ready; else [[ -s $TFTP/ipxe.efi ]]; fi; }
 g_done_fetch()   { iso_is_verified; }
 g_done_extract() { [[ -f $LAYOUT ]]; }
 
@@ -4057,6 +4228,20 @@ guided_ipxe() {
     "iPXE is the tiny program the PC runs first. It is built with YOUR key inside," \
     "so it only boots files you signed. Building takes 10-30 minutes on a phone."
   if g_done_ipxe; then ok "Already done."; ask_yn "Do it again anyway?" n || return 0; fi
+  if shim_supported; then
+    echo
+    say "${C_BOLD}Ubuntu can use its own signed boot files, which is the easy way:${C_RESET}"
+    say "  1) Ubuntu's signed boot files  ${C_GREEN}recommended: nothing to build, ready in about a minute${C_RESET}"
+    hint "   Works with Secure Boot ON or OFF. For UEFI PCs (almost all since about 2012), not very old BIOS-only ones."
+    say "  2) iPXE with your own certificate  ${C_DIM}(a signed chain you control; has to be built or fetched)${C_RESET}"
+    read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Choose 1 or 2 [1]: " c || c=""
+    if [[ ${c:-1} != 2 ]]; then
+      BOOT_LOADER=shim; save_profile
+      ( shim_fetch ) && ok "Ubuntu's signed boot files are ready" || warn "That did not finish. Run it again: $0 shim-fetch"
+      return 0
+    fi
+    BOOT_LOADER=ipxe; save_profile
+  fi
   host_cpu=$(uname -m); [[ $host_cpu == aarch64 ]] && host_cpu=arm64
   if [[ $host_cpu == "$TARGET_ARCH" ]]; then
     hint "This device matches the PC's CPU ($TARGET_ARCH), so building here works and keeps everything on this device."
@@ -4479,6 +4664,8 @@ COMMANDS
   build-ipxe            Build iPXE at IPXE_COMMIT with the boot CA and a
                         verify-first script embedded
   import-ipxe DIR       Use iPXE binaries built on another machine
+  shim-fetch            Ubuntu only: get Ubuntu's own signed boot files (shim + grub). No building,
+                        works with Secure Boot on or off (UEFI PCs). Use with --shim or BOOT_LOADER=shim
   ipxe-phone            Build the x86_64 loader ON THIS PHONE (sets up a small compiler first)
   proot-build           Inside a proot Linux on the phone: build the loader for your Termux install
   xbuild-setup          Only set up that on-phone compiler (Debian via proot-distro)
@@ -4588,6 +4775,7 @@ parse_args() {
       --dry-run)  DRY_RUN=1 ;;
       -y|--yes)   ASSUME_YES=1 ;;
       --no-backup) AUTO_BACKUP=0 ;;
+      --shim|--secure-boot) BOOT_LOADER=shim; CLI_SET+=" BOOT_LOADER" ;;
       --iso)      [[ $# -ge 2 ]] || die "--iso requires a path"; ISO_FILE="$2"; shift ;;
       --iso=*)    ISO_FILE="${1#*=}" ;;
       --distro)   [[ $# -ge 2 ]] || die "--distro requires a value"; DISTRO="$2"; CLI_SET+=" DISTRO"; shift ;;
@@ -4614,7 +4802,7 @@ case "$COMMAND" in
   *) guard_root; log_rotate ;;
 esac
 case "$COMMAND" in
-  deps|attest-init|self-sign|pins|build-ipxe|ipxe-phone|xbuild-setup|import-ipxe|proot-build|fetch|extract|configure|attest|serve|clean|backup|restore|terabox-install|all)
+  deps|attest-init|self-sign|pins|build-ipxe|ipxe-phone|shim-fetch|xbuild-setup|import-ipxe|proot-build|fetch|extract|configure|attest|serve|clean|backup|restore|terabox-install|all)
     acquire_lock ;;
 esac
 
@@ -4653,6 +4841,7 @@ case "$COMMAND" in
   build-ipxe)     build_ipxe ;;
   import-ipxe)    import_ipxe "${POSITIONAL[0]:-}" ;;
   ipxe-phone)     ipxe_phone ;;
+  shim-fetch)     shim_fetch ;;
   proot-build)    proot_build_flow ;;
   xbuild-setup)   xbox_setup ;;
   ipxe-request)   ipxe_request ;;

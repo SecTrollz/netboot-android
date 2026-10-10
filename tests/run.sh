@@ -1162,6 +1162,167 @@ test_a_manual_backup_always_runs() {
   assert "two manual backups, two archives" test "$(count_backups)" -eq 2
 }
 
+# ---- Ubuntu's signed boot files (shim + grub): Secure Boot route ----
+mk_fake_archive() {   # a local stand-in for archive.ubuntu.com, signed with a throwaway key
+  src; mkroot
+  command -v bsdtar >/dev/null && command -v xz >/dev/null || skip "bsdtar/xz missing"
+  DISTRO=ubuntu; TARGET_ARCH=x86_64; BOOT_LOADER=shim; set_distro
+  A="$T/arch"; GH="$T/archgpg"; mkdir -p "$A" "$GH"; chmod 700 "$GH"
+  gpg --homedir "$GH" --batch --passphrase '' --quick-gen-key "Fake Archive <a@a>" ed25519 sign never >/dev/null 2>&1 || skip "gpg cannot make a key"
+  FPR=$(gpg --homedir "$GH" --with-colons --list-keys | awk -F: '$1=="fpr"{print $10; exit}')
+  gpg --homedir "$GH" --export "$FPR" > "$T/archive-keyring.gpg"
+  UBUNTU_ARCHIVE_FPRS="$FPR"
+  # packages: each deb holds the files shim_fetch pulls out
+  mkdir -p "$T/pk/shim/usr/lib/shim" "$T/pk/grub/usr/lib/grub/x86_64-efi-signed" "$A/pool/main/s/shim-signed" "$A/pool/main/g/grub2-signed"
+  printf 'MZ-shim-signed-by-microsoft' > "$T/pk/shim/usr/lib/shim/shimx64.efi.signed.latest"
+  printf 'MZ-mokmanager' > "$T/pk/shim/usr/lib/shim/mmx64.efi"
+  printf 'MZ-grub-net-signed-by-canonical' > "$T/pk/grub/usr/lib/grub/x86_64-efi-signed/grubnetx64.efi.signed"
+  echo 2.0 > "$T/debian-binary"
+  mkdir -p "$T/d1" "$T/d2"; cp "$T/debian-binary" "$T/d1/"; cp "$T/debian-binary" "$T/d2/"
+  ( cd "$T/pk/shim" && bsdtar -czf "$T/d1/data.tar.gz" ./usr ) && ( cd "$T/d1" && bsdtar --format ar -cf "$A/pool/main/s/shim-signed/shim-signed_9_amd64.deb" debian-binary data.tar.gz )
+  ( cd "$T/pk/grub" && bsdtar -czf "$T/d2/data.tar.gz" ./usr ) && ( cd "$T/d2" && bsdtar --format ar -cf "$A/pool/main/g/grub2-signed/grub-efi-amd64-signed_9_amd64.deb" debian-binary data.tar.gz )
+  build_fake_release
+  vfetch() { local rel=${1#"$UBUNTU_ARCHIVE"/}; [[ -f $A/$rel ]] || return 1; cp "$A/$rel" "$2"; }
+  fetch_key_source() { cp "$T/archive-keyring.gpg" "$2"; }
+}
+
+build_fake_release() {   # (re)writes the package list and the signed release file
+  local d="$A/dists/resolute/main/binary-amd64" sh gr
+  mkdir -p "$d"
+  sh=$(sha256sum "$A/pool/main/s/shim-signed/shim-signed_9_amd64.deb" | cut -d' ' -f1)
+  gr=$(sha256sum "$A/pool/main/g/grub2-signed/grub-efi-amd64-signed_9_amd64.deb" | cut -d' ' -f1)
+  printf 'Package: shim-signed\nVersion: 9\nFilename: pool/main/s/shim-signed/shim-signed_9_amd64.deb\nSHA256: %s\n\nPackage: grub-efi-amd64-signed\nVersion: 9\nFilename: pool/main/g/grub2-signed/grub-efi-amd64-signed_9_amd64.deb\nSHA256: %s\n' "$sh" "$gr" > "$d/Packages"
+  xz -c "$d/Packages" > "$d/Packages.xz"
+  printf 'Origin: Ubuntu\nCodename: resolute\nSHA256:\n %s %s main/binary-amd64/Packages.xz\n' "$(sha256sum "$d/Packages.xz" | cut -d' ' -f1)" "$(stat -c %s "$d/Packages.xz")" > "$A/dists/resolute/Release"
+  gpg --homedir "$GH" --batch --yes --clearsign --output "$A/dists/resolute/InRelease" "$A/dists/resolute/Release" >/dev/null 2>&1
+}
+
+test_ubuntu_signed_boot_files_are_fetched_and_verified() {
+  mk_fake_archive
+  ( shim_fetch ) >"$T/s.out" 2>&1; rc=$?
+  [[ $rc -eq 0 ]] || sed 's/^/    shim said: /' "$T/s.out" | tail -14
+  assert "succeeds" test $rc -eq 0
+  assert "shim installed" test "$(cat "$TFTP/shimx64.efi")" = "MZ-shim-signed-by-microsoft"
+  assert "netboot grub installed as grubx64.efi" test "$(cat "$TFTP/grubx64.efi")" = "MZ-grub-net-signed-by-canonical"
+  assert "mokmanager installed" test -s "$TFTP/mmx64.efi"
+  assert "record written" grep -q '^shim-signed=9' "$STATE/shim-x86_64.built-from"
+  assert "shim_ready" shim_ready
+}
+
+test_release_signed_by_another_key_is_refused() {
+  mk_fake_archive
+  GH2="$T/evilgpg"; mkdir -p "$GH2"; chmod 700 "$GH2"
+  gpg --homedir "$GH2" --batch --passphrase '' --quick-gen-key "Evil <e@e>" ed25519 sign never >/dev/null 2>&1
+  gpg --homedir "$GH2" --batch --yes --clearsign --output "$A/dists/resolute/InRelease" "$A/dists/resolute/Release" >/dev/null 2>&1
+  ( shim_fetch ) >"$T/s.out" 2>&1; rc=$?
+  assert "refused (30)" test $rc -eq 30
+  assert "nothing installed" test ! -e "$TFTP/shimx64.efi"
+}
+
+test_a_tampered_package_list_is_refused() {
+  mk_fake_archive
+  printf 'Package: shim-signed\nVersion: 99\nFilename: pool/evil.deb\nSHA256: 00\n' | xz -c > "$A/dists/resolute/main/binary-amd64/Packages.xz"
+  ( shim_fetch ) >"$T/s.out" 2>&1; rc=$?
+  assert "refused (30)" test $rc -eq 30
+  assert "nothing installed" test ! -e "$TFTP/shimx64.efi"
+}
+
+test_a_tampered_package_is_refused() {
+  mk_fake_archive
+  printf 'tamper' >> "$A/pool/main/s/shim-signed/shim-signed_9_amd64.deb"
+  ( shim_fetch ) >"$T/s.out" 2>&1; rc=$?
+  assert "refused (30)" test $rc -eq 30
+  assert "nothing installed" test ! -e "$TFTP/shimx64.efi"
+}
+
+test_a_downgrade_to_an_older_version_is_not_chosen() {
+  mk_fake_archive
+  # a second pocket advertises an OLDER version: the newer one must win
+  mkdir -p "$A/dists/resolute-updates/main/binary-amd64"
+  sed 's/^Version: 9/Version: 3/' "$A/dists/resolute/main/binary-amd64/Packages" > "$A/dists/resolute-updates/main/binary-amd64/Packages"
+  xz -c "$A/dists/resolute-updates/main/binary-amd64/Packages" > "$A/dists/resolute-updates/main/binary-amd64/Packages.xz"
+  printf 'Codename: resolute\nSHA256:\n %s 1 main/binary-amd64/Packages.xz\n' "$(sha256sum "$A/dists/resolute-updates/main/binary-amd64/Packages.xz" | cut -d' ' -f1)" > "$A/dists/resolute-updates/Release"
+  gpg --homedir "$GH" --batch --yes --clearsign --output "$A/dists/resolute-updates/InRelease" "$A/dists/resolute-updates/Release" >/dev/null 2>&1
+  ( shim_fetch ) >"$T/s.out" 2>&1; rc=$?
+  assert "succeeds" test $rc -eq 0
+  assert "kept version 9" grep -q '^shim-signed=9$' "$STATE/shim-x86_64.built-from"
+}
+
+test_shim_mode_is_ubuntu_x86_64_only() {
+  src; mkroot
+  BOOT_LOADER=shim; DISTRO=debian; TARGET_ARCH=x86_64; set_distro
+  ( shim_fetch ) >"$T/s.out" 2>&1; rc=$?
+  assert "refused for other systems (exit 2)" test $rc -eq 2
+}
+
+test_configure_in_shim_mode_writes_grub_cfg_and_shim_dhcp_settings() {
+  src; mkroot
+  DISTRO=ubuntu; TARGET_ARCH=x86_64; BOOT_LOADER=shim; set_distro
+  mkdir -p "$TFTP" "$HTTP/casper" "$HTTP/iso" "$RUN"
+  printf 'MZ-s' > "$TFTP/shimx64.efi"; printf 'MZ-g' > "$TFTP/grubx64.efi"; printf 'MZ-m' > "$TFTP/mmx64.efi"
+  echo K > "$HTTP/casper/vmlinuz"; echo I > "$HTTP/casper/initrd"; echo R > "$HTTP/iso/ubuntu.iso"
+  printf "KERNEL_REL='casper/vmlinuz'\nINITRD_REL='casper/initrd'\nROOTFS_REL='iso/ubuntu.iso'\nSHA_REL=''\nBASEDIR=''\nUCODE_RELS=''\n" > "$LAYOUT"
+  resolve_network() { IFACE=wlan0; MODE=proxy; PHONE_IP=192.168.0.230; NET=192.168.0.0; MASK=255.255.255.0; PREFIX_LEN=24; BASE_URL="http://192.168.0.230:$HTTP_PORT"; IS_HOTSPOT=0; }
+  ( configure ) >"$T/c.out" 2>&1; rc=$?
+  [[ $rc -eq 0 ]] || sed 's/^/    configure said: /' "$T/c.out" | tail -10
+  assert "configure succeeds without iPXE or keys" test $rc -eq 0
+  assert "grub.cfg exists" test -s "$TFTP/grub/grub.cfg"
+  assert "grub loads the kernel over http from the phone" grep -q 'linux (http,192.168.0.230:8000)/casper/vmlinuz' "$TFTP/grub/grub.cfg"
+  assert "kernel args carry the image URL" grep -q 'url=http://192.168.0.230:8000/iso/ubuntu.iso' "$TFTP/grub/grub.cfg"
+  assert "initrd line" grep -q 'initrd (http,192.168.0.230:8000)/casper/initrd' "$TFTP/grub/grub.cfg"
+  assert "dhcp hands UEFI PCs the shim" grep -q 'dhcp-boot=tag:efi64,shimx64.efi' "$DNSMASQ_CONF"
+  assert "pxe menu entry uses the shim" grep -q 'X86-64_EFI.*shimx64.efi' "$DNSMASQ_CONF"
+  assert "iPXE is not offered" bash -c '! grep -q "ipxe.efi" "$1"' _ "$DNSMASQ_CONF"
+  assert "shim, grub and grub.cfg are in the integrity manifest" bash -c 'grep -q " tftp/shimx64.efi$" "$1" && grep -q " tftp/grub/grub.cfg$" "$1" && grep -q " tftp/grubx64.efi$" "$1"' _ "$MANIFEST"
+}
+
+test_status_asks_for_shim_files_in_shim_mode() {
+  src; mkroot
+  DISTRO=ubuntu; TARGET_ARCH=x86_64; BOOT_LOADER=shim; set_distro
+  diagnose
+  hit=""; for i in "${!F_TAG[@]}"; do [[ ${F_TAG[$i]} == IPXE ]] && hit="${F_LVL[$i]}|${F_FIX[$i]}"; done
+  assert "missing shim is a FAIL with the fetch command" test "$hit" = "FAIL|$0 shim-fetch"
+}
+
+test_guide_offers_ubuntus_signed_files_first_and_remembers_the_choice() {
+  cat > "$T/ip.sh" <<EOT
+export NETBOOT_SOURCE_ONLY=1
+source "$SCRIPT"
+DISTRO=ubuntu; TARGET_ARCH=x86_64; set_distro
+mkdir -p "\$STATE"
+g_done_ipxe() { return 1; }
+shim_fetch() { echo "SHIM-FETCH-RAN"; }
+guided_ipxe
+echo "LOADER=\$BOOT_LOADER"
+cat "\$PROFILE" | grep BOOT_LOADER
+EOT
+  python3 -I -c "$PTY_PY" "|" bash "$T/ip.sh" > "$T/pty.out" 2>&1
+  assert "Enter picks Ubuntu's signed files" grep -q "SHIM-FETCH-RAN" "$T/pty.out"
+  assert "mentions Secure Boot" grep -q "Secure Boot" "$T/pty.out"
+  assert "route remembered in the profile" grep -q "BOOT_LOADER='shim'" "$T/pty.out"
+}
+
+test_other_distros_never_see_the_shim_offer() {
+  cat > "$T/ip2.sh" <<EOT
+export NETBOOT_SOURCE_ONLY=1
+source "$SCRIPT"
+DISTRO=debian; TARGET_ARCH=x86_64; set_distro
+g_done_ipxe() { return 1; }
+ipxe_cloud() { echo "CLOUD"; }
+guided_ipxe
+EOT
+  python3 -I -c "$PTY_PY" "|" bash "$T/ip2.sh" > "$T/pty.out" 2>&1
+  assert "no shim question for Debian" bash -c '! grep -q "signed boot files" "$1"' _ "$T/pty.out"
+}
+
+test_shim_flag_beats_a_saved_ipxe_profile() {
+  src; mkroot
+  printf "DISTRO='ubuntu'\nBOOT_LOADER='ipxe'\n" > "$PROFILE"
+  CLI_SET=" BOOT_LOADER"; BOOT_LOADER=shim
+  load_profile
+  assert "command line wins" test "$BOOT_LOADER" = shim
+}
+
 # ---------------------------------------------------------------- run
 for t in $(declare -F | awk '{print $3}' | grep '^test_'); do run_test "$t"; done
 
