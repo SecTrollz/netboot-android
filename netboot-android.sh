@@ -4073,8 +4073,8 @@ pick_goal() {
 }
 
 pc_instructions() {
-  local sb_line="Secure Boot: this distro has no signed network route, so it must be OFF (only Ubuntu works with it on)."
-  [[ $BOOT_LOADER == shim ]] && sb_line="Do NOT touch Secure Boot. Leave it as it is. (BIOS-only PCs cannot network-boot this way.)"
+  local sb1="Secure Boot: this distro has no signed network route," sb2="so turn it OFF for this one (only Ubuntu works with it on)."
+  if [[ $BOOT_LOADER == shim ]]; then sb1="Do NOT touch Secure Boot. Leave it exactly as it is."; sb2="(Very old BIOS-only PCs cannot network-boot this way.)"; fi
   echo
   box \
     "NOW, ON THE PC YOU WANT TO BOOT:" \
@@ -4088,7 +4088,8 @@ pc_instructions() {
     "4. If it will not list network boot: in settings turn ON" \
     "   network boot, then try again." \
     "" \
-    "$sb_line" \
+    "$sb1" \
+    "$sb2" \
     "A good sign: text scrolls here when the PC asks for its files." \
     "Stop the server with Ctrl+C when the PC has booted."
   echo
