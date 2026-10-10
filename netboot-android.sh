@@ -3446,6 +3446,17 @@ usb_cleanup() {
   info "USB drive mode stopped. The phone's normal USB settings are back."
 }
 
+# What the phone itself says about why the USB gadget was refused (shown only after a failure)
+usb_diag() {
+  local line
+  info "SELinux now: $(run_root 'getenforce' 2>/dev/null || echo unknown)   root context: $(run_root 'id -Z' 2>/dev/null || echo unknown)"
+  info "Kernel: $(uname -r)"
+  info "Gadgets present: $(run_root "ls '$USB_CFG'" 2>/dev/null | tr '\n' ' ')"
+  info "Functions the kernel offers: $(run_root "ls '$USB_CFG/$USB_GNAME/functions' 2>/dev/null; zcat '$USB_KCONFIG' 2>/dev/null | grep -E 'CONFIGFS_(MASS_STORAGE|F_FS|ECM|RNDIS|NCM)=' | tr '\n' ' '" 2>/dev/null)"
+  info "Kernel messages about it (last lines):"
+  run_root "dmesg 2>/dev/null | grep -iE 'avc|gadget|configfs|mass_storage|fsg|usb_cfg|denied' | tail -n 12" 2>/dev/null | sed 's/^/    /' || true
+}
+
 # Creates the gadget folders and points them at the ISO; does not connect it to the USB port yet.
 usb_prepare_gadget() {
   local g_path=$1
@@ -3512,6 +3523,7 @@ usb_boot_start() {
       fi
     fi
     if [[ ! -e $RUN/usb.ok ]]; then
+      usb_diag
       usb_boot_stop
       die "$E_ENV" "Could not switch on USB drive mode: ${why:-unknown error}. If SELinux was already permissive, this phone's kernel or vendor setup does not allow a USB drive gadget here."
     fi
