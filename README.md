@@ -56,17 +56,19 @@ Every step is checked. The script has trust issues, and they are healthy ones.
 
 ---
 
-## Backups of the working folder
+## Backups of the working folder (optional)
 
-`serve` and `clean` take a restorable archive of `~/netboot` (keys, attestation, pins, state, TFTP files, configs) into `~/netboot-backups`, with a SHA-256 sidecar, **only when something actually changed since the last backup**. Logs, locks, the big downloads and extracted files do not count, so a normal run costs nothing. A backup is a safety net, never a gate: if it cannot finish, the script says so and carries on.
+**Nothing is backed up unless you ask.** To make a restorable archive of `~/netboot` (keys, attestation, pins, state, TFTP files, configs) in `~/netboot-backups`, with a SHA-256 sidecar:
 
 ```sh
-./netboot-android.sh backup            # take one now (always runs)
+./netboot-android.sh backup            # take one now
+./netboot-android.sh --backup go       # also back up before this one run (only if something changed)
+./netboot-android.sh backup-auto on    # make it automatic before serve and clean (off is the default)
 ./netboot-android.sh backup-list       # newest first
 ./netboot-android.sh restore FILE      # verify checksum, save current state, restore
-./netboot-android.sh backup-auto off   # never back up automatically (on turns it back on)
-./netboot-android.sh --no-backup go    # skip it for this one run
 ```
+
+When automatic backups are on, a backup is taken only if something actually changed since the last one (logs, locks, the big downloads and extracted files do not count), and it is a safety net, never a gate: if it cannot finish, the script says so and carries on. `restore` always saves the current state first, because it overwrites files.
 
 Extracted `http/`, `src/`, and `run/` are skipped because they rebuild. `downloads/` (the ISOs) is skipped unless `BACKUP_DL=1`. The newest 5 are kept (`BACKUP_KEEP`).
 
@@ -76,7 +78,7 @@ Extracted `http/`, `src/`, and `run/` are skipped because they rebuild. `downloa
 ./netboot-android.sh terabox-install                      # needs git and Go 1.24+
 export TERABOX_COOKIE_FILE=~/.terabox-cookie              # contains: ndus=...
 export BACKUP_GPG_PASSFILE=~/.nb-pass                     # archive passphrase
-./netboot-android.sh serve                                # backs up, encrypts, uploads to /netboot-backups
+./netboot-android.sh --backup serve                       # backs up, encrypts, uploads to /netboot-backups
 ```
 
 The archive holds your signing keys, so it is AES256-encrypted first and never uploaded without the passphrase file. A failed upload only warns; the local backup stays. To restore from Terabox, fetch the `.gpg` file with `tbc get`, decrypt it with `gpg -d FILE.gpg > FILE`, and then run `restore FILE` after putting the matching `.sha256` next to it (or unpack it with `tar -xzf`). For any other uploader, set `BACKUP_UPLOAD_CMD` instead.
@@ -212,7 +214,7 @@ What it does for you while it runs:
 
 Honest limits: the fast check trusts a file's size, time, and inode for a few minutes until the background check finishes, so someone with root who forges those could briefly serve a changed root image (the kernel and initrd are signed and always fully checked). The root image is unsigned on the client for most distros; see the header of the script. Android features (root, `oom_score_adj`, Wi-Fi power mode) can only be proven on a real phone.
 
-Tests: `tests/run.sh` runs 96 checks (fault injection and the easy-mode screens) (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
+Tests: `tests/run.sh` runs 99 checks (fault injection and the easy-mode screens) (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
 
 ---
 

@@ -1148,11 +1148,11 @@ test_backup_auto_off_is_remembered_and_the_flag_skips_one_run() {
   assert "saved in the settings file" grep -q "^AUTO_BACKUP='0'" "$STATE/backup.conf"
   mkdir -p "$ROOT/keys"; echo k > "$ROOT/keys/k"
   out=$(NETBOOT_SOURCE_ONLY=0 "$SCRIPT" backup-auto 2>&1)
-  assert "reports OFF" grep -q 'OFF' <<<"$out"
+  assert "reports only-when-asked" grep -q 'ONLY WHEN YOU ASK' <<<"$out"
   NETBOOT_SOURCE_ONLY=0 "$SCRIPT" backup-auto on >/dev/null 2>&1
   assert "can be turned back on" grep -q "^AUTO_BACKUP='1'" "$STATE/backup.conf"
   out=$(NETBOOT_SOURCE_ONLY=0 "$SCRIPT" --no-backup backup-auto 2>&1)
-  assert "--no-backup is understood" grep -q 'OFF' <<<"$out"
+  assert "--no-backup is understood" grep -q 'ONLY WHEN YOU ASK' <<<"$out"
 }
 
 test_a_manual_backup_always_runs() {
@@ -1321,6 +1321,37 @@ test_shim_flag_beats_a_saved_ipxe_profile() {
   CLI_SET=" BOOT_LOADER"; BOOT_LOADER=shim
   load_profile
   assert "command line wins" test "$BOOT_LOADER" = shim
+}
+
+test_backups_are_off_unless_asked_for() {
+  src; mkroot
+  mkdir -p "$ROOT/keys"; echo k > "$ROOT/keys/k"
+  assert "default is off" test "$AUTO_BACKUP" = 0
+  out=$(auto_backup serve 2>&1)
+  assert "serve/clean make no backup" test "$(count_backups)" -eq 0
+  assert "and say nothing about it" test -z "$out"
+}
+
+test_backup_flag_opts_in_for_one_run() {
+  src; mkroot
+  out=$(NETBOOT_SOURCE_ONLY=0 "$SCRIPT" backup-auto 2>&1)
+  assert "status says only when asked" grep -q 'ONLY WHEN YOU ASK' <<<"$out"
+  out=$(NETBOOT_SOURCE_ONLY=0 "$SCRIPT" --backup backup-auto 2>&1)
+  assert "--backup turns it on for the run" grep -q 'AUTOMATIC' <<<"$out"
+  out=$(NETBOOT_SOURCE_ONLY=0 "$SCRIPT" backup-auto 2>&1)
+  assert "but does not stick" grep -q 'ONLY WHEN YOU ASK' <<<"$out"
+}
+
+test_a_manual_backup_and_restore_safety_copy_still_work_with_auto_off() {
+  src; mkroot
+  mkdir -p "$ROOT/keys"; echo k1 > "$ROOT/keys/k"
+  NETBOOT_SOURCE_ONLY=0 "$SCRIPT" backup >/dev/null 2>&1
+  assert "manual backup works" test "$(count_backups)" -eq 1
+  f=$(ls "$BACKUP_DIR"/netboot-manual-*.tar.gz | head -n1)
+  sleep 1.1; echo k2 > "$ROOT/keys/k"
+  NETBOOT_SOURCE_ONLY=0 "$SCRIPT" restore "$f" >/dev/null 2>&1
+  assert "restore keeps its safety copy of what it overwrote" test "$(count_backups)" -eq 2
+  assert "restored" test "$(cat "$ROOT/keys/k")" = k1
 }
 
 # ---------------------------------------------------------------- run

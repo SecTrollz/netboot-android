@@ -175,7 +175,7 @@ load_saved_settings() {
 }
 load_saved_settings
 
-AUTO_BACKUP="${AUTO_BACKUP:-1}"           # 1: back up the working folder before serve and clean
+AUTO_BACKUP="${AUTO_BACKUP:-0}"           # 0 (default): never back up unless asked. 1: back up before serve and clean (only if something changed)
 BACKUP_DIR="${BACKUP_DIR:-$HOME/netboot-backups}"
 BACKUP_KEEP="${BACKUP_KEEP:-5}"           # newest archives kept after each backup
 BACKUP_DL="${BACKUP_DL:-0}"               # 1: include downloads/ (ISOs, large)
@@ -3144,7 +3144,7 @@ backup_create() {
   info "Backing up $ROOT -> $out"
   if ! ( umask 077; tar -C "$parent" -czpf "$out.part" "${ex[@]}" "$base" ) 2>/dev/null; then
     rm -f "$out.part"
-    die "Backup failed (unreadable files? run: sudo chown -R \$(id -u) $ROOT). Set AUTO_BACKUP=0 to skip."
+    die "Backup failed (unreadable files? run: sudo chown -R \$(id -u) $ROOT)."
   fi
   tar -tzf "$out.part" >/dev/null 2>&1 || { rm -f "$out.part"; die "Backup archive failed its read-back test"; }
   mv -f "$out.part" "$out"
@@ -3255,7 +3255,7 @@ backup_verify() {
 
 # Runs before anything that can change or remove served state.
 auto_backup() {
-  [[ $AUTO_BACKUP == 1 ]] || { info "Automatic backup is off. Skipping."; return 0; }
+  [[ $AUTO_BACKUP == 1 ]] || return 0      # backups happen only when you ask for them
   [[ -d $ROOT ]] || return 0
   local now last
   now=$(backup_fingerprint 2>/dev/null || true)
@@ -3275,8 +3275,8 @@ auto_backup() {
 backup_auto_cmd() {
   case "${1:-}" in
     on)  save_setting AUTO_BACKUP 1 && ok "Automatic backups are ON: one is taken before serve or clean, only when something changed." ;;
-    off) save_setting AUTO_BACKUP 0 && ok "Automatic backups are OFF. Take one yourself any time with: $0 backup" ;;
-    *)   info "Automatic backups are $([[ $AUTO_BACKUP == 1 ]] && echo ON || echo OFF). Change with: $0 backup-auto on|off" ;;
+    off) save_setting AUTO_BACKUP 0 && ok "Automatic backups are OFF (the default). Take one yourself any time with: $0 backup" ;;
+    *)   info "Backups are $([[ $AUTO_BACKUP == 1 ]] && echo "AUTOMATIC (before serve and clean)" || echo "ONLY WHEN YOU ASK (the default)"). Take one: $0 backup   |   Automatic: $0 backup-auto on" ;;
   esac
 }
 
@@ -3858,7 +3858,7 @@ diagnose() {
   fi
   # backups
   last=$(ls -1t "$BACKUP_DIR"/netboot-*.tar.gz 2>/dev/null | head -n1 || true)
-  if [[ -z $last ]]; then finding INFO BACKUP "No backup yet (one is taken automatically before serve)" ""
+  if [[ -z $last ]]; then finding INFO BACKUP "No backup (optional: $0 backup)" ""
   else
     age=$(( ( $(date +%s) - $(file_mtime "$last") ) / 3600 ))
     (( age < 168 )) && finding OK BACKUP "Last backup $age h ago" "" || finding WARN BACKUP "Last backup is $((age/24)) days old" "$0 backup"
@@ -4405,9 +4405,18 @@ offsite_wizard() {
     fi
   fi
 
-  # 4. test
+  # 4. automatic backups: off unless you say so
   say ""
-  if ask_yn "Run a test backup now to try it out?" y; then
+  if ask_yn "Also take a backup automatically before each serve? (otherwise only when you run: $0 backup)" n; then
+    save_setting AUTO_BACKUP 1 && ok "Automatic backups are ON"
+  else
+    save_setting AUTO_BACKUP 0
+    info "Backups will only happen when you ask: $0 backup"
+  fi
+
+  # 5. test
+  say ""
+  if [[ -n ${GDRIVE_REMOTE:-}${TERABOX_COOKIE_FILE:-} ]] && ask_yn "Take a one-off test backup now to try the cloud copy?" n; then
     ( backup_create test ) || warn "The test did not finish. Your settings are saved; fix the issue and test again from the menu."
   fi
   ok "Settings saved in $STATE/backup.conf. serve and clean will use them automatically."
@@ -4425,8 +4434,8 @@ guided() {
       "- Every step says what it does, in plain words." \
       "- Press Enter to accept the suggested answer (shown in capitals)." \
       "- Type q at any question to stop safely." \
-      "- Nothing is deleted. A backup of your working folder is taken" \
-      "  before the server starts."
+      "- Nothing is deleted. Backups are optional and only" \
+      "  happen when you ask (the backup step, or --backup)."
     say ""
     ask_yn "Ready to begin?" y || { info "OK. Come back any time."; return 0; }
   fi
@@ -4468,7 +4477,7 @@ guided() {
   gstep_head "Start the boot server" \
     "Plug the PC into the same network (or cable), set it to network (PXE) boot," \
     "Secure Boot off, then power it on. Press Ctrl+C here to stop the server."
-  hint "A backup of your working folder is taken first, automatically."
+  hint "No backup is taken unless you ask for one (./netboot-android.sh backup, or --backup)."
   if ask_yn "Start the server now?" y; then
     run_step serve
   else
@@ -4680,8 +4689,8 @@ COMMANDS
   backup                Archive the working folder (SHA-256 sidecar) into $BACKUP_DIR
   terabox-install       Build the unofficial Terabox CLI (fcr--/tbc, pinned) for offsite backups
   backup-list           List backups, newest first
-  backup-auto on|off    Turn the automatic pre-serve backup on or off for good
-                        (it already skips itself when nothing changed; --no-backup skips one run)
+  backup-auto on|off    Make backups automatic before serve and clean (off is the default); when on it
+                        skips itself if nothing changed. --backup asks for one on a single run
   restore ARCHIVE       Verify a backup, save the current state, then restore it
                         (add --dry-run to only list what would be replaced)
   serve                 Backs up the working folder, integrity gate, then HTTP + dnsmasq (DHCP/TFTP) as root
@@ -4734,7 +4743,7 @@ ENVIRONMENT VARIABLES
   ALLOW_UNPINNED=1      Fetch transport-trusted content without a pin (not recommended)
   ALLOW_UNVERIFIED=1    Accept an ISO with no verified signature (not recommended)
   ACCEPT_SCRIPT_CHANGE=1  Run even though the script changed since self-sign
-  AUTO_BACKUP           1 (default): back up before serve and clean, only if something changed. 0: skip
+  AUTO_BACKUP           0 (default): backups only when you ask. 1: also back up before serve and clean (only if something changed)
   BACKUP_DIR            Where backups go                          (default: ~/netboot-backups)
   BACKUP_KEEP           Newest backups kept                       (default: 5)
   BACKUP_DL             1: include downloads/ (ISOs) in backups   (default: 0)
@@ -4775,6 +4784,7 @@ parse_args() {
       --dry-run)  DRY_RUN=1 ;;
       -y|--yes)   ASSUME_YES=1 ;;
       --no-backup) AUTO_BACKUP=0 ;;
+      --backup)    AUTO_BACKUP=1 ;;
       --shim|--secure-boot) BOOT_LOADER=shim; CLI_SET+=" BOOT_LOADER" ;;
       --iso)      [[ $# -ge 2 ]] || die "--iso requires a path"; ISO_FILE="$2"; shift ;;
       --iso=*)    ISO_FILE="${1#*=}" ;;
