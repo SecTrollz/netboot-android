@@ -200,7 +200,7 @@ Network boot needs an Ethernet connection, and USB tethering does not count (PC 
 ./netboot-android.sh usb-boot     # then plug the phone into the PC and boot from the USB device
 ```
 
-No network, router or Secure Boot change is needed (Ubuntu's image is signed). It needs root and a kernel with USB mass-storage support; `usb-boot check` tells you. While it runs, the phone's USB file transfer and adb pause; Ctrl+C (or `usb-boot stop` after a crash) puts everything back. The ISO is shown read-only and only if it passed verification. `USB_CDROM=1` makes it look like a CD drive instead of a USB drive, for firmware that prefers that. The live system then runs from the ISO over USB, so it does not need the 10 GB of client RAM that network boot does. Not yet tried on real hardware from this repository.
+It works with the cable unplugged too: it prepares everything and connects the moment the phone is plugged into the PC. No network, router or Secure Boot change is needed (Ubuntu's image is signed). It needs root and a kernel with USB mass-storage support; `usb-boot check` tells you. While it runs, the phone's USB file transfer and adb pause; Ctrl+C (or `usb-boot stop` after a crash) puts everything back. The ISO is shown read-only and only if it passed verification. `USB_CDROM=1` makes it look like a CD drive instead of a USB drive, for firmware that prefers that. The live system then runs from the ISO over USB, so it does not need the 10 GB of client RAM that network boot does. Not yet tried on real hardware from this repository.
 
 ## Daily use and emergencies
 
@@ -231,7 +231,7 @@ What it does for you while it runs:
 
 Honest limits: the fast check trusts a file's size, time, and inode for a few minutes until the background check finishes, so someone with root who forges those could briefly serve a changed root image (the kernel and initrd are signed and always fully checked). The root image is unsigned on the client for most distros; see the header of the script. Android features (root, `oom_score_adj`, Wi-Fi power mode) can only be proven on a real phone.
 
-Tests: `tests/run.sh` runs 114 checks (fault injection and the easy-mode screens) (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
+Tests: `tests/run.sh` runs 115 checks (fault injection and the easy-mode screens) (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
 
 ---
 

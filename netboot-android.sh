@@ -3420,13 +3420,13 @@ usb_check() {
   if run_root "zcat '$USB_KCONFIG' 2>/dev/null | grep -qE '^CONFIG_USB_CONFIGFS_MASS_STORAGE=[ym]'" >/dev/null 2>&1; then msc=yes
   elif run_root "[ -r '$USB_KCONFIG' ]" >/dev/null 2>&1; then msc=no; fi
   [[ $cfg == yes ]] && ok "USB gadget folder found: $USB_CFG" || err "No USB gadget folder ($USB_CFG). This phone cannot act as a USB drive."
-  [[ -n $udc ]]     && ok "USB controller: $udc" || err "No USB controller found in $USB_UDC_DIR"
+  [[ -n $udc ]]     && ok "USB controller: $udc" || info "No USB controller is listed yet. That is normal until the cable is plugged in: it will be picked up when it appears."
   case $msc in
     yes)     ok "Kernel supports USB mass storage" ;;
     no)      err "Kernel says it has no USB mass storage support" ;;
     unknown) info "Could not read the kernel config. It may still work; the start will tell." ;;
   esac
-  [[ $cfg == yes && -n $udc && $msc != no ]]
+  [[ $cfg == yes && $msc != no ]]
 }
 
 usb_boot_stop() {
@@ -3453,7 +3453,7 @@ usb_boot_start() {
   iso_is_verified || die "$E_INTEGRITY" "The ISO is not marked as verified. Run: $0 fetch (it checks the signature and checksum first)"
   usb_check || die "$E_ENV" "This phone cannot act as a USB drive (see above)."
   mkdir -p "$RUN"
-  udc=$(run_root "ls -1 '$USB_UDC_DIR' | head -n1")
+  udc=$(run_root "ls -1 '$USB_UDC_DIR' 2>/dev/null | head -n1" 2>/dev/null || true)
   journal_replay
   # remember what is bound now so it can be put back exactly
   for g in $(run_root "ls -1 '$USB_CFG' 2>/dev/null" 2>/dev/null || true); do
@@ -3491,13 +3491,29 @@ mkdir -p \"\$F\"
 echo 1 > \"\$F/ro\"
 echo '$USB_CDROM' > \"\$F/cdrom\"
 echo '$ISO' > \"\$F/file\"
-ln -sf \"\$G/functions/mass_storage.0\" \"\$G/configs/c.1/mass_storage.0\"
-echo '$udc' > \"\$G/UDC\"" >/dev/null 2>"$RUN/usb.err" || {
+ln -sf \"\$G/functions/mass_storage.0\" \"\$G/configs/c.1/mass_storage.0\"" >/dev/null 2>"$RUN/usb.err" || {
     local why; why=$(tr '\n' ' ' < "$RUN/usb.err" 2>/dev/null | cut -c1-240)
     usb_boot_stop
     die "$E_ENV" "Could not switch on USB drive mode: ${why:-unknown error}. If it says 'Permission denied' or 'Operation not permitted', SELinux is blocking the file: see '$0 selinux status'. If it says the file cannot be opened, the kernel may lack mass-storage support."
   }
-  [[ $(run_root "cat '$g_path/UDC'" 2>/dev/null) == "$udc" ]] || { usb_boot_stop; die "$E_ENV" "The USB port did not switch over. Unplug the cable, run '$0 usb-boot stop', and try again."; }
+  # Everything is prepared. Connect it to the USB port now, or as soon as the port shows up (cable plugged in).
+  local bind_err="" last_msg="" shown_msg="" tries=0
+  while true; do
+    [[ -n $udc ]] || udc=$(run_root "ls -1 '$USB_UDC_DIR' 2>/dev/null | head -n1" 2>/dev/null || true)
+    if [[ -n $udc ]]; then
+      if run_root "echo '$udc' > '$g_path/UDC'" >/dev/null 2>"$RUN/usb.err"; then
+        [[ $(run_root "cat '$g_path/UDC'" 2>/dev/null) == "$udc" ]] && break
+      fi
+      bind_err=$(tr '\n' ' ' < "$RUN/usb.err" 2>/dev/null | cut -c1-160)
+      tries=$((tries+1))
+      (( tries < 8 )) || { usb_boot_stop; die "$E_ENV" "The USB port would not switch over (${bind_err:-no message}). Unplug the cable, run '$0 usb-boot stop', and try again."; }
+      last_msg="USB port busy, retrying (${bind_err:-no message})"
+    else
+      last_msg="Waiting for the USB cable. Plug the phone into the PC when you are ready."
+    fi
+    [[ $last_msg == "$shown_msg" ]] || { info "$last_msg"; shown_msg=$last_msg; }
+    sleep 2
+  done
 
   size_mb=$(( $(file_size "$ISO") / 1048576 ))
   echo

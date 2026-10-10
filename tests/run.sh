@@ -1408,6 +1408,22 @@ test_usb_drive_mode_refuses_an_unverified_iso() {
   assert "nothing was created" test ! -e "$USB_CFG/netboot-android"
 }
 
+test_usb_drive_mode_waits_for_the_cable_instead_of_failing() {
+  can_root || skip "needs root or sudo"
+  src; mkroot; mk_fake_usb; IS_TERMUX=0
+  rm -rf "$USB_UDC_DIR/fake.udc"; echo > "$USB_CFG/android0/UDC"       # no cable yet: no controller listed
+  ( usb_boot_start ) > "$T/usb.out" 2>&1 & u=$!
+  sleep 5
+  assert "still running, not failed" kill -0 "$u"
+  assert "says it is waiting" grep -q 'Waiting for the USB cable' "$T/usb.out"
+  assert "everything else is prepared already" test "$(cat "$USB_CFG/netboot-android/functions/mass_storage.0/lun.0/file")" = "$ISO"
+  mkdir -p "$USB_UDC_DIR/fake.udc"; echo configured > "$USB_UDC_DIR/fake.udc/state"   # cable plugged in
+  for _ in $(seq 1 30); do [[ -s $USB_CFG/netboot-android/UDC ]] && break; sleep 0.5; done
+  assert "connected once the cable appeared" test "$(cat "$USB_CFG/netboot-android/UDC")" = fake.udc
+  kill -TERM "$u" 2>/dev/null; wait "$u" 2>/dev/null
+  exit 0
+}
+
 test_usb_check_reports_a_phone_without_gadget_support() {
   can_root || skip "needs root or sudo"
   src; mkroot; USB_CFG="$T/none/usb_gadget"; USB_UDC_DIR="$T/none/udc"
