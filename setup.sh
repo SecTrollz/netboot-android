@@ -99,8 +99,20 @@ verify_copy() {
     read -r -p "Press Enter to continue, or Ctrl+C to stop. " a
     return 0
   fi
-  UPSTREAM_REPO="$REPO_URL" UPSTREAM_BRANCH="$BRANCH" "$script" verify-upstream \
-    || die "This copy does NOT match the release on GitHub. Do not use it."
+  local out rc=0
+  out=$(UPSTREAM_REPO="$REPO_URL" UPSTREAM_BRANCH="$BRANCH" "$script" verify-upstream 2>&1) || rc=$?
+  printf '%s\n' "$out"
+  if (( rc != 0 )); then
+    # Only these outcomes mean the copy itself is wrong. Anything else (network,
+    # expired certificate pins, missing branch) means it could not be checked.
+    if grep -qE 'TIME MISMATCH|NOT the copy|EXPECT_CODE|verification FAILED' <<<"$out"; then
+      die "This copy does NOT match the release on GitHub. Do not use it."
+    fi
+    warn "Could not check this copy against GitHub (network or certificate pins). It is not proven good or bad."
+    read -r -p "Type continue to use it anyway, or press Enter to stop: " a
+    [[ $a == continue ]] || die "Stopped. Try again later, or on another network."
+    return 0
+  fi
   echo "Compare the code above with the code the author published (README or release notes)."
   read -r -p "Is it the same? [y/N] " a
   [[ $a == [yY]* ]] || die "Stopped. Do not use this copy until the codes match."
