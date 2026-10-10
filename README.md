@@ -52,7 +52,7 @@ Every step is checked. The script has trust issues, and they are healthy ones.
 - A **rooted** Android phone with Termux (give Termux root in Magisk or KernelSU), or a Linux machine with sudo.
 - Free storage: about 3 GB to 17 GB, depending on the distro. `check` will tell you. `check` is very honest. It has never lied, not even about the soup.
 - The PC on the same network as the phone, or a cable straight between them.
-- On the PC: **network (PXE) boot on, Secure Boot off.**
+- On the PC: **network (PXE) boot on.** With Ubuntu you never touch Secure Boot. Other distros need it off.
 
 ---
 
