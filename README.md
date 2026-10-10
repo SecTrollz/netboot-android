@@ -58,13 +58,17 @@ Every step is checked. The script has trust issues, and they are healthy ones.
 
 ## Backups of the working folder
 
-`serve` and `clean` first write a restorable archive of `~/netboot` (keys, attestation, pins, state, TFTP files, configs) to `~/netboot-backups`, with a SHA-256 sidecar. Extracted `http/`, `src/`, and `run/` are skipped because they rebuild. `downloads/` (the ISOs) is skipped unless `BACKUP_DL=1`. The newest 5 are kept (`BACKUP_KEEP`). If the backup fails, the command stops. `AUTO_BACKUP=0` turns this off.
+`serve` and `clean` take a restorable archive of `~/netboot` (keys, attestation, pins, state, TFTP files, configs) into `~/netboot-backups`, with a SHA-256 sidecar, **only when something actually changed since the last backup**. Logs, locks, the big downloads and extracted files do not count, so a normal run costs nothing. A backup is a safety net, never a gate: if it cannot finish, the script says so and carries on.
 
 ```sh
-./netboot-android.sh backup            # take one now
+./netboot-android.sh backup            # take one now (always runs)
 ./netboot-android.sh backup-list       # newest first
 ./netboot-android.sh restore FILE      # verify checksum, save current state, restore
+./netboot-android.sh backup-auto off   # never back up automatically (on turns it back on)
+./netboot-android.sh --no-backup go    # skip it for this one run
 ```
+
+Extracted `http/`, `src/`, and `run/` are skipped because they rebuild. `downloads/` (the ISOs) is skipped unless `BACKUP_DL=1`. The newest 5 are kept (`BACKUP_KEEP`).
 
 **Offsite copy to Terabox.** Terabox has no official API, so this uses the unofficial open-source CLI [fcr--/tbc](https://github.com/fcr--/tbc) (MIT, Go), pinned to one commit. It contacts only `www.terabox.com` and logs in with your `ndus` cookie, so treat that cookie like a password and keep it in a `chmod 600` file. Unofficial tools can break when Terabox changes its site.
 
@@ -192,7 +196,7 @@ What it does for you while it runs:
 
 Honest limits: the fast check trusts a file's size, time, and inode for a few minutes until the background check finishes, so someone with root who forges those could briefly serve a changed root image (the kernel and initrd are signed and always fully checked). The root image is unsigned on the client for most distros; see the header of the script. Android features (root, `oom_score_adj`, Wi-Fi power mode) can only be proven on a real phone.
 
-Tests: `tests/run.sh` runs 79 checks (fault injection and the easy-mode screens) (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
+Tests: `tests/run.sh` runs 85 checks (fault injection and the easy-mode screens) (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
 
 ---
 

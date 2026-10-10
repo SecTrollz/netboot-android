@@ -1095,6 +1095,73 @@ test_ct_paging_loop_counter_is_not_clobbered() {
   assert "second page was requested" test "$(wc -l < "$T/ct.calls")" -ge 2
 }
 
+# ---- the automatic backup is a convenience, not a requirement ----
+count_backups() { local f n=0; for f in "$BACKUP_DIR"/netboot-*.tar.gz; do [[ -e $f ]] && n=$((n+1)); done; echo "$n"; }
+
+mk_backup_env() {
+  src; mkroot
+  mkdir -p "$ROOT/keys" "$ROOT/downloads" "$ROOT/http"
+  echo k1 > "$ROOT/keys/k"; echo big > "$ROOT/downloads/x.iso"; echo served > "$ROOT/http/f"
+  AUTO_BACKUP=1; BACKUP_FP_FILE="$BACKUP_DIR/.last-fingerprint"
+}
+
+test_auto_backup_runs_once_then_skips_when_nothing_changed() {
+  mk_backup_env
+  auto_backup serve >/dev/null 2>&1
+  assert "first run makes a backup" test "$(count_backups)" -eq 1
+  sleep 1.1
+  out=$(auto_backup serve 2>&1)
+  assert "second run makes none" test "$(count_backups)" -eq 1
+  assert "says why" grep -q 'Nothing has changed' <<<"$out"
+}
+
+test_auto_backup_runs_again_when_a_real_file_changes() {
+  mk_backup_env
+  auto_backup serve >/dev/null 2>&1
+  sleep 1.1; echo k2 > "$ROOT/keys/k"
+  auto_backup serve >/dev/null 2>&1
+  assert "changed keys trigger a new backup" test "$(count_backups)" -eq 2
+}
+
+test_logs_locks_and_big_downloads_do_not_trigger_a_backup() {
+  mk_backup_env
+  auto_backup serve >/dev/null 2>&1
+  sleep 1.1
+  echo line >> "$STATE/netboot.log"; echo now > "$STATE/last-serve"; echo x > "$ROOT/http.log"
+  mkdir -p "$STATE/lock.d"; echo 1 > "$STATE/lock.d/owner"
+  echo "more iso bytes" >> "$ROOT/downloads/x.iso"; echo more >> "$ROOT/http/f"
+  auto_backup serve >/dev/null 2>&1
+  assert "still only one backup" test "$(count_backups)" -eq 1
+}
+
+test_a_failing_backup_never_stops_serving() {
+  mk_backup_env
+  backup_create() { return 1; }
+  out=$(auto_backup serve 2>&1); rc=$?
+  assert "auto_backup returns success" test $rc -eq 0
+  assert "tells you it carried on" grep -q 'continuing without it' <<<"$out"
+}
+
+test_backup_auto_off_is_remembered_and_the_flag_skips_one_run() {
+  src; mkroot
+  NETBOOT_SOURCE_ONLY=0 "$SCRIPT" backup-auto off >/dev/null 2>&1
+  assert "saved in the settings file" grep -q "^AUTO_BACKUP='0'" "$STATE/backup.conf"
+  mkdir -p "$ROOT/keys"; echo k > "$ROOT/keys/k"
+  out=$(NETBOOT_SOURCE_ONLY=0 "$SCRIPT" backup-auto 2>&1)
+  assert "reports OFF" grep -q 'OFF' <<<"$out"
+  NETBOOT_SOURCE_ONLY=0 "$SCRIPT" backup-auto on >/dev/null 2>&1
+  assert "can be turned back on" grep -q "^AUTO_BACKUP='1'" "$STATE/backup.conf"
+  out=$(NETBOOT_SOURCE_ONLY=0 "$SCRIPT" --no-backup backup-auto 2>&1)
+  assert "--no-backup is understood" grep -q 'OFF' <<<"$out"
+}
+
+test_a_manual_backup_always_runs() {
+  mk_backup_env
+  NETBOOT_SOURCE_ONLY=0 "$SCRIPT" backup >/dev/null 2>&1; sleep 1.1
+  NETBOOT_SOURCE_ONLY=0 "$SCRIPT" backup >/dev/null 2>&1
+  assert "two manual backups, two archives" test "$(count_backups)" -eq 2
+}
+
 # ---------------------------------------------------------------- run
 for t in $(declare -F | awk '{print $3}' | grep '^test_'); do run_test "$t"; done
 

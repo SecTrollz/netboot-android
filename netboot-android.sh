@@ -2963,6 +2963,19 @@ verify_attest() {
 # Restorable point-in-time copy of $ROOT (keys, attestation, pins, state, TFTP
 # files, configs). Rebuildable bulk (extracted http/, src/, run/) is skipped, and
 # downloads/ only with BACKUP_DL=1. Each archive gets a SHA-256 sidecar.
+backup_fingerprint() {
+  local base; base=$(basename "$ROOT")
+  [[ -d $ROOT ]] || return 0
+  ( cd "$(dirname "$ROOT")" && find "$base" \
+      \( -path "$base/http" -o -path "$base/run" -o -path "$base/src" \
+         -o -path "$base/state/lock.d" -o -path "$base/state/undo.d" \) -prune -o \
+      -type f ! -name '*.log' ! -name '*.log.*' ! -name '*.tmp' ! -name '*.part' ! -name 'last-serve' ! -name 'offsite.status' \
+      -exec stat -c '%n %s %Y' {} + 2>/dev/null ) \
+    | { if (( ${BACKUP_DL:-0} )); then cat; else grep -v "^$base/downloads/" ; fi; } \
+    | grep -v "^$(basename "$BACKUP_DIR")/" | LC_ALL=C sort | sha256sum | cut -d' ' -f1
+}
+BACKUP_FP_FILE="$BACKUP_DIR/.last-fingerprint"
+
 backup_create() {
   local label=${1:-manual} base parent ts out
   need tar; need sha256sum
@@ -2986,6 +2999,7 @@ backup_create() {
     "$(tar -tzf "$out" | grep -vc '/$' || true)" > "$out.meta"
   chmod 600 "$out" "$out.sha256" 2>/dev/null || true
   ok "Backup written: $out ($(file_size "$out") bytes)"
+  backup_fingerprint > "$BACKUP_FP_FILE" 2>/dev/null || true
   backup_prune
   backup_upload "$out"
 }
@@ -3087,9 +3101,29 @@ backup_verify() {
 
 # Runs before anything that can change or remove served state.
 auto_backup() {
-  [[ $AUTO_BACKUP == 1 ]] || { warn "AUTO_BACKUP=0: skipping the pre-run backup"; return 0; }
+  [[ $AUTO_BACKUP == 1 ]] || { info "Automatic backup is off. Skipping."; return 0; }
   [[ -d $ROOT ]] || return 0
-  backup_create "auto-$1"
+  local now last
+  now=$(backup_fingerprint 2>/dev/null || true)
+  last=$(cat "$BACKUP_FP_FILE" 2>/dev/null || true)
+  if [[ -n $now && $now == "$last" ]] && compgen -G "$BACKUP_DIR/netboot-*.tar.gz" >/dev/null; then
+    ok "Nothing has changed since the last backup. Skipping it."
+    return 0
+  fi
+  # A backup is a safety net, never a gate: if it cannot finish, say so and carry on.
+  if ! ( backup_create "auto-$1" ); then
+    warn "The automatic backup did not finish, so I am continuing without it. Fix it later with: $0 backup   (or turn it off: $0 backup-auto off)"
+  fi
+  return 0
+}
+
+# Turn the automatic backup on or off for good (saved in the settings file)
+backup_auto_cmd() {
+  case "${1:-}" in
+    on)  save_setting AUTO_BACKUP 1 && ok "Automatic backups are ON: one is taken before serve or clean, only when something changed." ;;
+    off) save_setting AUTO_BACKUP 0 && ok "Automatic backups are OFF. Take one yourself any time with: $0 backup" ;;
+    *)   info "Automatic backups are $([[ $AUTO_BACKUP == 1 ]] && echo ON || echo OFF). Change with: $0 backup-auto on|off" ;;
+  esac
 }
 
 restore() {
@@ -4459,6 +4493,8 @@ COMMANDS
   backup                Archive the working folder (SHA-256 sidecar) into $BACKUP_DIR
   terabox-install       Build the unofficial Terabox CLI (fcr--/tbc, pinned) for offsite backups
   backup-list           List backups, newest first
+  backup-auto on|off    Turn the automatic pre-serve backup on or off for good
+                        (it already skips itself when nothing changed; --no-backup skips one run)
   restore ARCHIVE       Verify a backup, save the current state, then restore it
                         (add --dry-run to only list what would be replaced)
   serve                 Backs up the working folder, integrity gate, then HTTP + dnsmasq (DHCP/TFTP) as root
@@ -4511,7 +4547,7 @@ ENVIRONMENT VARIABLES
   ALLOW_UNPINNED=1      Fetch transport-trusted content without a pin (not recommended)
   ALLOW_UNVERIFIED=1    Accept an ISO with no verified signature (not recommended)
   ACCEPT_SCRIPT_CHANGE=1  Run even though the script changed since self-sign
-  AUTO_BACKUP           1 (default): back up before serve and clean. 0: skip
+  AUTO_BACKUP           1 (default): back up before serve and clean, only if something changed. 0: skip
   BACKUP_DIR            Where backups go                          (default: ~/netboot-backups)
   BACKUP_KEEP           Newest backups kept                       (default: 5)
   BACKUP_DL             1: include downloads/ (ISOs) in backups   (default: 0)
@@ -4551,6 +4587,7 @@ parse_args() {
       -h|--help)  usage; exit 0 ;;
       --dry-run)  DRY_RUN=1 ;;
       -y|--yes)   ASSUME_YES=1 ;;
+      --no-backup) AUTO_BACKUP=0 ;;
       --iso)      [[ $# -ge 2 ]] || die "--iso requires a path"; ISO_FILE="$2"; shift ;;
       --iso=*)    ISO_FILE="${1#*=}" ;;
       --distro)   [[ $# -ge 2 ]] || die "--distro requires a value"; DISTRO="$2"; CLI_SET+=" DISTRO"; shift ;;
@@ -4628,6 +4665,7 @@ case "$COMMAND" in
   verify-attest)  verify_attest "${POSITIONAL[0]:-}" ;;
   backup)         backup_create manual ;;
   backup-list)    backup_list ;;
+  backup-auto)    backup_auto_cmd "${POSITIONAL[0]:-}" ;;
   terabox-install) terabox_install ;;
   restore)        restore "${POSITIONAL[0]:-}" ;;
   serve)          serve ;;
