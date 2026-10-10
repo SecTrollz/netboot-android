@@ -3446,6 +3446,30 @@ usb_cleanup() {
   info "USB drive mode stopped. The phone's normal USB settings are back."
 }
 
+# Creates the gadget folders and points them at the ISO; does not connect it to the USB port yet.
+usb_prepare_gadget() {
+  local g_path=$1
+  rm -f "$RUN/usb.ok"
+  run_root "set -e
+G='$g_path'
+mkdir -p \"\$G\"
+echo 0x1d6b > \"\$G/idVendor\"; echo 0x0104 > \"\$G/idProduct\"
+mkdir -p \"\$G/strings/0x409\"
+echo 'netboot-android' > \"\$G/strings/0x409/manufacturer\"
+echo '$DISTRO live drive' > \"\$G/strings/0x409/product\"
+echo '0001' > \"\$G/strings/0x409/serialnumber\"
+mkdir -p \"\$G/configs/c.1/strings/0x409\"
+echo 'mass storage' > \"\$G/configs/c.1/strings/0x409/configuration\"
+mkdir -p \"\$G/functions/mass_storage.0\"
+F=\"\$G/functions/mass_storage.0/lun.0\"
+mkdir -p \"\$F\"
+echo 1 > \"\$F/ro\"
+echo '$USB_CDROM' > \"\$F/cdrom\"
+echo '$ISO' > \"\$F/file\"
+ln -sf \"\$G/functions/mass_storage.0\" \"\$G/configs/c.1/mass_storage.0\"" >/dev/null 2>"$RUN/usb.err" && : > "$RUN/usb.ok"
+  [[ -e $RUN/usb.ok ]]
+}
+
 usb_boot_start() {
   local udc g saved="" rebind="" prev_cfg="" g_path undo size_mb
   (( IS_PROOT )) && die "$E_ENV" "You are inside proot. Leave it ('exit') and run this in Termux."
@@ -3475,27 +3499,23 @@ usb_boot_start() {
   # Android's own USB setup owns the port; ask it to let go, then free anything still bound.
   run_root "setprop sys.usb.config none 2>/dev/null; sleep 1; for g in '$USB_CFG'/*; do [ \"\$g\" = '$g_path' ] && continue; [ -f \"\$g/UDC\" ] && echo '' > \"\$g/UDC\" 2>/dev/null; done; true" >/dev/null 2>&1 || true
 
-  run_root "set -e
-G='$g_path'
-mkdir -p \"\$G\"
-echo 0x1d6b > \"\$G/idVendor\"; echo 0x0104 > \"\$G/idProduct\"
-mkdir -p \"\$G/strings/0x409\"
-echo 'netboot-android' > \"\$G/strings/0x409/manufacturer\"
-echo '$DISTRO live drive' > \"\$G/strings/0x409/product\"
-echo '0001' > \"\$G/strings/0x409/serialnumber\"
-mkdir -p \"\$G/configs/c.1/strings/0x409\"
-echo 'mass storage' > \"\$G/configs/c.1/strings/0x409/configuration\"
-mkdir -p \"\$G/functions/mass_storage.0\"
-F=\"\$G/functions/mass_storage.0/lun.0\"
-mkdir -p \"\$F\"
-echo 1 > \"\$F/ro\"
-echo '$USB_CDROM' > \"\$F/cdrom\"
-echo '$ISO' > \"\$F/file\"
-ln -sf \"\$G/functions/mass_storage.0\" \"\$G/configs/c.1/mass_storage.0\"" >/dev/null 2>"$RUN/usb.err" || {
+  if ! usb_prepare_gadget "$g_path"; then
     local why; why=$(tr '\n' ' ' < "$RUN/usb.err" 2>/dev/null | cut -c1-240)
-    usb_boot_stop
-    die "$E_ENV" "Could not switch on USB drive mode: ${why:-unknown error}. If it says 'Permission denied' or 'Operation not permitted', SELinux is blocking the file: see '$0 selinux status'. If it says the file cannot be opened, the kernel may lack mass-storage support."
-  }
+    if [[ $why == *"not permitted"* || $why == *"ermission denied"* ]] && (( IS_ANDROID )) && [[ $(run_root "getenforce" 2>/dev/null) == Enforcing ]]; then
+      warn "Android's SELinux blocked this step ($why)"
+      info "Usual fix: let SELinux be permissive only while the USB drive is on. It is switched back automatically when you stop."
+      if ask_yn "Allow SELinux permissive for this USB session?" n; then
+        # the undo for this session now also puts SELinux back, and does it last
+        printf '%s; setenforce 1\n' "$(cat "$JOURNAL/$JID_USB")" > "$JOURNAL/$JID_USB"
+        run_root "setenforce 0" >/dev/null 2>&1 || { usb_boot_stop; die "$E_ENV" "Could not change SELinux on this phone."; }
+        usb_prepare_gadget "$g_path" || why=$(tr '\n' ' ' < "$RUN/usb.err" 2>/dev/null | cut -c1-240)
+      fi
+    fi
+    if [[ ! -e $RUN/usb.ok ]]; then
+      usb_boot_stop
+      die "$E_ENV" "Could not switch on USB drive mode: ${why:-unknown error}. If SELinux was already permissive, this phone's kernel or vendor setup does not allow a USB drive gadget here."
+    fi
+  fi
   # Everything is prepared. Connect it to the USB port now, or as soon as the port shows up (cable plugged in).
   local bind_err="" last_msg="" shown_msg="" tries=0
   while true; do

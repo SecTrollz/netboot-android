@@ -1424,6 +1424,46 @@ test_usb_drive_mode_waits_for_the_cable_instead_of_failing() {
   exit 0
 }
 
+test_usb_selinux_block_offers_permissive_for_the_session_and_restores_it() {
+  src; mkroot; mk_fake_usb; IS_TERMUX=0; IS_ANDROID=1
+  LOG="$T/se.log"; : > "$LOG"
+  mkdir -p "$T/fakebin"
+  printf '#!/bin/sh\nif [ "$1" = 0 ]; then : > "%s/permissive"; else rm -f "%s/permissive"; fi\necho "setenforce $1" >> "%s"\n' "$T" "$T" "$LOG" > "$T/fakebin/setenforce"
+  chmod +x "$T/fakebin/setenforce"; export PATH="$T/fakebin:$PATH"
+  run_root() {   # fake su: getenforce says Enforcing until setenforce 0 is run
+    case "$1" in
+      getenforce) [[ -f $T/permissive ]] && echo Permissive || echo Enforcing ;;
+      *"ln -sf"*) [[ -f $T/permissive ]] || { echo "ln: cannot create symbolic link: Operation not permitted" >&2; return 1; }; bash -c "$1" ;;
+      *) bash -c "$1" ;;
+    esac
+  }
+  ask_yn() { return 0; }
+  ( usb_boot_start ) > "$T/usb.out" 2>&1 & u=$!
+  for _ in $(seq 1 40); do [[ -s $USB_CFG/netboot-android/UDC ]] && break; sleep 0.5; done
+  assert "SELinux lowered only after being asked" grep -q '^setenforce 0$' "$LOG"
+  assert "connected after the retry" test "$(cat "$USB_CFG/netboot-android/UDC")" = fake.udc
+  kill -TERM "$u" 2>/dev/null; wait "$u" 2>/dev/null || true
+  assert "SELinux put back at the end" test "$(tail -n1 "$LOG")" = "setenforce 1"
+}
+
+test_usb_selinux_block_with_a_no_answer_stays_enforcing_and_explains() {
+  src; mkroot; mk_fake_usb; IS_TERMUX=0; IS_ANDROID=1
+  LOG="$T/se.log"; : > "$LOG"
+  run_root() {
+    case "$1" in
+      getenforce) echo Enforcing ;;
+      "setenforce "*) echo "$1" >> "$LOG" ;;
+      *"ln -sf"*) echo "ln: cannot create symbolic link: Operation not permitted" >&2; return 1 ;;
+      *) bash -c "$1" ;;
+    esac
+  }
+  ask_yn() { return 1; }
+  out=$( ( usb_boot_start ) 2>&1 ); rc=$?
+  assert "fails with a clear message" test $rc -ne 0
+  assert "never lowered SELinux" bash -c '! grep -q "setenforce 0" "$1"' _ "$LOG"
+  assert "mentions the blocker" grep -q 'Operation not permitted' <<<"$out"
+}
+
 test_usb_check_reports_a_phone_without_gadget_support() {
   can_root || skip "needs root or sudo"
   src; mkroot; USB_CFG="$T/none/usb_gadget"; USB_UDC_DIR="$T/none/udc"
