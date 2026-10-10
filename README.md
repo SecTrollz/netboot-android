@@ -179,6 +179,12 @@ Before downloading anything, `fetch` looks for an image you already have: in `~/
 
 ---
 
+## It never redoes finished work
+
+The guide (and `all`) checks whether each step is already done and skips it on its own, without asking: tools installed, keys made, script signed, server pins valid, boot loader in place, image downloaded and verified, boot files really unpacked, configuration matching the current network and loader, signed report newer than the configuration, cloud-backup question already answered. Each skipped step is shown as one line. If something has changed (a new Wi-Fi address, a re-extract, an edited script) only the affected steps run again. `./netboot-android.sh guide --redo` offers every step again.
+
+---
+
 ## A download is never thrown away over a key or network problem
 
 The vendor signing key is checked **before** the big download starts, so a problem shows up in seconds, not after 6 GB. Ubuntu's key is confirmed by two independent places (Ubuntu's keyserver and the `ubuntu-keyring` package from Ubuntu's own archive; `keys.openpgp.org` does not carry that key). If verification cannot finish for any reason other than the image really not matching its signed checksum, the finished download is **kept** and the next `fetch` only re-verifies it. Only a real checksum or signature mismatch discards the image (after one clean retry if it was a resumed download). A mirror that cannot resume makes the script start the file over instead of retrying forever. `KEY_MIN_SOURCES=1` accepts a key from one source (its fingerprint is built into the script), if you choose to.
@@ -214,7 +220,7 @@ What it does for you while it runs:
 
 Honest limits: the fast check trusts a file's size, time, and inode for a few minutes until the background check finishes, so someone with root who forges those could briefly serve a changed root image (the kernel and initrd are signed and always fully checked). The root image is unsigned on the client for most distros; see the header of the script. Android features (root, `oom_score_adj`, Wi-Fi power mode) can only be proven on a real phone.
 
-Tests: `tests/run.sh` runs 99 checks (fault injection and the easy-mode screens) (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
+Tests: `tests/run.sh` runs 107 checks (fault injection and the easy-mode screens) (kill mid-extract, tampered files, stale locks, address change, crashed servers, backup and restore) with no network.
 
 ---
 

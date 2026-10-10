@@ -1354,6 +1354,118 @@ test_a_manual_backup_and_restore_safety_copy_still_work_with_auto_off() {
   assert "restored" test "$(cat "$ROOT/keys/k")" = k1
 }
 
+# ---- never redo a finished step ----
+stub_steps() {   # every real step just records that it ran
+  STEPLOG="$T/steps.log"; : > "$STEPLOG"
+  for fn in check_soft deps attest_init self_sign pins_refresh fetch extract configure attest_report offsite_wizard run_step; do
+    eval "$fn() { echo $fn >> \"\$STEPLOG\"; }"
+  done
+}
+
+all_done() { for fn in g_done_check g_done_deps g_done_attest g_done_sign g_done_pins g_done_fetch g_done_extract g_done_configure g_done_report g_done_ipxe; do eval "$fn() { return 0; }"; done; }
+
+test_a_fully_finished_guide_runs_no_step_and_asks_nothing() {
+  src; mkroot; stub_steps; all_done
+  printf "DISTRO='ubuntu'\n" > "$PROFILE"; : > "$STATE/offsite.asked"
+  GUIDE_WELCOMED=1 ASSUME_YES=1
+  ( guided ) >"$T/g.out" 2>&1; rc=$?
+  [[ $rc -eq 0 ]] || sed 's/^/    guide said: /' "$T/g.out" | tail -8
+  echo "steps run: $(tr '\n' ' ' < "$STEPLOG")"
+  assert "guide ends fine" test $rc -eq 0
+  assert "no setup step ran" bash -c '! grep -vxE "run_step" "$1" | grep -q .' _ "$STEPLOG"
+  assert "says so" grep -q 'already done' "$T/g.out"
+  assert "counts them" grep -qE 'Skipped [0-9]+ step' "$T/g.out"
+  assert "asked no question" bash -c '! grep -qE "Do this step now|Do it again" "$1"' _ "$T/g.out"
+}
+
+test_only_the_unfinished_step_runs() {
+  src; mkroot; stub_steps; all_done
+  g_done_fetch() { return 1; }
+  printf "DISTRO='ubuntu'\n" > "$PROFILE"; : > "$STATE/offsite.asked"
+  GUIDE_WELCOMED=1 ASSUME_YES=1
+  ( guided ) >"$T/g.out" 2>&1
+  ran=$(grep -vxE 'run_step' "$STEPLOG" | tr '\n' ' ')
+  assert "only fetch ran" test "$ran" = "fetch "
+}
+
+test_redo_offers_finished_steps_again() {
+  src; mkroot; stub_steps; all_done
+  printf "DISTRO='ubuntu'\n" > "$PROFILE"; : > "$STATE/offsite.asked"
+  GUIDE_WELCOMED=1 ASSUME_YES=1 GUIDE_REDO=1
+  ( guided ) >"$T/g.out" 2>&1
+  assert "it asks again" grep -q 'Do it again anyway' "$T/g.out"
+}
+
+test_done_checks_tell_the_truth() {
+  src; mkroot
+  # deps
+  missing_tools() { echo "openssl"; }
+  g_done_deps && { echo "deps wrongly done"; exit 1; }
+  missing_tools() { echo ""; }; g_done_deps || { echo "deps wrongly not done"; exit 1; }
+  # sign
+  self_status() { echo changed; }; g_done_sign && { echo "changed script counted as signed"; exit 1; }
+  self_status() { echo ok; }; g_done_sign || { echo "signed script not counted"; exit 1; }
+  # pins
+  pin_hosts_for_target() { echo a.example; echo b.example; }
+  active_pins() { [[ $1 == a.example ]] && echo PIN; }
+  g_done_pins && { echo "a host without a pin counted as done"; exit 1; }
+  active_pins() { echo PIN; }
+  g_done_pins || { echo "valid pins not counted"; exit 1; }
+  # extract: layout alone is not enough, the files must exist
+  printf "KERNEL_REL='k'\nINITRD_REL='i'\nROOTFS_REL='r'\n" > "$LAYOUT"
+  g_done_extract && { echo "extract counted without files"; exit 1; }
+  mkdir -p "$HTTP"; echo k > "$HTTP/k"; echo i > "$HTTP/i"; echo r > "$HTTP/r"
+  g_done_extract || { echo "extract not counted with files"; exit 1; }
+  exit 0
+}
+
+test_configure_is_redone_only_when_the_network_or_extraction_changed() {
+  src; mkroot
+  mkdir -p "$TFTP"
+  echo "set base http://192.168.0.5:8000" > "$TFTP/boot.ipxe"
+  : > "$LAYOUT"; sleep 1.1; : > "$MANIFEST"
+  echo "iface=wlan0 loader=ipxe" > "$STATE/$DISTRO-$TARGET_ARCH.config"
+  resolve_network() { IFACE=wlan0; PHONE_IP=192.168.0.5; }
+  g_done_configure || { echo "same network should count as done"; exit 1; }
+  resolve_network() { IFACE=wlan0; PHONE_IP=192.168.0.99; }
+  g_done_configure && { echo "address change should not count as done"; exit 1; }
+  resolve_network() { IFACE=wlan0; PHONE_IP=192.168.0.5; }
+  sleep 1.1; touch "$LAYOUT"          # re-extracted after configuring
+  g_done_configure && { echo "re-extract should require configuring again"; exit 1; }
+  exit 0
+}
+
+test_signed_report_is_current_only_if_newer_than_the_configuration() {
+  src; mkroot
+  mkdir -p "$ATTEST/reports"
+  : > "$MANIFEST"; sleep 1.1; : > "$ATTEST/reports/r1.asc"
+  g_done_report || { echo "newer report should count"; exit 1; }
+  sleep 1.1; : > "$MANIFEST"
+  g_done_report && { echo "older report should not count"; exit 1; }
+  exit 0
+}
+
+test_all_command_skips_finished_steps() {
+  src; mkroot; stub_steps; all_done
+  g_done_extract() { return 1; }
+  serve() { echo serve >> "$STEPLOG"; }
+  ( run_all ) >"$T/a.out" 2>&1
+  ran=$(tr '\n' ' ' < "$STEPLOG")
+  assert "only the unfinished steps plus fetch's own check and serve" test "$ran" = "fetch extract serve "
+}
+
+test_cloud_backup_question_is_asked_only_once() {
+  src; mkroot; stub_steps; all_done
+  printf "DISTRO='ubuntu'\n" > "$PROFILE"
+  GUIDE_WELCOMED=1 ASSUME_YES=1
+  ( guided ) >/dev/null 2>&1
+  assert "asked the first time" grep -q offsite_wizard "$STEPLOG"
+  assert "remembered" test -f "$STATE/offsite.asked"
+  : > "$STEPLOG"
+  ( guided ) >/dev/null 2>&1
+  assert "not asked again" bash -c '! grep -q offsite_wizard "$1"' _ "$STEPLOG"
+}
+
 # ---------------------------------------------------------------- run
 for t in $(declare -F | awk '{print $3}' | grep '^test_'); do run_test "$t"; done
 

@@ -208,6 +208,8 @@ POWER_TWEAKED=0
 COMMAND=""
 DRY_RUN=0
 ASSUME_YES=0
+GUIDE_REDO=0
+GUIDE_SKIPPED=0
 POSITIONAL=()
 SIG_SIGNER=""
 GIT_PIN_OPTS=()
@@ -4078,6 +4080,21 @@ EOF
 }
 
 # Picks the one screen that makes sense for the current state.
+# Everything in order, skipping what is already done
+run_all() {
+  once() { local d=$1; shift; if [[ $GUIDE_REDO != 1 ]] && "$d"; then info "Already done, skipping: $1"; else "$@"; fi; }
+  once g_done_deps deps
+  once g_done_attest attest_init
+  once g_done_sign self_sign
+  once g_done_pins pins_refresh
+  once g_done_ipxe build_ipxe
+  fetch
+  once g_done_extract extract
+  once g_done_configure configure
+  once g_done_report attest_report
+  serve
+}
+
 easy_home() {
   if [[ ! -t 0 || ! -t 1 ]]; then interactive; return; fi
   if (( IS_PROOT )); then proot_build_flow; return; fi
@@ -4197,6 +4214,12 @@ check_soft() {
 
 guided_run() {
   local title=$1 why=$2 donefn=$3 a; shift 3
+  # A finished step is skipped on its own. Use --redo to be offered it again.
+  if [[ -n $donefn && $GUIDE_REDO != 1 ]] && "$donefn"; then
+    GSTEP=$((GSTEP+1)); GUIDE_SKIPPED=$((GUIDE_SKIPPED+1))
+    printf '%s[+]%s Step %d of %d: %s %s(already done, skipping)%s\n' "$C_GREEN" "$C_RESET" "$GSTEP" "$GTOTAL" "$title" "$C_DIM" "$C_RESET"
+    return 0
+  fi
   gstep_head "$title" "$why"
   if [[ -n $donefn ]] && "$donefn"; then
     ok "Already done."
@@ -4216,14 +4239,61 @@ guided_run() {
   done
 }
 
+g_done_deps()    { [[ -z $(missing_tools) ]]; }
+g_done_check()   {   # the pre-flight only matters on a first run or when the basics are broken
+  g_done_deps && [[ -n $(attest_fpr) ]] || return 1
+  diagnose
+  local i
+  for i in "${!F_LVL[@]}"; do
+    [[ ${F_LVL[$i]} == FAIL ]] || continue
+    case "${F_TAG[$i]}" in DISK|FSTYPE|TOOLS) return 1 ;; esac
+  done
+  return 0
+}
 g_done_attest()  { [[ -n $(attest_fpr) ]]; }
-g_done_sign()    { [[ -s $ATTEST/script.sha256.asc ]]; }
+g_done_sign()    { [[ $(self_status) == ok ]]; }
+g_done_pins() {   # every server we talk to already has a valid pin
+  local h
+  for h in $(pin_hosts_for_target); do
+    [[ -n $(active_pins "$h") ]] || return 1
+  done
+  return 0
+}
 g_done_ipxe()    { if [[ $BOOT_LOADER == shim ]]; then shim_ready; else [[ -s $TFTP/ipxe.efi ]]; fi; }
 g_done_fetch()   { iso_is_verified; }
-g_done_extract() { [[ -f $LAYOUT ]]; }
+g_done_extract() {   # the layout record exists and the files it names are really there
+  [[ -f $LAYOUT ]] || return 1
+  ( KERNEL_REL=""; INITRD_REL=""; ROOTFS_REL=""
+    # shellcheck disable=SC1090
+    source "$LAYOUT"
+    [[ -s $HTTP/$KERNEL_REL && -s $HTTP/$INITRD_REL ]] && { [[ -z $ROOTFS_REL ]] || [[ -s $HTTP/$ROOTFS_REL ]]; } )
+}
+g_done_configure() {   # configured for the current network, the chosen loader, and the current extraction
+  local cfg_ip cur conf="$STATE/$DISTRO-$TARGET_ARCH.config"
+  [[ -f $MANIFEST && -f $TFTP/boot.ipxe && -f $conf ]] || return 1
+  [[ -f $LAYOUT && ! $LAYOUT -nt $MANIFEST ]] || return 1
+  if [[ $BOOT_LOADER == shim ]]; then
+    grep -q 'loader=shim' "$conf" || return 1
+  else
+    ! grep -q 'loader=shim' "$conf" || return 1
+  fi
+  cfg_ip=$(sed -n 's|^set base http://\([0-9.]*\):.*|\1|p' "$TFTP/boot.ipxe" | head -n1)
+  cur=$( ( LOG_QUIET=1; resolve_network >/dev/null 2>&1 && printf '%s' "$PHONE_IP" ) 2>/dev/null || true )
+  [[ -n $cur && $cur == "$cfg_ip" ]]
+}
+g_done_report() {   # a signed report newer than the current configuration
+  local latest
+  latest=$(ls -1t "$ATTEST"/reports/*.asc 2>/dev/null | head -n1 || true)
+  [[ -n $latest && -f $MANIFEST && ! $MANIFEST -nt $latest ]]
+}
 
 guided_ipxe() {
   local host_cpu c
+  if g_done_ipxe && [[ $GUIDE_REDO != 1 ]]; then
+    GSTEP=$((GSTEP+1)); GUIDE_SKIPPED=$((GUIDE_SKIPPED+1))
+    printf '%s[+]%s Step %d of %d: Boot loader %s(already in place, skipping)%s\n' "$C_GREEN" "$C_RESET" "$GSTEP" "$GTOTAL" "$C_DIM" "$C_RESET"
+    return 0
+  fi
   gstep_head "Get the network-boot loader (iPXE)" \
     "iPXE is the tiny program the PC runs first. It is built with YOUR key inside," \
     "so it only boots files you signed. Building takes 10-30 minutes on a phone."
@@ -4441,39 +4511,51 @@ guided() {
   fi
 
   load_profile && set_distro || true
-  gstep_head "Choose what to boot" \
-    "Now: $P_LABEL on a $TARGET_ARCH PC."
-  if [[ -r $PROFILE ]]; then
-    if ask_yn "Change that?" n; then pick_goal; fi
+  if [[ -r $PROFILE && $GUIDE_REDO != 1 ]]; then
+    GSTEP=$((GSTEP+1)); GUIDE_SKIPPED=$((GUIDE_SKIPPED+1))
+    printf '%s[+]%s Step %d of %d: What to boot: %s %s(saved choice; change it with: %s guide --redo)%s\n' "$C_GREEN" "$C_RESET" "$GSTEP" "$GTOTAL" "$P_LABEL" "$C_DIM" "$0" "$C_RESET"
   else
-    pick_goal
+    gstep_head "Choose what to boot" \
+      "Now: $P_LABEL on a $TARGET_ARCH PC."
+    if [[ -r $PROFILE ]]; then
+      if ask_yn "Change that?" n; then pick_goal; fi
+    else
+      pick_goal
+    fi
   fi
 
   guided_run "Check this device" \
-    "Looks for root, tools, free space and network. Safe: it only reads things. (under a minute)" "" check_soft
+    "Looks for root, tools, free space and network. Safe: it only reads things. (under a minute)" g_done_check check_soft
   guided_run "Install the tools needed" \
-    "Installs packages such as dnsmasq, python, gpg. Needs internet. (2-5 minutes)" "" deps
+    "Installs packages such as dnsmasq, python, gpg. Needs internet. (2-5 minutes)" g_done_deps deps
   guided_run "Create your private keys" \
     "Makes a signing key and a small certificate authority that live only on this device." g_done_attest attest_init
   guided_run "Sign this script" \
     "Records the script's fingerprint so any later tampering is noticed." g_done_sign self_sign
   guided_run "Check the download servers" \
-    "Confirms each vendor's server identity against public logs before trusting it. (about a minute)" "" pins_refresh
+    "Confirms each vendor's server identity against public logs before trusting it. (about a minute)" g_done_pins pins_refresh
   guided_ipxe
   guided_run "Download and verify the Linux image" \
     "Downloads $P_LABEL and checks the vendor's signature. Large download, so use Wi-Fi. (10-40 minutes; safe to stop and resume)" g_done_fetch fetch
   guided_run "Unpack the boot files" \
     "Pulls the kernel and files the PC needs out of the image. (1-5 minutes)" g_done_extract extract
   guided_run "Sign and prepare everything" \
-    "Signs the boot files with your key and writes the server settings for your current network." "" configure
+    "Signs the boot files with your key and writes the server settings for your current network." g_done_configure configure
 
-  gstep_head "Cloud backups (optional)" \
-    "Adds an encrypted offsite copy of your keys and settings to Google One and/or Terabox."
-  offsite_wizard
+  if [[ -f $STATE/offsite.asked && $GUIDE_REDO != 1 ]]; then
+    GSTEP=$((GSTEP+1)); GUIDE_SKIPPED=$((GUIDE_SKIPPED+1))
+    printf '%s[+]%s Step %d of %d: Cloud backups %s(already decided, skipping; change with: %s backup-setup)%s\n' "$C_GREEN" "$C_RESET" "$GSTEP" "$GTOTAL" "$C_DIM" "$0" "$C_RESET"
+  else
+    gstep_head "Cloud backups (optional)" \
+      "Adds an encrypted offsite copy of your keys and settings to Google One and/or Terabox."
+    offsite_wizard
+    : > "$STATE/offsite.asked"
+  fi
 
   guided_run "Write the signed report" \
-    "A signed record of everything above that you can re-check later." "" attest_report
+    "A signed record of everything above that you can re-check later." g_done_report attest_report
 
+  (( GUIDE_SKIPPED == 0 )) || info "Skipped $GUIDE_SKIPPED step(s) that were already done. (--redo shows them again.)"
   gstep_head "Start the boot server" \
     "Plug the PC into the same network (or cable), set it to network (PXE) boot," \
     "Secure Boot off, then power it on. Press Ctrl+C here to stop the server."
@@ -4653,7 +4735,7 @@ COMMANDS
   easy                  The zero-argument screen (same as running with no arguments)
   menu                  Full menu of every step
   shortcut              Create the one-tap Termux:Widget "Boot-a-PC" shortcut
-  guide                 Step-by-step guided setup (best for first time)
+  guide [--redo]        Step-by-step; finished steps are skipped on their own (--redo offers them again) guided setup (best for first time)
   ui, interactive       Menu of every step (no arguments does this too)
   backup-setup          Guided setup of Google One / Terabox cloud backups
   check                 Pre-flight: root, tools, ports 67/69/4011/$HTTP_PORT, storage,
@@ -4784,6 +4866,7 @@ parse_args() {
       --dry-run)  DRY_RUN=1 ;;
       -y|--yes)   ASSUME_YES=1 ;;
       --no-backup) AUTO_BACKUP=0 ;;
+      --redo)      GUIDE_REDO=1 ;;
       --backup)    AUTO_BACKUP=1 ;;
       --shim|--secure-boot) BOOT_LOADER=shim; CLI_SET+=" BOOT_LOADER" ;;
       --iso)      [[ $# -ge 2 ]] || die "--iso requires a path"; ISO_FILE="$2"; shift ;;
@@ -4872,16 +4955,7 @@ case "$COMMAND" in
   selinux)        selinux_ctl "${POSITIONAL[0]:-status}" ;;
   clean)          clean ;;
   all)
-    deps
-    attest_init
-    [[ -s $ATTEST/script.sha256.asc ]] || self_sign
-    pins_refresh
-    build_ipxe
-    fetch
-    extract
-    configure
-    attest_report
-    serve ;;
+    run_all ;;
   *)
     known_cmds="go status heal doctor guide easy menu check deps fetch extract configure serve backup restore shortcut verify clean logs"
     sugg=$( { compgen -W "$known_cmds" -- "${COMMAND:0:2}" || compgen -W "$known_cmds" -- "${COMMAND:0:1}" || true; } | tr '\n' ' ')
