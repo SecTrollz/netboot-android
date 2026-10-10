@@ -1374,6 +1374,47 @@ test_pc_instructions_do_not_ask_for_secure_boot_changes_on_the_signed_route() {
   assert "says leave it alone" grep -q "Do NOT touch Secure Boot" "$T/pc.out"
 }
 
+mk_fake_usb() {
+  USB_CFG="$T/cfg/usb_gadget"; USB_UDC_DIR="$T/udc"; USB_KCONFIG="$T/no-config.gz"
+  mkdir -p "$USB_CFG/android0" "$USB_UDC_DIR/fake.udc"
+  echo fake.udc > "$USB_CFG/android0/UDC"; echo configured > "$USB_UDC_DIR/fake.udc/state"
+  head -c 4096 /dev/urandom > "$ISO"
+  printf '%s %s %s\n' deadbeef "$(file_size "$ISO")" "$(file_mtime "$ISO")" > "$ISO_VERIFIED"
+}
+
+test_usb_drive_mode_binds_the_verified_iso_read_only_and_restores_everything() {
+  can_root || skip "needs root or sudo"
+  src; mkroot; mk_fake_usb; IS_TERMUX=0
+  ( usb_boot_start ) > "$T/usb.out" 2>&1 & u=$!
+  for _ in $(seq 1 30); do [[ -s $USB_CFG/netboot-android/UDC ]] && break; sleep 0.5; done
+  G="$USB_CFG/netboot-android"
+  assert "our gadget points at the ISO" test "$(cat "$G/functions/mass_storage.0/lun.0/file")" = "$ISO"
+  assert "read-only" test "$(cat "$G/functions/mass_storage.0/lun.0/ro")" = 1
+  assert "bound to the controller" test "$(cat "$G/UDC")" = fake.udc
+  assert "the old gadget was let go" test -z "$(tr -d '\n' < "$USB_CFG/android0/UDC")"
+  assert "tells the user what to do" grep -q 'USB DRIVE MODE' "$T/usb.out"
+  kill -TERM "$u" 2>/dev/null; wait "$u" 2>/dev/null
+  assert "old gadget restored" test "$(cat "$USB_CFG/android0/UDC")" = fake.udc
+  assert "our gadget is unbound" test -z "$(tr -d '\n' < "$G/UDC" 2>/dev/null)"
+  assert "our function link is gone" test ! -e "$G/configs/c.1/mass_storage.0"
+}
+
+test_usb_drive_mode_refuses_an_unverified_iso() {
+  src; mkroot; mk_fake_usb; IS_TERMUX=0
+  rm -f "$ISO_VERIFIED"
+  out=$( ( usb_boot_start ) 2>&1 ); rc=$?
+  assert "refused with the integrity exit code" test $rc -eq 30
+  assert "says what to do" grep -q 'fetch' <<<"$out"
+  assert "nothing was created" test ! -e "$USB_CFG/netboot-android"
+}
+
+test_usb_check_reports_a_phone_without_gadget_support() {
+  can_root || skip "needs root or sudo"
+  src; mkroot; USB_CFG="$T/none/usb_gadget"; USB_UDC_DIR="$T/none/udc"
+  usb_check >"$T/c.out" 2>&1 && { echo "unsupported phone reported as fine"; exit 1; }
+  assert "explains" grep -q 'cannot act as a USB drive' "$T/c.out"
+}
+
 test_backups_are_off_unless_asked_for() {
   src; mkroot
   mkdir -p "$ROOT/keys"; echo k > "$ROOT/keys/k"

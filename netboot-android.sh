@@ -3400,6 +3400,140 @@ kill_servers() {
   run_root "pkill -f '$DNSMASQ_CONF'" >/dev/null 2>&1 || true
 }
 
+# =============================================================================
+# USB drive mode: the phone shows the verified ISO to a PC as a read-only USB drive.
+# No network, router or Ethernet needed. Needs root and a kernel with USB mass storage.
+# =============================================================================
+USB_CFG="${USB_CFG:-/config/usb_gadget}"          # the configfs gadget folder (override only for tests)
+USB_UDC_DIR="${USB_UDC_DIR:-/sys/class/udc}"
+USB_KCONFIG="${USB_KCONFIG:-/proc/config.gz}"
+USB_CDROM="${USB_CDROM:-0}"                       # 0: looks like a USB drive (best for hybrid ISOs). 1: looks like a CD drive
+USB_GNAME="netboot-android"
+JID_USB=""
+
+usb_udc() { ls -1 "$USB_UDC_DIR" 2>/dev/null | head -n1; }
+
+usb_check() {
+  local udc cfg=no msc="unknown"
+  udc=$(run_root "ls -1 '$USB_UDC_DIR' 2>/dev/null | head -n1" 2>/dev/null || true)
+  run_root "[ -d '$USB_CFG' ] || mount -t configfs none \"\$(dirname '$USB_CFG')\" 2>/dev/null; [ -d '$USB_CFG' ]" >/dev/null 2>&1 && cfg=yes
+  if run_root "zcat '$USB_KCONFIG' 2>/dev/null | grep -qE '^CONFIG_USB_CONFIGFS_MASS_STORAGE=[ym]'" >/dev/null 2>&1; then msc=yes
+  elif run_root "[ -r '$USB_KCONFIG' ]" >/dev/null 2>&1; then msc=no; fi
+  [[ $cfg == yes ]] && ok "USB gadget folder found: $USB_CFG" || err "No USB gadget folder ($USB_CFG). This phone cannot act as a USB drive."
+  [[ -n $udc ]]     && ok "USB controller: $udc" || err "No USB controller found in $USB_UDC_DIR"
+  case $msc in
+    yes)     ok "Kernel supports USB mass storage" ;;
+    no)      err "Kernel says it has no USB mass storage support" ;;
+    unknown) info "Could not read the kernel config. It may still work; the start will tell." ;;
+  esac
+  [[ $cfg == yes && -n $udc && $msc != no ]]
+}
+
+usb_boot_stop() {
+  local cmd
+  [[ -n $JID_USB ]] || return 0
+  cmd=$(cat "$JOURNAL/$JID_USB" 2>/dev/null) || cmd=""
+  [[ -z $cmd ]] || run_root "$cmd" >/dev/null 2>&1 || true
+  journal_drop "$JID_USB"; JID_USB=""
+}
+
+usb_cleanup() {
+  trap - EXIT
+  usb_boot_stop
+  (( IS_TERMUX )) && termux-wake-unlock 2>/dev/null || true
+  release_lock
+  echo
+  info "USB drive mode stopped. The phone's normal USB settings are back."
+}
+
+usb_boot_start() {
+  local udc g saved="" rebind="" prev_cfg="" g_path undo size_mb
+  (( IS_PROOT )) && die "$E_ENV" "You are inside proot. Leave it ('exit') and run this in Termux."
+  [[ -s $ISO ]] || die "$E_ENV" "No ISO downloaded yet. Run: $0 fetch"
+  iso_is_verified || die "$E_INTEGRITY" "The ISO is not marked as verified. Run: $0 fetch (it checks the signature and checksum first)"
+  usb_check || die "$E_ENV" "This phone cannot act as a USB drive (see above)."
+  mkdir -p "$RUN"
+  udc=$(run_root "ls -1 '$USB_UDC_DIR' | head -n1")
+  journal_replay
+  # remember what is bound now so it can be put back exactly
+  for g in $(run_root "ls -1 '$USB_CFG' 2>/dev/null" 2>/dev/null || true); do
+    [[ $g != "$USB_GNAME" ]] || continue
+    saved=$(run_root "cat '$USB_CFG/$g/UDC' 2>/dev/null" 2>/dev/null || true)
+    [[ -z $saved ]] || rebind+="echo '$saved' > '$USB_CFG/$g/UDC' 2>/dev/null; "
+  done
+  prev_cfg=$(run_root "getprop sys.usb.config 2>/dev/null" 2>/dev/null || true)
+  g_path="$USB_CFG/$USB_GNAME"
+  undo="echo '' > '$g_path/UDC' 2>/dev/null; rm -f '$g_path/configs/c.1/mass_storage.0'; rmdir '$g_path/configs/c.1/strings/0x409' '$g_path/configs/c.1' '$g_path/functions/mass_storage.0' '$g_path/strings/0x409' '$g_path' 2>/dev/null; "
+  [[ -z $prev_cfg ]] || undo+="setprop sys.usb.config '$prev_cfg' 2>/dev/null; "
+  undo+="${rebind}true"
+  JID_USB=$(journal_push "$undo")
+  trap usb_cleanup EXIT
+  trap 'exit 130' INT TERM
+  (( IS_TERMUX )) && { termux-wake-lock 2>/dev/null || true; }
+
+  info "Switching the phone's USB port to drive mode (USB file transfer and adb pause until you stop)"
+  # Android's own USB setup owns the port; ask it to let go, then free anything still bound.
+  run_root "setprop sys.usb.config none 2>/dev/null; sleep 1; for g in '$USB_CFG'/*; do [ \"\$g\" = '$g_path' ] && continue; [ -f \"\$g/UDC\" ] && echo '' > \"\$g/UDC\" 2>/dev/null; done; true" >/dev/null 2>&1 || true
+
+  run_root "set -e
+G='$g_path'
+mkdir -p \"\$G\"
+echo 0x1d6b > \"\$G/idVendor\"; echo 0x0104 > \"\$G/idProduct\"
+mkdir -p \"\$G/strings/0x409\"
+echo 'netboot-android' > \"\$G/strings/0x409/manufacturer\"
+echo '$DISTRO live drive' > \"\$G/strings/0x409/product\"
+echo '0001' > \"\$G/strings/0x409/serialnumber\"
+mkdir -p \"\$G/configs/c.1/strings/0x409\"
+echo 'mass storage' > \"\$G/configs/c.1/strings/0x409/configuration\"
+mkdir -p \"\$G/functions/mass_storage.0\"
+F=\"\$G/functions/mass_storage.0/lun.0\"
+mkdir -p \"\$F\"
+echo 1 > \"\$F/ro\"
+echo '$USB_CDROM' > \"\$F/cdrom\"
+echo '$ISO' > \"\$F/file\"
+ln -sf \"\$G/functions/mass_storage.0\" \"\$G/configs/c.1/mass_storage.0\"
+echo '$udc' > \"\$G/UDC\"" >/dev/null 2>"$RUN/usb.err" || {
+    local why; why=$(tr '\n' ' ' < "$RUN/usb.err" 2>/dev/null | cut -c1-240)
+    usb_boot_stop
+    die "$E_ENV" "Could not switch on USB drive mode: ${why:-unknown error}. If it says 'Permission denied' or 'Operation not permitted', SELinux is blocking the file: see '$0 selinux status'. If it says the file cannot be opened, the kernel may lack mass-storage support."
+  }
+  [[ $(run_root "cat '$g_path/UDC'" 2>/dev/null) == "$udc" ]] || { usb_boot_stop; die "$E_ENV" "The USB port did not switch over. Unplug the cable, run '$0 usb-boot stop', and try again."; }
+
+  size_mb=$(( $(file_size "$ISO") / 1048576 ))
+  echo
+  box \
+    "USB DRIVE MODE: ON" \
+    "" \
+    "Showing: $(basename "$ISO") (${size_mb} MB, read-only, verified)" \
+    "" \
+    "NOW, ON THE PC:" \
+    "1. Plug the phone's USB-C cable into the PC." \
+    "2. Turn the PC on and tap its boot-menu key (F12, F9, Esc, F8)." \
+    "3. Choose the USB device from the list (not the hard drive)." \
+    "4. Do NOT touch Secure Boot (Ubuntu's image is signed)." \
+    "" \
+    "No network is used. Press Ctrl+C here to stop and restore USB."
+  local last="" st
+  while true; do
+    st=$(cat "$USB_UDC_DIR/$udc/state" 2>/dev/null || true)
+    if [[ $st != "$last" ]]; then
+      [[ $st == configured ]] && ok "The PC is connected and sees the drive"
+      [[ -z $last || $st != configured ]] && info "USB state: ${st:-unknown}"
+      last=$st
+    fi
+    sleep 2
+  done
+}
+
+usb_boot() {
+  case "${1:-start}" in
+    check)  usb_check ;;
+    stop)   journal_replay; ok "USB settings restored" ;;
+    start)  usb_boot_start ;;
+    *)      die "$E_USAGE" "Usage: $0 usb-boot [start|stop|check]" ;;
+  esac
+}
+
 cleanup() {
   trap - EXIT
   kill_servers
@@ -4791,6 +4925,8 @@ COMMANDS
   import-ipxe DIR       Use iPXE binaries built on another machine
   shim-fetch            Ubuntu only: get Ubuntu's own signed boot files (shim + grub). No building,
                         works with Secure Boot on or off (UEFI PCs). Use with --shim or BOOT_LOADER=shim
+  usb-boot [stop|check] No network at all: the phone shows the verified ISO to a PC as a read-only USB drive
+                        (rooted phone with USB mass-storage support; plug the phone into the PC and boot from USB)
   ipxe-phone            Build the x86_64 loader ON THIS PHONE (sets up a small compiler first)
   proot-build           Inside a proot Linux on the phone: build the loader for your Termux install
   xbuild-setup          Only set up that on-phone compiler (Debian via proot-distro)
@@ -4929,7 +5065,7 @@ case "$COMMAND" in
   *) guard_root; log_rotate ;;
 esac
 case "$COMMAND" in
-  deps|attest-init|self-sign|pins|build-ipxe|ipxe-phone|shim-fetch|xbuild-setup|import-ipxe|proot-build|fetch|extract|configure|attest|serve|clean|backup|restore|terabox-install|all)
+  deps|attest-init|self-sign|pins|build-ipxe|ipxe-phone|shim-fetch|xbuild-setup|import-ipxe|proot-build|fetch|extract|configure|attest|serve|usb-boot|clean|backup|restore|terabox-install|all)
     acquire_lock ;;
 esac
 
@@ -4969,6 +5105,7 @@ case "$COMMAND" in
   import-ipxe)    import_ipxe "${POSITIONAL[0]:-}" ;;
   ipxe-phone)     ipxe_phone ;;
   shim-fetch)     shim_fetch ;;
+  usb-boot)       usb_boot "${POSITIONAL[0]:-start}" ;;
   proot-build)    proot_build_flow ;;
   xbuild-setup)   xbox_setup ;;
   ipxe-request)   ipxe_request ;;
@@ -4991,7 +5128,7 @@ case "$COMMAND" in
   all)
     run_all ;;
   *)
-    known_cmds="go status heal doctor guide easy menu check deps fetch extract configure serve backup restore shortcut verify clean logs"
+    known_cmds="go status heal doctor guide easy menu check deps fetch extract configure serve usb-boot backup restore shortcut verify clean logs"
     sugg=$( { compgen -W "$known_cmds" -- "${COMMAND:0:2}" || compgen -W "$known_cmds" -- "${COMMAND:0:1}" || true; } | tr '\n' ' ')
     err "Unknown command: $COMMAND"
     say "Did you mean: ${sugg:-go, status, heal, guide}"
