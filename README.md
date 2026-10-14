@@ -27,7 +27,7 @@ The script contains these presets. The exact release numbers are set in the scri
 | Ubuntu 24.04 | x86-64 |
 | Debian, Fedora, Arch Linux, SystemRescue | x86-64 |
 | Parrot Security | x86-64 or ARM64 |
-| WIM-based Windows Setup | x86-64 |
+| Current Windows 11 ISO download and WIM-based Windows Setup | x86-64 |
 
 Windows network boot is for **x86-64 PCs** and Windows installer ISOs that contain these WIM boot files:
 
@@ -35,7 +35,7 @@ Windows network boot is for **x86-64 PCs** and Windows installer ISOs that conta
 - `boot/boot.sdi`
 - `sources/boot.wim`
 
-That covers WIM-based Windows Setup media, but it does **not** mean every Windows version, custom ISO, or PC is guaranteed to work. Older or unusual bootable Windows ISOs may work through the USB-drive method if the Android device and PC support it.
+The script can check current Windows 11 x64 media against the SHA-256 values on Microsoft's download page. Older Windows releases and custom ISOs are not downloaded automatically; you must provide the ISO and a trusted SHA-256 value. Any ISO used for network setup must contain the three WIM boot files above. That does not guarantee every version or PC will work.
 
 Windows Setup can start from the network boot files, but this script does not make Setup install Windows automatically from the streamed ISO. Setup may need a separate installation source. The USB-drive method presents the ISO itself to the PC as read-only media.
 
@@ -45,9 +45,9 @@ You need:
 
 1. A supported server device listed above.
 2. A separate PC that supports network boot or USB boot.
-3. Internet access for setup tools and, for Linux targets, the operating system download.
+3. Internet access for setup tools and the operating system download.
 4. Enough free storage for the ISO and extracted boot files. Windows media is large; plan for at least 12 GB free.
-5. For Windows, an ISO file and an **independently trusted SHA-256 value** for that exact file. See [Windows ISO safety](#windows-iso-safety) below.
+5. For Windows, an internet connection to Microsoft's current download page, or a Windows ISO you already downloaded. Older Windows releases also need a trusted SHA-256 value. See [Windows ISO safety](#windows-iso-safety) below.
 
 For network boot, connect the server and PC to the same private network. A wired connection is usually more reliable. Guest Wi-Fi and networks that isolate devices can block boot traffic.
 
@@ -65,27 +65,29 @@ chmod +x netboot-android.sh
 
 This lets the script file run as a program. Run it as your normal user. Do not add `sudo` to every command; the script asks for administrator permission when a step needs it. Administrator permission is called **root** on Linux and Android. On Android, the phone must already be rooted.
 
-### 2. Prepare Windows media, if that is your target
+### 2. Choose how to get Windows media, if that is your target
 
-Get the Windows ISO from a source you trust. Put it in a folder the server can read, such as your Downloads folder. Termux may ask for permission to read shared files; grant access only if you want it to use that ISO.
-
-The Windows step checks a local ISO; it does not choose or download Windows media for you.
-
-Before starting the guide, set the expected hash in the same terminal window:
+For current Windows 11 x64, choose **Windows Setup** in the guide or run:
 
 ```sh
-export ISO_SHA256="PASTE_THE_TRUSTED_64_CHARACTER_SHA256_HERE"
+./netboot-android.sh windows-download
 ```
 
-If the ISO is not in one of the folders the script searches, also set its full path:
+The script reads Microsoft's current language-specific SHA-256 table, asks which language you want, then requests the matching download link. If Microsoft's link service refuses an automated request, the script stops and shows Microsoft's official page. Download the ISO there, then give the script its path:
 
 ```sh
-export ISO_FILE="/full/path/to/your/Windows.iso"
+./netboot-android.sh --distro windows --iso "/full/path/to/Windows.iso" fetch
 ```
 
-Replace the example path and hash with your own values. Keep the quotes. Leave out the `ISO_FILE` line if the ISO is in a folder the script searches.
+The file name can be anything. The script checks its bytes against the hashes on Microsoft's page; it does not trust a hash it calculated from the file itself. If the file is in a detected Downloads folder, choose its language in the prompt and the script adopts it only if its SHA-256 matches.
 
-Keep using the same terminal window so these settings stay active. If you close it, enter the `export` lines again before running the script.
+For an older Windows release, download the ISO from a Microsoft source you trust and use that exact file's independently published SHA-256:
+
+```sh
+./netboot-android.sh --distro windows --iso "/full/path/to/Windows.iso" --sha256 "64_HEX_CHARACTERS" fetch
+```
+
+Do not use a hash copied from the same ISO file as proof of origin. After the file matches, the script saves that explicitly supplied value in a locally signed record for later runs. The local signature remembers what you approved; it does not verify where the hash came from. Keep the quotes around paths that contain spaces.
 
 ### 3. Start the guided setup
 
@@ -95,7 +97,7 @@ Run:
 ./netboot-android.sh guide
 ```
 
-On a new setup, choose **Something else** to see the full target list, then choose the PC's processor type and operating system. For Windows, choose `x86_64` and `windows`.
+On a new setup, choose **Windows Setup** for the current Windows 11 x64 installer. Choose **Something else** to see the other operating systems. Windows network boot supports x86-64 PCs only.
 
 The guide checks the server, offers to install required tools, creates local signing keys, checks download-server identities, builds the iPXE boot program, and prepares the selected system. Read each prompt. Installing tools changes the server by adding packages through its normal software installer, called a package manager. Cloud backup is optional; skip it unless you choose to set it up.
 
@@ -116,7 +118,7 @@ The guide offers these network choices:
 - **Direct:** connect the server to the PC with an Ethernet cable. The script becomes the only address server on that link. Use this only on a direct or isolated connection, never on a shared network that already has another address server.
 - **USB:** use Android USB RNDIS networking. This is Android-only, pauses the phone's current USB function (including ADB), and works only when the phone's kernel and the PC's firmware support it.
 
-The script saves your choices and can start serving when setup is complete. The server stays running while the PC boots. Press **Ctrl+C** in the server terminal when you are done.
+The script saves your choices. At the end, it leaves the server stopped unless you answer **yes** to the start question. Press **Ctrl+C** in the server terminal when you are done. The easy screen also requires you to press **b** to start; pressing Enter there does nothing.
 
 ### 5. Start the PC from the network
 
@@ -131,23 +133,13 @@ Windows and most systems using the custom iPXE route generally need **Secure Boo
 
 ## Windows ISO safety
 
-The script checks a Windows ISO against the SHA-256 value you supply. It hashes the ISO before use and checks it again before the HTTP server starts. If the bytes do not match the value, the script refuses to use the ISO.
+For current Windows 11 x64, the script fetches Microsoft's official download page over HTTPS and checks the page's server key against Certificate Transparency records. It reads the page's language-specific SHA-256 table. It does **not** calculate a file's hash and then treat that result as proof that the file is genuine.
 
-That check proves only that the file matches the value you supplied. It does **not** prove who made the file or whether the value came from Microsoft. A hash calculated from an ISO is just a fingerprint; it is not proof that the ISO is genuine. Get the expected value from a trusted source that is separate from the ISO file. Make sure it refers to that exact ISO. If you cannot do that, do not treat the file as verified or continue with the Windows path.
+The ISO is hashed and compared with Microsoft's listed value before the script accepts it. The expected hash and language are saved in a record signed by the script's local GPG key. On later runs, the script checks that signature and hashes the ISO again. Before the HTTP server starts, the script checks the ISO again as part of the integrity checks.
 
-To calculate the hash of a file on Linux or Termux, run:
+If Microsoft's automated link service refuses a request, nothing is accepted or marked ready. Download from the official page shown by the script and run `fetch` with `--iso PATH`; the same Microsoft hash comparison is used. For older versions not on the current page, give the script a SHA-256 published by an independent Microsoft source. A user-provided hash is only as trustworthy as the source it came from.
 
-```sh
-sha256sum "/full/path/to/your/Windows.iso"
-```
-
-If you want to calculate the file's hash on a Windows PC before moving the ISO to the Linux or Android server, use Windows PowerShell:
-
-```powershell
-Get-FileHash "C:\path\to\your\Windows.iso" -Algorithm SHA256
-```
-
-These commands calculate the file's hash. They do not tell you whether the ISO is genuine. Compare the result with the independently trusted expected value before using it.
+A matching hash proves that the file matches the value Microsoft published for that product and language. It does **not** prove that the ISO has no security flaws, that Windows is risk-free, or that a computer will work with it. No software check can make those guarantees.
 
 For Linux images, the script uses the signing keys and checksum/signature files configured for each preset. Checks protect the boot files, but they are not identical for every system. Ubuntu, Debian, Fedora, and Parrot fetch a large operating-system image after boot. This script does not check that later download on the target PC. Arch and SystemRescue use a checksum step for their large image.
 
@@ -161,7 +153,7 @@ After the ISO has been verified, run:
 ./netboot-android.sh usb-boot
 ```
 
-If you opened a new terminal since verifying a Windows ISO, export `ISO_SHA256` again before running this command.
+The Windows checksum is remembered in the local signed state record. If that record or the local signing key is missing or invalid, the script stops and requires a fresh Microsoft-page check or a new trusted SHA-256.
 
 Connect the phone to the target PC and select its USB drive in the PC's boot menu. Press **Ctrl+C** to stop. If a previous run was interrupted, run:
 
@@ -179,11 +171,11 @@ Do not confuse `usb-boot` with `--mode usb`. `usb-boot` presents a USB drive. `-
 - **`serve` starts network services** for DHCP/PXE, TFTP, and HTTP. These services are not encrypted or password-protected. Other devices on the same network may be able to download the listed boot files and ISO. Use a private network you trust, and never forward these ports to the public internet.
 - **USB modes change the phone's USB settings temporarily.** The script records recovery steps and tries to restore the previous settings when it stops. If recovery is needed, run `./netboot-android.sh heal`.
 - **`clean` removes generated boot files and settings** after stopping the server. It keeps the ISOs, keys, and pins. Do not run it unless you want to remove the prepared files.
-- The default verified boot mode signs boot files with a key created on the server. This helps detect changes to those files after preparation. It does not prove the Windows ISO came from Microsoft.
+- The default verified boot mode signs boot files with a key created on the server. For Windows, Microsoft-page hashes help verify the ISO's publisher-listed bytes; the ISO is not itself digitally signed by this script.
 - Self-signing the script can detect later edits to that same file. It cannot prove that the first copy you downloaded was safe. Compare the script's fingerprint with a copy you trust on another device.
 - An imported iPXE program is still code that will run on the target PC. The script checks for its embedded certificate, but that check alone does not prove who built the program or what it does. Only import a build you trust.
 
-For normal use, leave security settings at their defaults. Do not set `ALLOW_UNPINNED=1`, `ALLOW_UNVERIFIED=1`, `VERIFIED_BOOT=0`, `IPXE_ALLOW_UNATTESTED=1`, or `ACCEPT_SCRIPT_CHANGE=1` unless you understand the protection you are turning off. The Windows ISO still requires its SHA-256 value.
+For normal use, leave security settings at their defaults. Do not set `ALLOW_UNPINNED=1`, `ALLOW_UNVERIFIED=1`, `VERIFIED_BOOT=0`, `IPXE_ALLOW_UNATTESTED=1`, or `ACCEPT_SCRIPT_CHANGE=1` unless you understand the protection you are turning off. Windows remains blocked unless the ISO matches Microsoft's published SHA-256 or you explicitly supply a hash from another trusted source.
 
 No script can promise that every download, computer, firmware version, software source, or ISO is free of malicious code. This script adds checks and stops when several checks fail. You still need to trust the script, the ISO, the expected hash, and the server's software sources.
 
@@ -196,15 +188,26 @@ Run these from the script folder:
 ./netboot-android.sh doctor       # See problems and suggested fixes
 ./netboot-android.sh verify deep # Re-hash all prepared boot files
 ./netboot-android.sh heal         # Try to restore saved network/USB state
+./netboot-android.sh windows-download # Get or verify a Windows 11 x64 ISO
 ./netboot-android.sh clean        # Stop and remove generated boot files
 ```
 
-For day-to-day use after setup, `./netboot-android.sh go` checks the saved setup and starts the server. The target choice is saved. The Windows hash is not; if you open a new terminal, export `ISO_SHA256` again before using Windows commands.
+For day-to-day use after setup, `./netboot-android.sh go` checks the saved setup and starts the server. It uses the saved target, and re-checks the Windows ISO against its locally signed Microsoft checksum record. To change back to Windows after choosing another system, select **Windows: download or verify an official ISO** in the menu.
+
+For a non-interactive current Windows 11 download, choose the language explicitly:
+
+```sh
+./netboot-android.sh --windows-language en-us windows-download
+```
+
+You can use a Microsoft language name instead, such as `English`. The script does not pick a language on its own. If Microsoft's direct-link service is blocked on your network, use the official browser page and provide the ISO path.
 
 ## Plain-language terms
 
 - **ISO:** One large file that contains an operating system installer or live system.
 - **SHA-256:** A long fingerprint calculated from a file. If one byte changes, the fingerprint should change. It proves a match to a known value, not who created the file.
+- **Certificate Transparency:** Public records of website certificates. The script uses these records as an extra check of Microsoft's HTTPS identity.
+- **GPG signature:** A check made with a key. The script uses its local key to detect changes to saved trust records; it does not make a user-supplied hash trustworthy.
 - **x86-64 / ARM64:** Two different types of processor. Most Intel- or AMD-based PCs use x86-64. Some newer PCs use ARM64.
 - **PXE / network boot:** Starting a PC by asking another computer on the local network for boot files.
 - **DHCP:** The service that gives devices their network addresses. Direct mode must not compete with another DHCP server.
