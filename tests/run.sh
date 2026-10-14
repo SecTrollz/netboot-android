@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fault-injection tests for netboot-android.sh. No network, no real DHCP server.
+# Integrity and recovery tests for netboot-android.sh. These use temporary folders and local mocks only.
 # Usage: tests/run.sh [name-filter]
 set -uo pipefail
 
@@ -100,11 +100,12 @@ test_heal_leftovers() {
 mk_gate_env() {
   src; mkroot
   ( attest_init ) >/dev/null 2>&1 || skip "gpg/openssl not usable"
-  BIG_BYTES=1000; VERIFIED_BOOT=0; FAMILY=squash
+  BIG_BYTES=1000; VERIFIED_BOOT=0; FAMILY=squash; BOOT_LOADER=ipxe
   KERNEL_REL=k; INITRD_REL=i; ROOTFS_REL=r.img; SHA_REL=""; UCODE_RELS=""
   echo b > "$TFTP/boot.ipxe"; echo e > "$TFTP/ipxe.efi"; echo u > "$TFTP/undionly.kpxe"
   head -c 5000 /dev/urandom > "$HTTP/r.img"; echo k > "$HTTP/k"; echo i > "$HTTP/i"
   echo c > "$DNSMASQ_CONF"; echo p > "$LIB/httpd.py"
+  prepare_tftp_serve
   write_manifest >/dev/null 2>&1
 }
 
@@ -169,10 +170,16 @@ test_extract_is_atomic() {
 
 start_test_httpd() {
   src; mkroot; write_libs
+  FAMILY=casper; VERIFIED_BOOT=0; BOOT_LOADER=ipxe; TARGET_ARCH=x86_64
+  KERNEL_REL=casper/vmlinuz; INITRD_REL=casper/initrd; ROOTFS_REL=casper/big; SHA_REL=""; UCODE_RELS=""
   mkdir -p "$HTTP/casper" "$HTTP/iso"
-  head -c 3000000 /dev/urandom > "$HTTP/casper/big"; echo hi > "$HTTP/boot.ipxe"
+  echo b > "$TFTP/boot.ipxe"; echo e > "$TFTP/ipxe.efi"; echo u > "$TFTP/undionly.kpxe"
+  head -c 3000000 /dev/urandom > "$HTTP/casper/big"
+  echo kernel > "$HTTP/casper/vmlinuz"; echo initrd > "$HTTP/casper/initrd"
   head -c 1000 /dev/urandom > "$T/outside.iso"; ln -s "$T/outside.iso" "$HTTP/iso/x.iso"
   echo secret > "$T/secret"
+  prepare_tftp_serve
+  write_manifest >/dev/null 2>&1
   PHONE_IP=127.0.0.1; HTTP_PORT=$((20000 + RANDOM % 20000)); ISO="$T/outside.iso"
   start_http || { echo "httpd did not start"; cat "$HTTP_LOG.err" 2>/dev/null; exit 1; }
   B="http://127.0.0.1:$HTTP_PORT"
@@ -328,7 +335,7 @@ test_easy_first_run_asks_one_question() {
   assert "choice remembered" grep -q "DISTRO='systemrescue'" "$NETBOOT_HOME/state/profile"
 }
 
-test_easy_ready_enter_runs_go() {
+test_easy_ready_requires_explicit_boot_key() {
   cat > "$T/ready.sh" <<EOF
 export NETBOOT_SOURCE_ONLY=1
 source "$SCRIPT"
@@ -339,12 +346,12 @@ heal_safe() { :; }
 go_cmd() { echo "GO-RAN"; }
 easy_home
 EOF
-  pty_run "" bash "$T/ready.sh"
+  pty_run "|" bash "$T/ready.sh"
   assert "ready screen" grep -q "READY" "$T/pty.out"
-  assert "waits instead of running" bash -c '! grep -q GO-RAN "$1"' _ "$T/pty.out"
-  pty_run "" bash "$T/ready.sh" >/dev/null
-  python3 -I -c "$PTY_PY" "|" bash "$T/ready.sh" > "$T/pty.out" 2>&1
-  assert "Enter starts go" grep -q "GO-RAN" "$T/pty.out"
+  assert "Enter does not start services" bash -c '! grep -q GO-RAN "$1"' _ "$T/pty.out"
+  assert "explains the explicit boot key" grep -q "Press b to start" "$T/pty.out"
+  pty_run "b" bash "$T/ready.sh"
+  assert "b starts go" grep -q "GO-RAN" "$T/pty.out"
 }
 
 mk_signed_copy() {   # a private copy of the script, signed, then edited so its hash differs
