@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  netboot-android.sh
-#  Verified PXE live boot of Linux ISOs, served from a rooted Android phone
-#  (Termux) or from any Linux machine.
+#  Verified PXE live boot of Linux ISOs and WIM-based Windows Setup media
+#  from a supported Linux host or a rooted Android/Termux device.
 # =============================================================================
 #
 #  WHAT IT DOES
@@ -25,12 +25,21 @@
 #    5. iPXE is built from source at a pinned commit with the local CA embedded.
 #       Its built-in script refuses to run boot.ipxe, the kernel, or any initrd
 #       unless the signature verifies against that CA.
-#    6. Integrity gate. Every served file is re-hashed against the manifest
+#    6. Windows wimboot is fixed to upstream v2.9.0 and its SHA-256 is checked
+#       before the binary is copied into the served boot tree.
+#    7. Integrity gate. Every served file is re-hashed against the manifest
 #       before the servers start.
-#    7. Signed attestation reports tie all of the above together and can be
+#    8. Signed attestation reports tie all of the above together and can be
 #       re-verified at any time.
 #
 #  LIMITS
+#    - Windows ISO verification uses a SHA-256 pin supplied by the operator;
+#      Microsoft does not publish a universal signed checksum manifest for
+#      these consumer ISO downloads. The digest proves byte-for-byte equality
+#      to that pin, not Microsoft's authorship of the pin itself.
+#    - Windows wimboot starts Windows Setup/WinPE. The verified ISO is also
+#      exposed as an HTTP byte-range file; installing Windows still depends on
+#      the target machine's storage/network drivers and setup source handling.
 #    - The large root image that the initrd downloads after boot (the Ubuntu
 #      ISO, the Debian or Parrot squashfs, the Fedora squashfs) is not
 #      signature-checked on the client. Arch and SystemRescue verify theirs
@@ -44,7 +53,7 @@
 set -euo pipefail
 umask 022
 
-SCRIPT_VERSION="2026.10.09-easy"
+SCRIPT_VERSION="2026.10.13-windows-usb-net"
 RELEASE_TIME=""   # upload time (UTC epoch) set by release-stamp; must equal the upstream commit time
 
 # =============================================================================
@@ -56,6 +65,50 @@ if [[ -n ${PROOT_TMP_DIR:-}${PROOT_L2S_DIR:-} ]] || grep -q '^TracerPid:[[:space
 IS_ANDROID=0; [[ -e /system/build.prop || -n ${ANDROID_ROOT:-} ]] && IS_ANDROID=1
 HOST_ARCH=$(uname -m)
 SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+
+# Select persistent, writable storage from this host's normal data locations.
+# Rank usable candidates by free space; never default to emulated/shared storage
+# that commonly cannot hold large ISO files or provide the required link support.
+default_netboot_root() {
+  local home=${HOME:-} xdg uid=${EUID:-$(id -u)} candidate probe fs avail best="" best_avail=-1
+  local -a candidates=()
+  xdg=${XDG_DATA_HOME:-${home:+$home/.local/share}}
+  [[ $xdg == /* ]] || xdg=${home:+$home/.local/share}
+  if [[ ${PREFIX:-} == *com.termux* ]]; then
+    candidates=("${PREFIX}/var/lib/netboot-android")
+    [[ -n $home ]] && candidates+=("$home/.local/share/netboot-android" "$home/netboot-android")
+  elif (( IS_ANDROID )); then
+    [[ -n $home ]] && candidates+=("$home/.local/share/netboot-android" "$home/netboot-android")
+    candidates+=("/data/local/netboot-android")
+  else
+    [[ -n $xdg ]] && candidates+=("$xdg/netboot-android")
+    [[ -n $home ]] && candidates+=("$home/.local/share/netboot-android")
+    [[ -n $xdg || -n $home ]] || candidates+=("/var/tmp/netboot-android-$uid")
+  fi
+  for candidate in "${candidates[@]}"; do
+    [[ $candidate == /* ]] || continue
+    probe=$candidate
+    while [[ ! -e $probe && $probe != / ]]; do
+      probe=${probe%/*}; [[ -n $probe ]] || probe=/
+    done
+    [[ -d $probe && -w $probe && -x $probe ]] || continue
+    fs=$(stat -f -c %T "$probe" 2>/dev/null || true)
+    case "$fs" in vfat|msdos|msdosfs|exfat) continue ;; esac
+    avail=$(df -Pk "$probe" 2>/dev/null | awk 'END { if (NR > 1) print $4 }')
+    [[ $avail =~ ^[0-9]+$ ]] || avail=0
+    avail=$((avail / 1024))
+    if (( avail > best_avail )); then best=$candidate; best_avail=$avail; fi
+  done
+  # Keep the preferred platform path as the diagnostic fallback; guard_root
+  # reports a clear error if no parent is actually writable.
+  if [[ -n $best ]]; then printf '%s' "$best"
+  elif [[ ${PREFIX:-} == *com.termux* ]]; then printf '%s' "${PREFIX}/var/lib/netboot-android"
+  elif (( IS_ANDROID )); then printf '%s' "/data/local/netboot-android"
+  elif [[ -n $xdg ]]; then printf '%s' "$xdg/netboot-android"
+  elif [[ -n $home ]]; then printf '%s' "$home/.local/share/netboot-android"
+  else printf '/var/tmp/netboot-android-%s' "$uid"
+  fi
+}
 
 find_bin() {
   local name=$1 c
@@ -84,8 +137,9 @@ missing_tools() {
 # =============================================================================
 # Paths
 # =============================================================================
-ROOT="${NETBOOT_HOME:-$HOME/netboot}"
+ROOT="${NETBOOT_HOME:-$(default_netboot_root)}"
 TFTP="$ROOT/tftp"
+TFTP_SERVE="$ROOT/tftp-serve"
 HTTP="$ROOT/http"
 DL="$ROOT/downloads"
 PIN_DIR="$ROOT/pins"
@@ -106,6 +160,10 @@ PIN_AUDIT="$STATE/pin-audit.log"
 PIN_SNAPSHOT_DATE="2026-10-08"
 DEFAULT_IPXE_COMMIT="744cdb451ef28bc894df72b6b40fdf1fda04acfc"   # 2026-09-22, Michael Brown
 IPXE_REPO="https://github.com/ipxe/ipxe.git"
+WIMBOOT_VERSION="v2.9.0"
+WIMBOOT_URL="https://github.com/ipxe/wimboot/releases/download/${WIMBOOT_VERSION}/wimboot"
+# SHA-256 from the upstream GitHub release asset, independently checked against the downloaded bytes.
+WIMBOOT_SHA256="5f067ccdc4d084d5bf77b6c853bd0f8402dfc2b4cd1b103d358993ae97fae8e3"
 CT_API="https://api.certspotter.com/v1/issuances"
 CT_HOST="api.certspotter.com"
 KEYSERVER_UBUNTU="https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x"
@@ -117,14 +175,16 @@ UPSTREAM_PATH="netboot-android.sh"
 # =============================================================================
 # Settings (environment overrides)
 # =============================================================================
-declare -A PRE_ENV=( [DISTRO]="${DISTRO:-}" [TARGET_ARCH]="${TARGET_ARCH:-}" [DHCP_MODE]="${DHCP_MODE:-}" [IFACE]="${IFACE:-}" [HTTP_PORT]="${HTTP_PORT:-}" )
+declare -gA PRE_ENV=( [BOOT_LOADER]="${BOOT_LOADER:-}" [DISTRO]="${DISTRO:-}" [TARGET_ARCH]="${TARGET_ARCH:-}" [DHCP_MODE]="${DHCP_MODE:-}" [IFACE]="${IFACE:-}" [HTTP_PORT]="${HTTP_PORT:-}" [USB_NET_IFACE]="${USB_NET_IFACE:-}" [USB_NET_CIDR]="${USB_NET_CIDR:-}" )
 CLI_SET=""
 IFACE="${IFACE:-}"
 HTTP_PORT="${HTTP_PORT:-8000}"
 DISTRO="${DISTRO:-ubuntu}"
 TARGET_ARCH="${TARGET_ARCH:-x86_64}"
-DHCP_MODE="${DHCP_MODE:-auto}"            # auto | proxy | direct
+DHCP_MODE="${DHCP_MODE:-auto}"            # auto | proxy | direct | usb
 DIRECT_CIDR="${DIRECT_CIDR:-10.42.0.1/24}"
+USB_NET_IFACE="${USB_NET_IFACE:-usb0}"
+USB_NET_CIDR="${USB_NET_CIDR:-192.168.42.1/24}"
 VERIFIED_BOOT="${VERIFIED_BOOT:-1}"
 DEEP_VERIFY="${DEEP_VERIFY:-auto}"
 INCLUDE_UCODE="${INCLUDE_UCODE:-1}"
@@ -134,6 +194,17 @@ IPXE_CC="${IPXE_CC:-}"
 FALLBACK_SERVER="${FALLBACK_SERVER:-}"
 TRUST_CA="${TRUST_CA:-}"
 ALLOW_UNPINNED="${ALLOW_UNPINNED:-0}"
+# auto (default): Ubuntu's signed chain where it exists, so Secure Boot never has to be touched; otherwise iPXE.
+# ipxe (your own signed chain, needs Secure Boot off) | shim (Ubuntu's Secure Boot chain)
+BOOT_LOADER_AUTO=1
+[[ -n ${BOOT_LOADER:-} && $BOOT_LOADER != auto ]] && BOOT_LOADER_AUTO=0
+BOOT_LOADER="${BOOT_LOADER:-auto}"
+UBUNTU_ARCHIVE="${UBUNTU_ARCHIVE:-https://archive.ubuntu.com/ubuntu}"
+# Ubuntu Archive Automatic Signing Keys (2018, 2012): the only keys accepted for archive metadata
+UBUNTU_ARCHIVE_FPRS="${UBUNTU_ARCHIVE_FPRS:-F6ECB3762474EDA9D21B7022871920D1991BC93C 790BC7277767219C42C86F933B4FE6ACC0B21F32}"
+ISO_FILE="${ISO_FILE:-}"                       # a file you already have (--iso PATH); it is verified before use
+EXTRA_ISO_DIRS="${EXTRA_ISO_DIRS:-}"          # more folders to search for an earlier download, colon separated
+KEY_MIN_SOURCES="${KEY_MIN_SOURCES:-2}"       # independent places that must agree on the vendor key
 ALLOW_UNVERIFIED="${ALLOW_UNVERIFIED:-0}"
 ACCEPT_SCRIPT_CHANGE="${ACCEPT_SCRIPT_CHANGE:-0}"
 CT_BOOTSTRAP="${CT_BOOTSTRAP:-0}"
@@ -168,7 +239,7 @@ load_saved_settings() {
 }
 load_saved_settings
 
-AUTO_BACKUP="${AUTO_BACKUP:-1}"           # 1: back up the working folder before serve and clean
+AUTO_BACKUP="${AUTO_BACKUP:-0}"           # 0 (default): never back up unless asked. 1: back up before serve and clean (only if something changed)
 BACKUP_DIR="${BACKUP_DIR:-$HOME/netboot-backups}"
 BACKUP_KEEP="${BACKUP_KEEP:-5}"           # newest archives kept after each backup
 BACKUP_DL="${BACKUP_DL:-0}"               # 1: include downloads/ (ISOs, large)
@@ -189,6 +260,7 @@ U_ISO_SIG_URL="${ISO_SIG_URL:-}"
 U_KEY_FPR="${KEY_FPR:-}"
 U_BOOT_ARGS="${BOOT_ARGS:-}"
 U_MIN_FREE_MB="${MIN_FREE_MB:-}"
+U_ISO_SHA256="${ISO_SHA256:-}"
 
 # Runtime state
 SERVE_HTTP_PID=""
@@ -201,6 +273,8 @@ POWER_TWEAKED=0
 COMMAND=""
 DRY_RUN=0
 ASSUME_YES=0
+GUIDE_REDO=0
+GUIDE_SKIPPED=0
 POSITIONAL=()
 SIG_SIGNER=""
 GIT_PIN_OPTS=()
@@ -312,12 +386,23 @@ with_lock() {
 
 # ---- refuse to operate on dangerous locations (we rm -rf and chown -R under ROOT)
 guard_root() {
-  local r=${ROOT%/}
+  local r=${ROOT%/} probe p
   [[ $r == /* && ${#r} -ge 6 ]] || die "$E_USAGE" "Refusing NETBOOT_HOME='$ROOT' (must be an absolute path, not near /)."
+  [[ $r != *"'"* && ! $r =~ [[:cntrl:]] ]] || \
+    die "$E_USAGE" "Refusing NETBOOT_HOME with shell-unsafe quote or line-break characters."
+  case "$r" in *"/../"*|*"/./"*|*/..|*/.) die "$E_USAGE" "Refusing NETBOOT_HOME with dot-segment path traversal." ;; esac
+  [[ ! -L $r ]] || die "$E_USAGE" "Refusing a symlinked NETBOOT_HOME; use its resolved target path explicitly."
+  for p in "$TFTP" "$TFTP_SERVE" "$HTTP" "$DL" "$PIN_DIR" "$KEYS_DIR" "$SRC_DIR" "$STATE" "$ATTEST" "$RUN" "$LIB"; do
+    [[ ! -L $p ]] || die "$E_USAGE" "Refusing symlinked managed directory: $p"
+  done
   case "$r" in
     "$HOME"|/home|/root|/usr|/etc|/bin|/sbin|/var|/data|/system|/sdcard|/storage|/storage/emulated/0)
-      die "$E_USAGE" "Refusing NETBOOT_HOME='$ROOT': that is a system or home folder. Use a dedicated folder such as $HOME/netboot." ;;
+      die "$E_USAGE" "Refusing NETBOOT_HOME='$ROOT': choose a dedicated writable data directory, or let the script select one." ;;
   esac
+  probe=$r
+  while [[ ! -e $probe && $probe != / ]]; do probe=${probe%/*}; [[ -n $probe ]] || probe=/; done
+  [[ -d $probe && -w $probe && -x $probe ]] || \
+    die "$E_ENV" "No writable parent storage for '$ROOT'. Set NETBOOT_HOME to a persistent, writable filesystem with large-file support."
   if [[ -e $r && ! -O $r && $(id -u) -ne 0 ]]; then
     die "$E_ENV" "$ROOT is owned by another user. Fix with: sudo chown -R $(id -u) '$ROOT'"
   fi
@@ -346,22 +431,115 @@ atomic_dir_swap() {   # atomic_dir_swap NEW TARGET: TARGET is replaced by NEW; o
 
 # ---- undo journal: every change outside ROOT is recorded first, so a crash can be undone
 JOURNAL="$STATE/undo.d"
-journal_push() {   # journal_push "root command that undoes the change" -> prints entry id
-  mkdir -p "$JOURNAL"
-  local id; id="$(date +%s%N)-$$-$RANDOM"
-  printf '%s\n' "$1" > "$JOURNAL/$id"
+journal_seq_file="$STATE/undo.seq"
+journal_sync() {
+  sync "$1" 2>/dev/null || sync 2>/dev/null
+}
+journal_id_ok() {
+  [[ ${1##*/} =~ ^([0-9]{1,20}|[0-9]{1,19}N)-[0-9]+-[0-9]+$ ]]
+}
+journal_path_ok() {
+  journal_id_ok "$1" && [[ -f $1 && ! -L $1 ]]
+}
+journal_push() {   # Commit rollback before any host-side mutation.
+  local cmd=$1 id tmp seqtmp epoch last=0 order
+  [[ ! -L $ROOT && ! -L $STATE && ! -L $JOURNAL ]] || { err "Refusing a symlinked recovery-state path."; return 1; }
+  mkdir -p "$STATE" "$JOURNAL" || return 1
+  chmod 700 "$STATE" "$JOURNAL" || return 1
+  journal_sync "$STATE" || return 1
+  [[ ! -L $journal_seq_file ]] || { err "Refusing a symlinked recovery sequence."; return 1; }
+  if [[ -e $journal_seq_file ]]; then
+    [[ -f $journal_seq_file ]] || { err "Recovery sequence is not a regular file."; return 1; }
+    last=$(cat "$journal_seq_file" 2>/dev/null) || return 1
+    [[ $last =~ ^[0-9]{1,19}$ ]] || { err "Recovery sequence is malformed."; return 1; }
+    last=$((10#$last))
+  fi
+  # Migrate ordering safely if a journal from an earlier build is still pending.
+  local existing first
+  for existing in "$JOURNAL"/*; do
+    journal_id_ok "$existing" || continue
+    first=${existing##*/}; first=${first%%-*}; first=${first%N}
+    [[ $first =~ ^[0-9]{1,20}$ ]] || continue
+    (( 10#$first > last )) && last=$((10#$first))
+  done
+  epoch=$(date +%s) || return 1
+  [[ $epoch =~ ^[0-9]{1,10}$ ]] || { err "Could not read a valid clock for the recovery journal."; return 1; }
+  order=$((10#$epoch * 1000000000))
+  (( order > last )) || order=$((last+1))
+  printf -v order '%019d' "$order"
+  seqtmp=$(mktemp "$STATE/.undo-seq.XXXXXX") || return 1
+  if ! printf '%s\n' "$order" > "$seqtmp" || ! chmod 600 "$seqtmp" ||
+     ! journal_sync "$seqtmp" || ! mv -f "$seqtmp" "$journal_seq_file" ||
+     ! journal_sync "$STATE"; then
+    rm -f "$seqtmp"
+    return 1
+  fi
+  id="${order}-$$-$RANDOM"
+  while [[ -e $JOURNAL/$id || -L $JOURNAL/$id ]]; do id="${order}-$$-$RANDOM"; done
+  tmp=$(mktemp "$JOURNAL/.pending.XXXXXX") || return 1
+  if ! printf '%s\n' "$cmd" > "$tmp" || ! chmod 600 "$tmp" || ! journal_sync "$tmp" ||
+     ! mv -f "$tmp" "$JOURNAL/$id" || ! journal_sync "$JOURNAL"; then
+    rm -f "$tmp"
+    err "Could not durably commit the recovery journal; refusing the host-side change."
+    return 1
+  fi
   printf '%s' "$id"
 }
-journal_drop() { rm -f "$JOURNAL/$1" 2>/dev/null || true; }
-journal_count() { local f n=0; for f in "$JOURNAL"/*; do [[ -e $f ]] && n=$((n+1)); done; echo "$n"; }
-journal_replay() {   # newest first; entries that succeed are removed
-  local f cmd n=0
+journal_replace() {   # Atomically update a still-pending compensation plan.
+  local id=$1 cmd=$2 path="$JOURNAL/$1" tmp
+  journal_path_ok "$path" || return 1
+  tmp=$(mktemp "$JOURNAL/.pending.XXXXXX") || return 1
+  if ! printf '%s\n' "$cmd" > "$tmp" || ! chmod 600 "$tmp" || ! journal_sync "$tmp" ||
+     ! mv -f "$tmp" "$path" || ! journal_sync "$JOURNAL"; then
+    rm -f "$tmp"
+    return 1
+  fi
+}
+journal_drop() {
+  local path="$JOURNAL/$1"
+  journal_path_ok "$path" || return 1
+  rm -f "$path" && journal_sync "$JOURNAL"
+}
+journal_count() {
+  local f n=0
+  for f in "$JOURNAL"/[0-9]*-[0-9]*-[0-9]*; do [[ -e $f || -L $f ]] && n=$((n+1)); done
+  echo "$n"
+}
+journal_apply() {
+  local id=$1 path="$JOURNAL/$1" cmd
+  journal_path_ok "$path" || { warn "Invalid or unreadable recovery record: $id"; return 1; }
+  cmd=$(cat "$path" 2>/dev/null) || return 1
+  [[ -n $cmd ]] || { warn "Empty recovery record retained: $id"; return 1; }
+  if run_root "$cmd" >/dev/null 2>&1; then
+    journal_drop "$id"
+  else
+    warn "Recovery record remains pending: $id. Retry with '$0 heal'."
+    return 1
+  fi
+}
+journal_replay() {   # Newest first; failed or malformed records remain for the next recovery attempt.
+  local id n=0 failed=0 f
+  local -a ids=()
   [[ -d $JOURNAL ]] || return 0
-  while IFS= read -r f; do
-    cmd=$(cat "$f" 2>/dev/null) || continue
-    if run_root "$cmd" >/dev/null 2>&1; then rm -f "$f"; n=$((n+1)); else warn "Could not undo: $cmd"; fi
-  done <<<"$(ls -1r "$JOURNAL"/* 2>/dev/null || true)"
+  for f in "$JOURNAL"/[0-9]*-[0-9]*-[0-9]*; do
+    [[ -e $f || -L $f ]] || continue
+    if [[ -f $f && ! -L $f ]] && journal_id_ok "$f"; then
+      ids+=("${f##*/}")
+    else
+      warn "Malformed recovery record retained for inspection: ${f##*/}"
+      failed=$((failed+1))
+    fi
+  done
+  if ((${#ids[@]})); then
+    mapfile -t ids < <(printf '%s\n' "${ids[@]}" | LC_ALL=C sort -r)
+    for id in "${ids[@]}"; do
+      if journal_apply "$id"; then n=$((n+1)); else failed=$((failed+1)); fi
+    done
+  fi
+  # A .pending file can only be left before the host mutation starts.
+  for f in "$JOURNAL"/.pending.*; do [[ -f $f && ! -L $f ]] && rm -f "$f"; done
   (( n == 0 )) || { ok "Undid $n leftover system change(s) from an earlier run"; log_event INFO "journal replayed $n"; }
+  (( failed == 0 )) || { warn "$failed recovery record(s) remain pending; host changes may still be active."; return 1; }
   return 0
 }
 
@@ -539,7 +717,13 @@ PINS
 # GRUB configs on 2026-10-08. If a vendor changes its layout, extract falls
 # back to discovering the files.
 only_x86() {
-  [[ $TARGET_ARCH == x86_64 ]] || die "$DISTRO: the vendor publishes no $TARGET_ARCH live image. Use --arch x86_64."
+  [[ $TARGET_ARCH == x86_64 ]] || {
+    if [[ $DISTRO == windows || $DISTRO == win11 ]]; then
+      die "$DISTRO: the WIM-based PXE path currently supports x86_64 only. Use --arch x86_64."
+    else
+      die "$DISTRO: the vendor publishes no $TARGET_ARCH live image. Use --arch x86_64."
+    fi
+  }
 }
 
 set_distro() {
@@ -632,8 +816,15 @@ set_distro() {
       P_RAM_GB=12; P_MIN_MB=17000
       P_LABEL="Parrot Security 7.4"
       ;;
+    windows|win11)
+      only_x86
+      P_FAMILY=wimboot
+      P_KERNEL=wimboot; P_INITRD=sources/boot.wim; P_ROOTFS=boot/bcd
+      P_ISO_MB=5500; P_RAM_GB=4; P_MIN_MB=6000
+      P_LABEL="Windows Setup (WIM-based ISO via wimboot)"
+      ;;
     *)
-      die "Unknown DISTRO '$DISTRO'. Use: ubuntu, ubuntu24, debian, fedora, arch, systemrescue, parrot"
+      die "Unknown DISTRO '$DISTRO'. Use: ubuntu, ubuntu24, debian, fedora, arch, systemrescue, parrot, windows"
       ;;
   esac
 
@@ -649,11 +840,20 @@ set_distro() {
   SUMS_ALGO=$P_SUMS_ALGO
   ISO_SIG_URL=${U_ISO_SIG_URL:-$P_ISO_SIG_URL}
   KEY_EXTRA_URL=$P_KEY_EXTRA_URL
+  case "$DISTRO" in
+    ubuntu|ubuntu24)   # keys.openpgp.org does not carry Ubuntu's CD key; Ubuntu's own archive does
+      [[ -n $KEY_EXTRA_URL ]] || KEY_EXTRA_URL="deb:https://archive.ubuntu.com/ubuntu/pool/main/u/ubuntu-keyring/|ubuntu-keyring|usr/share/keyrings/ubuntu-cdimage-keyring.gpg" ;;
+  esac
   KEY_FPR=$(norm_fpr "${U_KEY_FPR:-$(vendor_fpr "$DISTRO")}")
   MIN_FREE_MB=${U_MIN_FREE_MB:-$P_MIN_MB}
   CLIENT_RAM_GB=$P_RAM_GB
 
   ISO_NAME=$(basename "${ISO_URL%%\?*}")
+  if [[ $DISTRO == windows || $DISTRO == win11 ]]; then
+    ISO_NAME=$(basename "${ISO_FILE:-windows.iso}")
+    [[ -n $ISO_NAME && $ISO_NAME != "." && $ISO_NAME != "/" ]] || ISO_NAME=windows.iso
+  fi
+  ISO_SHA256=${U_ISO_SHA256,,}
   ISO="$ROOT/$DISTRO-$TARGET_ARCH.iso"
   ISO_VERIFIED="$ISO.verified"
   SUMS_FILE="$DL/$DISTRO-$TARGET_ARCH.sums"
@@ -663,9 +863,20 @@ set_distro() {
   MANIFEST="$STATE/$DISTRO-$TARGET_ARCH.manifest"
   GNUPG_HOME="$ROOT/gnupg/$DISTRO"
   IPXE_BUILT="$STATE/ipxe-$TARGET_ARCH.built-from"
+  # No choice for you to make: the signed route is used whenever it exists
+  if [[ $BOOT_LOADER_AUTO == 1 || $BOOT_LOADER == auto ]]; then
+    BOOT_LOADER_AUTO=1
+    if shim_supported; then BOOT_LOADER=shim; else BOOT_LOADER=ipxe; fi
+  fi
 }
 
 # iPXE binaries served for the current target architecture
+# Files the PC downloads first. In shim mode these are Ubuntu's signed shim and grub.
+boot_files() {
+  if [[ $BOOT_LOADER == shim ]]; then echo shimx64.efi; echo grubx64.efi; echo mmx64.efi; else ipxe_files_for_arch; fi
+}
+shim_supported() { [[ $TARGET_ARCH == x86_64 && ( $DISTRO == ubuntu || $DISTRO == ubuntu24 ) ]]; }
+
 ipxe_files_for_arch() {
   if [[ $TARGET_ARCH == x86_64 ]]; then
     echo ipxe.efi; echo undionly.kpxe
@@ -724,8 +935,10 @@ PYEOF
   cat > "$LIB/httpd.py" <<'PYEOF'
 import logging
 import logging.handlers
+import hashlib
 import mimetypes
 import os
+import posixpath
 import re
 import signal
 import socket
@@ -738,6 +951,24 @@ from urllib.parse import unquote, urlsplit
 
 bind, port, root = sys.argv[1], int(sys.argv[2]), os.path.realpath(sys.argv[3])
 allow = {os.path.realpath(p) for p in os.environ.get("HTTPD_ALLOW", "").split(os.pathsep) if p}
+manifest_path = os.environ.get("HTTPD_MANIFEST")
+if not manifest_path:
+    raise SystemExit("missing integrity manifest; refusing to serve")
+served_rel = set()
+try:
+    with open(manifest_path, "r", encoding="utf-8") as manifest:
+        for line in manifest:
+            fields = line.rstrip("\n").split(" ", 2)
+            if len(fields) != 3 or not fields[2].startswith("http/"):
+                continue
+            rel = fields[2][5:]
+            normalized = posixpath.normpath(rel)
+            if rel and not rel.startswith("/") and normalized != "." and not normalized.startswith("../"):
+                served_rel.add(normalized)
+except OSError as exc:
+    raise SystemExit("cannot read integrity manifest: %s" % exc)
+if not served_rel:
+    raise SystemExit("integrity manifest contains no HTTP files; refusing to serve")
 max_conn = int(os.environ.get("HTTPD_MAX_CONN", "16"))
 log_path = os.environ.get("HTTPD_LOG")
 
@@ -752,6 +983,18 @@ slots = threading.BoundedSemaphore(max_conn)
 stats_lock = threading.Lock()
 stats = {"requests": 0, "bytes": 0}
 RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+iso_pin = os.environ.get("HTTPD_ISO_SHA256", "").strip().lower()
+iso_path = os.environ.get("HTTPD_ISO_PATH", "")
+if iso_pin:
+    if not re.fullmatch(r"[0-9a-f]{64}", iso_pin) or not iso_path:
+        raise SystemExit("invalid pinned ISO configuration")
+    h = hashlib.sha256()
+    with open(iso_path, "rb") as iso:
+        for chunk in iter(lambda: iso.read(4 << 20), b""):
+            h.update(chunk)
+    if h.hexdigest() != iso_pin:
+        raise SystemExit("Windows ISO SHA-256 differs from its configured pin; refusing to serve")
+    log.info("pinned ISO SHA-256 verified before listening")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -787,7 +1030,11 @@ class Handler(BaseHTTPRequestHandler):
         path = unquote(urlsplit(self.path).path)
         if "\x00" in path:
             return None
-        fs = os.path.realpath(os.path.join(root, path.lstrip("/")))
+        rel = path.lstrip("/")
+        normalized = posixpath.normpath(rel)
+        if not rel or normalized == "." or normalized.startswith("../") or normalized not in served_rel:
+            return None
+        fs = os.path.realpath(os.path.join(root, normalized))
         if fs == root or fs.startswith(root + os.sep) or fs in allow:
             return fs
         return None
@@ -973,13 +1220,33 @@ auto_iface() {
 
 # Sets IFACE, MODE, PHONE_IP, PREFIX_LEN, NET, MASK, BASE_URL, IS_HOTSPOT
 resolve_network() {
+  if [[ $DHCP_MODE == usb ]]; then
+    [[ -z $IFACE || $IFACE == "$USB_NET_IFACE" ]] || die "$E_USAGE" "USB network mode uses USB_NET_IFACE=$USB_NET_IFACE; change USB_NET_IFACE instead of --iface."
+    local usb_ip=${USB_NET_CIDR%/*} usb_prefix=${USB_NET_CIDR#*/} part
+    local -a _usb_octets=()
+    [[ $USB_NET_CIDR == */* && $usb_ip =~ ^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}$ && $usb_prefix =~ ^(0|[1-9][0-9]?)$ ]] || \
+      die "$E_USAGE" "USB_NET_CIDR must be a valid IPv4 CIDR such as 192.168.42.1/24."
+    IFS=. read -r -a _usb_octets <<<"$usb_ip"
+    for part in "${_usb_octets[@]}"; do
+      [[ $part =~ ^(0|[1-9][0-9]{0,2})$ ]] && (( part <= 255 )) || die "$E_USAGE" "Invalid IPv4 address in USB_NET_CIDR: $USB_NET_CIDR"
+    done
+    (( 10#$usb_prefix >= 1 && 10#$usb_prefix <= 30 )) || die "$E_USAGE" "USB_NET_CIDR must have a prefix from /1 through /30."
+    IFACE=$USB_NET_IFACE
+  fi
   [[ -n $IFACE ]] || IFACE=$(auto_iface)
   [[ -n $IFACE ]] || die "No usable network interface. Connect to Wi-Fi or Ethernet, or set IFACE=..."
+  [[ $IFACE =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || die "$E_USAGE" "Invalid network interface name: $IFACE"
 
   local cidr
   cidr=$(iface_cidr "$IFACE")
 
   MODE=$DHCP_MODE
+  if [[ $MODE == usb ]]; then
+    (( IS_ANDROID )) || die "$E_ENV" "USB gadget network mode is Android-only. Use --mode direct with a USB Ethernet adapter on Linux."
+    MODE=direct
+    cidr=$USB_NET_CIDR
+    DIRECT_CIDR=$USB_NET_CIDR
+  fi
   if [[ $MODE == auto ]]; then
     if [[ -z $cidr && $IFACE =~ ^(eth|usb|rndis|ncm|en) ]]; then MODE=direct; else MODE=proxy; fi
   fi
@@ -988,15 +1255,22 @@ resolve_network() {
   if [[ $MODE == direct && -z $cidr ]]; then cidr=$DIRECT_CIDR; fi
   [[ -n $cidr ]] || die "$IFACE has no IPv4 address. Connect it, or use --mode direct for a cable to the PC."
 
-  local prefix ipint maskint
+  local prefix ipint maskint part
+  local -a _cidr_octets=()
   PHONE_IP=${cidr%/*}
   prefix=${cidr#*/}
-  [[ $prefix =~ ^[0-9]+$ ]] && (( prefix >= 0 && prefix <= 32 )) || die "Unexpected prefix in $cidr"
-  (( prefix <= 30 )) || die "Subnet /$prefix on $IFACE is too small for PXE clients"
+  [[ $PHONE_IP =~ ^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}$ && $prefix =~ ^(0|[1-9][0-9]?)$ ]] || die "$E_USAGE" "Invalid IPv4 CIDR for $IFACE: $cidr"
+  IFS=. read -r -a _cidr_octets <<<"$PHONE_IP"
+  for part in "${_cidr_octets[@]}"; do (( part <= 255 )) || die "$E_USAGE" "Invalid IPv4 address in $cidr"; done
+  (( 10#$prefix >= 1 && 10#$prefix <= 30 )) || die "$E_USAGE" "Subnet /$prefix on $IFACE is too small for PXE clients."
 
   ipint=$(ip_to_int "$PHONE_IP")
   maskint=$(prefix_to_mask_int "$prefix")
-  NET="${NET:-$(int_to_ip $(( ipint & maskint )))}"
+  if [[ $DHCP_MODE == usb ]]; then
+    NET=$(int_to_ip $(( ipint & maskint )))
+  else
+    NET="${NET:-$(int_to_ip $(( ipint & maskint )))}"
+  fi
   MASK=$(int_to_ip "$maskint")
   PREFIX_LEN=$prefix
   BASE_URL="http://${PHONE_IP}:${HTTP_PORT}"
@@ -1010,12 +1284,20 @@ resolve_network() {
 direct_pool() {
   local netint size start end phone
   netint=$(ip_to_int "$NET")
-  size=$(( 1 << (32 - PREFIX_LEN) ))
   phone=$(ip_to_int "$PHONE_IP")
-  start=$(( netint + size / 4 ))
-  end=$(( netint + size - 2 ))
-  (( end - start > 100 )) && end=$(( start + 100 ))
-  if (( phone >= start && phone <= end )); then start=$(( phone + 1 )); fi
+  if [[ $DHCP_MODE == usb && $PREFIX_LEN == 24 ]]; then
+    start=$(( netint + 10 ))
+    end=$(( netint + 50 ))
+    if (( phone >= start && phone <= end )); then
+      if (( phone > start )); then end=$(( phone - 1 )); else start=$(( phone + 1 )); fi
+    fi
+  else
+    size=$(( 1 << (32 - PREFIX_LEN) ))
+    start=$(( netint + size / 4 ))
+    end=$(( netint + size - 2 ))
+    (( end - start > 100 )) && end=$(( start + 100 ))
+    if (( phone >= start && phone <= end )); then start=$(( phone + 1 )); fi
+  fi
   (( start <= end )) || die "Cannot fit a DHCP pool in $NET/$PREFIX_LEN"
   POOL_START=$(int_to_ip "$start")
   POOL_END=$(int_to_ip "$end")
@@ -1152,7 +1434,7 @@ ct_get() {
 
 # Prints "spki until issuer" lines for all current, unrevoked certs covering HOST
 ct_current() {
-  local host=$1 tmp=$2 dom after page n last f
+  local host=$1 tmp=$2 dom after page pinfo n last f
   local -a files=() doms=("$host")
   local parent=${host#*.}
   [[ $parent == *.* ]] && doms+=("$parent")
@@ -1161,8 +1443,8 @@ ct_current() {
     while (( page < 40 )); do
       f="$tmp/ct.$dom.$page.json"
       ct_get "$CT_API?domain=$dom&expand=dns_names&expand=issuer&expand=revocation${after:+&after=$after}" "$f" || return 1
-      page=$("$PYTHON" "$LIB/ct_parse.py" page "$f") || return 1
-      read -r n last <<<"$page"
+      pinfo=$("$PYTHON" "$LIB/ct_parse.py" page "$f") || return 1
+      read -r n last <<<"$pinfo"
       if (( n == 0 )); then rm -f "$f"; break; fi
       files+=("$f")
       after=$last
@@ -1250,6 +1532,37 @@ key_fprs_of() {
     | awk -F: '$1=="fpr"{print $10}'
 }
 
+# Newest NAME_*_all.deb listed in an HTML directory index (stdin)
+latest_deb_name() {   # latest_deb_name PKG < index.html
+  grep -o "$1_[0-9][0-9A-Za-z.+~:-]*_all\.deb" | sort -uV | tail -n1
+}
+
+# Pulls one file out of a .deb (an ar archive holding data.tar.*)
+deb_extract_member() {   # deb_extract_member DEB MEMBER_PATH DEST
+  local deb=$1 member=$2 dest=$3
+  need bsdtar
+  bsdtar -xOf "$deb" 'data.tar*' 2>/dev/null | bsdtar -xOf - "./$member" > "$dest.tmp" 2>/dev/null \
+    && [[ -s $dest.tmp ]] && mv -f "$dest.tmp" "$dest" || { rm -f "$dest.tmp"; return 1; }
+}
+
+# A key source is either an https URL, or  deb:BASEURL|PACKAGE|PATH-INSIDE-PACKAGE
+fetch_key_source() {   # fetch_key_source SRC DEST
+  local src=$1 dest=$2
+  if [[ $src == deb:* ]]; then
+    local spec=${src#deb:} base pkg member idx name
+    base=${spec%%|*}; spec=${spec#*|}; pkg=${spec%%|*}; member=${spec#*|}
+    idx=$(mktemp)
+    vfetch "$base" "$idx" protected || { rm -f "$idx"; return 1; }
+    name=$(latest_deb_name "$pkg" < "$idx"); rm -f "$idx"
+    [[ -n $name ]] || return 1
+    vfetch "$base$name" "$dest.deb" protected || return 1
+    deb_extract_member "$dest.deb" "$member" "$dest"; local rc=$?
+    rm -f "$dest.deb"
+    return $rc
+  fi
+  vfetch "$src" "$dest" protected
+}
+
 prepare_keyring() {
   need gpg
   [[ -n $KEY_FPR ]] || die "No signing key fingerprint for $DISTRO. Set KEY_FPR."
@@ -1268,7 +1581,7 @@ prepare_keyring() {
   for src in "${srcs[@]}"; do
     i=$((i+1))
     f="$KEYS_DIR/$DISTRO/key.$i.asc"
-    if ( vfetch "$src" "$f" protected ); then
+    if ( fetch_key_source "$src" "$f" ); then
       fprs=$(key_fprs_of "$scratch" "$f")
       if grep -qx "$KEY_FPR" <<<"$fprs"; then
         agree=$((agree+1))
@@ -1284,7 +1597,9 @@ prepare_keyring() {
   done
   rm -rf "$scratch"
 
-  (( agree >= 2 )) || die "Key $KEY_FPR was confirmed by only $agree source(s). Need at least 2."
+  if (( agree < KEY_MIN_SOURCES )); then
+    die "$E_NET" "Key $KEY_FPR was confirmed by only $agree source(s); $KEY_MIN_SOURCES are required. Nothing was downloaded or deleted. Check your internet and run the same step again. (To accept one source, whose key matches the fingerprint built into this script, set KEY_MIN_SOURCES=1.)"
+  fi
   gpg --homedir "$GNUPG_HOME" --batch --no-tty --list-keys "$KEY_FPR" >/dev/null 2>&1 \
     || die "Key $KEY_FPR could not be imported into the keyring"
   touch "$GNUPG_HOME/.ready-$KEY_FPR"
@@ -1302,7 +1617,7 @@ sig_ok() {
   while read -r _ rest; do
     if grep -qw "$sigkey" <<<"$rest"; then count=$((count+1)); fi
   done < "$GNUPG_HOME/source-fprs"
-  (( count >= 2 )) || return 1
+  (( count >= KEY_MIN_SOURCES )) || return 1
   SIG_SIGNER=$sigkey
 }
 
@@ -2142,16 +2457,13 @@ ipxe_cloud() {   # one-time GitHub build, then pinned forever
 }
 
 import_ipxe() {
-  local dir=${1:-}
+  local dir=${1:-} f n=0 first
   [[ -n $dir && -d $dir ]] || die "Usage: $0 import-ipxe DIR   (DIR holds ipxe.efi / undionly.kpxe / ipxe-arm64.efi)"
-  mkdir -p "$TFTP" "$STATE"
-  local f n=0
   for f in $(ipxe_files_for_arch); do
     if [[ -s $dir/$f ]]; then
       head -c 2 "$dir/$f" | grep -q 'MZ' || [[ $f == *.kpxe ]] || die "$f is not a PE/EFI binary"
-      cp "$dir/$f" "$TFTP/$f"
       n=$((n+1))
-      ok "Imported $f ($(sha256_of "$TFTP/$f"))"
+      info "Candidate $f SHA-256: $(sha256_of "$dir/$f")"
     else
       warn "Missing $dir/$f"
     fi
@@ -2160,9 +2472,25 @@ import_ipxe() {
 
   if [[ $VERIFIED_BOOT == 1 ]]; then
     [[ -s $ATTEST/ca.crt ]] || die "Run: $0 attest-init first"
-    check_ca_embedded "$TFTP/$(ipxe_files_for_arch | head -n1)" "$ATTEST/ca.crt"
+    first=$(ipxe_files_for_arch | head -n1)
+    [[ -s $dir/$first ]] || die "$first is required for verified boot."
+    check_ca_embedded "$dir/$first" "$ATTEST/ca.crt"
+    warn "An embedded CA match is not proof of source or safe behavior. Imported iPXE code will execute on the target computer."
+    ask_yn "Trust and stage these externally built iPXE binaries?" n || die "$E_USAGE" "Import declined; no loader files were copied."
   else
-    warn "VERIFIED_BOOT=0: imported binaries are trusted as-is"
+    warn "VERIFIED_BOOT=0: imported binaries are unsigned and unverified."
+    ask_yn "Stage these unverified iPXE binaries anyway?" n || die "$E_USAGE" "Import declined; no loader files were copied."
+  fi
+
+  mkdir -p "$TFTP" "$STATE"
+  for f in $(ipxe_files_for_arch); do
+    if [[ -s $dir/$f ]]; then
+      cp "$dir/$f" "$TFTP/$f"
+      ok "Imported $f ($(sha256_of "$TFTP/$f"))"
+    fi
+  done
+  if [[ $VERIFIED_BOOT == 1 ]]; then
+    check_ca_embedded "$TFTP/$first" "$ATTEST/ca.crt"
   fi
   if [[ ${IMPORT_KEEP_PIN:-0} != 1 && -s $(loader_pin_path) ]]; then
     rm -f "$(loader_pin_path)" "$(loader_pin_path).asc"
@@ -2183,17 +2511,244 @@ import_ipxe() {
 # =============================================================================
 # Fetch and verify the ISO
 # =============================================================================
+# =============================================================================
+# Ubuntu's own signed boot files (shim + grub). No compiling, works with Secure Boot on or off.
+# The PC's firmware verifies shim (Microsoft-signed), shim verifies grub and the kernel (Canonical-signed).
+# =============================================================================
+ubuntu_suite() { case $DISTRO in ubuntu) echo resolute ;; ubuntu24) echo noble ;; *) return 1 ;; esac; }
+
+# Verifies a clearsigned InRelease against Ubuntu's archive keys; prints the signed text to OUT
+archive_release_verify() {   # archive_release_verify HOMEDIR INRELEASE OUT
+  local home=$1 in=$2 out=$3 st fpr ok=0
+  st=$(mktemp)
+  gpg --homedir "$home" --batch --no-tty --yes --status-file "$st" --output "$out" --decrypt "$in" >/dev/null 2>&1 || true
+  if ! grep -qE '^\[GNUPG:\] (BADSIG|EXPKEYSIG|REVKEYSIG|ERRSIG) ' "$st"; then
+    for fpr in $UBUNTU_ARCHIVE_FPRS; do
+      if awk -v f="$fpr" '$2=="VALIDSIG" && $NF==f {found=1} END{exit !found}' "$st"; then ok=1; fi
+    done
+  fi
+  rm -f "$st"
+  (( ok )) && [[ -s $out ]]
+}
+
+# hash of FILE as listed in a verified Release text (SHA256 section)
+release_hash() {   # release_hash RELEASE_TEXT PATH
+  awk -v want="$2" '
+    /^SHA256:/ {in256=1; next}
+    /^[A-Za-z0-9-]+:/ {in256=0}
+    in256 && $3==want {print $1; exit}' "$1"
+}
+
+# Prints "version filename sha256" of PKG in a Packages file
+packages_entry() {   # packages_entry PACKAGES_FILE PKG
+  awk -v pkg="$2" 'BEGIN{RS="";FS="\n"}
+    { name=""; ver=""; fn=""; sum="";
+      for(i=1;i<=NF;i++){ if($i ~ /^Package: /){name=substr($i,10)} else if($i ~ /^Version: /){ver=substr($i,10)}
+                          else if($i ~ /^Filename: /){fn=substr($i,11)} else if($i ~ /^SHA256: /){sum=substr($i,9)} }
+      if(name==pkg) print ver, fn, sum }' "$1"
+}
+
+shim_fetch() {
+  shim_supported || die "$E_USAGE" "Ubuntu's signed boot files are available for Ubuntu on x86_64 PCs only."
+  need gpg; need curl; need bsdtar; need xz; need sha256sum
+  local suite work home keyf pkg pocket relf relt ph pf best ver fn sum debdir
+  suite=$(ubuntu_suite)
+  work=$(mktemp -d); chmod 700 "$work"; home="$work/gnupg"; mkdir -p "$home"; chmod 700 "$home"
+  mkdir -p "$TFTP/grub" "$STATE"
+
+  info "Getting Ubuntu's archive signing key from the ubuntu-keyring package"
+  keyf="$work/archive-keyring.gpg"
+  fetch_key_source "deb:$UBUNTU_ARCHIVE/pool/main/u/ubuntu-keyring/|ubuntu-keyring|usr/share/keyrings/ubuntu-archive-keyring.gpg" "$keyf" \
+    || { rm -rf "$work"; die "$E_NET" "Could not get Ubuntu's archive keyring. Check your internet and run again."; }
+  gpg --homedir "$home" --batch --no-tty --quiet --import "$keyf" 2>/dev/null || true
+  local have=0 fpr
+  for fpr in $UBUNTU_ARCHIVE_FPRS; do gpg --homedir "$home" --batch --list-keys "$fpr" >/dev/null 2>&1 && have=1; done
+  (( have )) || { rm -rf "$work"; die "$E_INTEGRITY" "The keyring does not contain Ubuntu's archive signing keys. Refusing."; }
+
+  declare -A got_ver=() got_fn=() got_sum=()
+  for pkg in shim-signed grub-efi-amd64-signed; do got_ver[$pkg]=""; done
+  for pocket in "$suite" "$suite-updates" "$suite-security"; do
+    relf="$work/InRelease.$pocket"; relt="$work/Release.$pocket"
+    vfetch "$UBUNTU_ARCHIVE/dists/$pocket/InRelease" "$relf" protected || { warn "Could not read $pocket; skipping it"; continue; }
+    archive_release_verify "$home" "$relf" "$relt" \
+      || { rm -rf "$work"; die "$E_INTEGRITY" "The signature on Ubuntu's $pocket release file did not verify. Refusing."; }
+    ph="$work/Packages.$pocket.xz"
+    vfetch "$UBUNTU_ARCHIVE/dists/$pocket/main/binary-amd64/Packages.xz" "$ph" protected || { warn "No package list for $pocket"; continue; }
+    sum=$(release_hash "$relt" main/binary-amd64/Packages.xz)
+    [[ -n $sum && $(sha256sum "$ph" | cut -d' ' -f1) == "$sum" ]] \
+      || { rm -rf "$work"; die "$E_INTEGRITY" "The package list for $pocket does not match Ubuntu's signed release file. Refusing."; }
+    pf="$work/Packages.$pocket"; xz -dc "$ph" > "$pf" || { rm -rf "$work"; die "$E_ENV" "Could not unpack the package list (is xz installed?)"; }
+    for pkg in shim-signed grub-efi-amd64-signed; do
+      best=$(packages_entry "$pf" "$pkg" | head -n1)
+      [[ -n $best ]] || continue
+      read -r ver fn sum <<<"$best"
+      if [[ -z ${got_ver[$pkg]} || $(printf '%s\n%s\n' "${got_ver[$pkg]}" "$ver" | sort -V | tail -n1) == "$ver" ]]; then
+        got_ver[$pkg]=$ver; got_fn[$pkg]=$fn; got_sum[$pkg]=$sum
+      fi
+    done
+  done
+  for pkg in shim-signed grub-efi-amd64-signed; do
+    [[ -n ${got_ver[$pkg]} ]] || { rm -rf "$work"; die "$E_ENV" "Ubuntu's archive has no $pkg for $suite."; }
+    ok "$pkg ${got_ver[$pkg]} (listed in Ubuntu's signed package list)"
+  done
+
+  debdir="$work/debs"; mkdir -p "$debdir"
+  for pkg in shim-signed grub-efi-amd64-signed; do
+    vfetch "$UBUNTU_ARCHIVE/${got_fn[$pkg]}" "$debdir/$pkg.deb" protected \
+      || { rm -rf "$work"; die "$E_NET" "Download of $pkg failed. Try again."; }
+    [[ $(sha256sum "$debdir/$pkg.deb" | cut -d' ' -f1) == "${got_sum[$pkg]}" ]] \
+      || { rm -rf "$work"; die "$E_INTEGRITY" "$pkg does not match the checksum in Ubuntu's signed package list. Refusing."; }
+  done
+  ok "Both packages match Ubuntu's signed package list"
+
+  deb_extract_member "$debdir/shim-signed.deb" usr/lib/shim/shimx64.efi.signed.latest "$work/shimx64.efi" \
+    && deb_extract_member "$debdir/shim-signed.deb" usr/lib/shim/mmx64.efi "$work/mmx64.efi" \
+    && deb_extract_member "$debdir/grub-efi-amd64-signed.deb" usr/lib/grub/x86_64-efi-signed/grubnetx64.efi.signed "$work/grubx64.efi" \
+    || { rm -rf "$work"; die "$E_ENV" "Could not find the boot files inside the packages (Ubuntu may have changed the layout)."; }
+  local f
+  for f in shimx64.efi mmx64.efi grubx64.efi; do
+    head -c 2 "$work/$f" | grep -q 'MZ' || { rm -rf "$work"; die "$E_INTEGRITY" "$f is not a UEFI program. Refusing."; }
+  done
+  for f in shimx64.efi mmx64.efi grubx64.efi; do sync_file "$work/$f"; mv -f "$work/$f" "$TFTP/$f"; done
+  chmod a+r "$TFTP"/shimx64.efi "$TFTP"/mmx64.efi "$TFTP"/grubx64.efi
+  {
+    echo "suite=$suite"; echo "fetched=$(now_iso)"
+    echo "shim-signed=${got_ver[shim-signed]}"; echo "grub-efi-amd64-signed=${got_ver[grub-efi-amd64-signed]}"
+    for f in shimx64.efi mmx64.efi grubx64.efi; do echo "file=$f sha256=$(sha256_of "$TFTP/$f")"; done
+  } | atomic_write "$STATE/shim-x86_64.built-from"
+  rm -rf "$work"
+  ok "Ubuntu's signed boot files are ready in $TFTP"
+  hint "The PC's firmware checks shim (signed by Microsoft); shim checks grub and the kernel (signed by Canonical)."
+}
+
+shim_ready() { [[ -s $TFTP/shimx64.efi && -s $TFTP/grubx64.efi ]]; }
+
+# grub reads this over TFTP. The kernel is signed by Canonical; Secure Boot refuses anything else.
+write_grub_cfg() {
+  local args; args=$(kernel_args)
+  mkdir -p "$TFTP/grub"
+  {
+    echo "# netboot-android $SCRIPT_VERSION - generated $(now_iso)"
+    echo "set default=0"
+    echo "set timeout=3"
+    echo "menuentry \"$P_LABEL (netboot-android)\" {"
+    echo "  echo \"Loading the kernel from $PHONE_IP ...\""
+    echo "  linux (http,$PHONE_IP:$HTTP_PORT)/$KERNEL_REL $args"
+    echo "  echo \"Loading the initial RAM disk ...\""
+    echo "  initrd (http,$PHONE_IP:$HTTP_PORT)/$INITRD_REL"
+    echo "}"
+  } | atomic_write "$TFTP/grub/grub.cfg"
+}
+
+# =============================================================================
+# Reuse an earlier download instead of fetching it again
+# =============================================================================
+# Prints candidate files (complete images first), best first.
+xdg_download_dir() {
+  local value=${XDG_DOWNLOAD_DIR:-} cfg line
+  if [[ -z $value && -r ${HOME:-}/.config/user-dirs.dirs ]]; then
+    cfg=${HOME}/.config/user-dirs.dirs
+    line=$(grep -m1 '^XDG_DOWNLOAD_DIR=' "$cfg" 2>/dev/null || true)
+    value=${line#*=}
+    value=${value#\"}; value=${value%\"}
+    value=${value//\$HOME/${HOME:-}}
+  fi
+  [[ $value == /* ]] && printf '%s\n' "$value"
+}
+
+iso_candidates() {
+  local d
+  local -a dirs=("$ROOT" "$DL")
+  [[ -n $ISO_FILE ]] && printf '%s\n' "$ISO_FILE"
+  d=$(xdg_download_dir 2>/dev/null || true)
+  [[ -n $d ]] && dirs+=("$d")
+  if [[ ${PREFIX:-} == *com.termux* ]]; then
+    dirs+=("${HOME:-}/storage/shared/Download" "${HOME:-}/Downloads")
+  elif (( IS_ANDROID )); then
+    [[ -n ${EXTERNAL_STORAGE:-} ]] && dirs+=("${EXTERNAL_STORAGE}/Download")
+    dirs+=("${HOME:-}/Download" "${HOME:-}/Downloads")
+  else
+    dirs+=("${HOME:-}/Downloads" "${HOME:-}/Download")
+  fi
+  dirs+=("$PWD")
+  local IFS=:; for d in $EXTRA_ISO_DIRS; do [[ -n $d ]] && dirs+=("$d"); done; unset IFS
+  for d in "${dirs[@]}"; do
+    [[ -d $d ]] || continue
+    if [[ $DISTRO == windows || $DISTRO == win11 ]]; then
+      find "$d" -maxdepth 2 -type f -iname '*.iso' 2>/dev/null || true
+    else
+      find "$d" -maxdepth 2 -type f \( -name "$ISO_NAME" -o -name "$ISO_NAME.part" \) 2>/dev/null || true
+    fi
+  done
+}
+
+# Puts an earlier download where fetch expects it. It is still fully verified afterwards;
+# the original file is never modified or deleted.
+adopt_existing_iso() {   # adopt_existing_iso REMOTE_BYTES
+  local remote=${1:-0} cand size min norm digest
+  [[ -s $ISO ]] && return 0
+  min=$(( P_ISO_MB * 900000 ))         # about 90% of the expected size, when the server will not tell us
+  norm=$(readlink -f "$ISO" 2>/dev/null || echo "$ISO")
+  while IFS= read -r cand; do
+    [[ -n $cand && -f $cand ]] || continue
+    [[ $(readlink -f "$cand" 2>/dev/null || echo "$cand") == "$norm" || $cand == "$ISO.part" ]] && continue
+    size=$(file_size "$cand")
+    if [[ $cand == *.part ]]; then
+      (( size > 1048576 )) || continue
+      [[ -s $ISO.part ]] && continue
+      if (( remote > 0 && size >= remote )); then continue; fi
+      info "Found an unfinished download: $cand ($((size/1048576)) MB). Resuming from it."
+      cp -f "$cand" "$ISO.part" || { rm -f "$ISO.part"; continue; }
+      return 0
+    fi
+    if [[ $DISTRO == windows || $DISTRO == win11 ]]; then
+      [[ $cand == "$ISO_FILE" || ${cand,,} == *.iso ]] || continue
+      digest=$(sha256_of "$cand") || continue
+      if [[ $digest != "$ISO_SHA256" ]]; then
+        info "Ignoring $cand: it does not match the configured Windows SHA-256 pin."
+        continue
+      fi
+    elif (( remote > 0 )); then
+      (( size == remote )) || { info "Ignoring $cand: its size ($size) is not the expected $remote."; continue; }
+    elif [[ -n $ISO_FILE && $(readlink -f "$cand" 2>/dev/null || echo "$cand") == "$(readlink -f "$ISO_FILE" 2>/dev/null || echo "$ISO_FILE")" ]]; then
+      : # An explicitly selected local file is validated by its cryptographic checksum below.
+    else
+      (( size >= min )) || { info "Ignoring $cand: too small to be the full image."; continue; }
+    fi
+    info "Found an earlier download: $cand. Checking it instead of downloading again."
+    if ln "$cand" "$ISO" 2>/dev/null; then :
+    elif (( $(free_mb "$ROOT") > size / 1048576 + 256 )) && cp -f "$cand" "$ISO"; then :
+    elif ln -sf "$(readlink -f "$cand")" "$ISO" 2>/dev/null; then
+      warn "Not enough space for a second copy, so $ISO points at $cand. Keep that file in place."
+    else
+      continue
+    fi
+    return 0
+  done <<<"$(iso_candidates)"
+  return 1
+}
+
 iso_is_verified() {
   [[ -s $ISO && -s $ISO_VERIFIED ]] || return 1
-  local size mtime
-  read -r _ size mtime < "$ISO_VERIFIED" || return 1
-  [[ $size == "$(file_size "$ISO")" && $mtime == "$(file_mtime "$ISO")" ]]
+  local recorded size mtime current
+  read -r recorded size mtime < "$ISO_VERIFIED" || return 1
+  [[ ( $DISTRO != win11 && $DISTRO != windows ) || ( -n $ISO_SHA256 && $recorded == "$ISO_SHA256" ) ]] || return 1
+  [[ $size == "$(file_size "$ISO")" && $mtime == "$(file_mtime "$ISO")" ]] || return 1
+  if [[ $DISTRO == win11 || $DISTRO == windows ]]; then
+    current=$(sha256_of "$ISO") || return 1
+    if [[ $current != "$ISO_SHA256" ]]; then
+      rm -f "$ISO_VERIFIED"
+      warn "The Windows ISO no longer matches its pinned SHA-256. The verification mark was revoked; the original file was kept."
+      return 1
+    fi
+  fi
+  return 0
 }
 
 iso_verified_sha() { awk '{print $1}' "$ISO_VERIFIED"; }
 
 verify_download() {
-  local file=$1 orig=$2 list="" signed_list=0 iso_sig=0 hash_ok=0 sha256 algohash expect
+  local file=$1 orig=$2 list="" signed_list=0 iso_sig=0 hash_ok=0 pin_ok=0 sha256 algohash expect
   : > "$VERIFY_REC.tmp"
   record "TARGET distro=$DISTRO arch=$TARGET_ARCH url=$ISO_URL"
 
@@ -2217,7 +2772,7 @@ verify_download() {
   if [[ -n $ISO_SIG_URL ]]; then
     vfetch "$ISO_SIG_URL" "$ISO_SIG_FILE" protected
     info "Checking the ISO signature (reads the whole file)"
-    verify_detached "$ISO_SIG_FILE" "$file" "ISO image" || return 1
+    verify_detached "$ISO_SIG_FILE" "$file" "ISO image" || return 30   # 30 = the image itself is bad
     iso_sig=1
   fi
 
@@ -2238,14 +2793,28 @@ verify_download() {
     fi
     if [[ $algohash != "$expect" ]]; then
       err "$SUMS_ALGO MISMATCH for $orig (expected $expect, got $algohash)"
-      return 1
+      return 30   # 30 = the image itself is bad
     fi
     ok "$SUMS_ALGO matches the published checksum"
     hash_ok=1
     record "HASH algo=$SUMS_ALGO value=$expect name=$orig signed_list=$signed_list"
   fi
 
-  if (( (signed_list && hash_ok) || iso_sig )); then
+  if [[ $DISTRO == win11 || $DISTRO == windows ]]; then
+    [[ $ISO_SHA256 =~ ^[[:xdigit:]]{64}$ ]] || {
+      err "Windows media needs a trusted SHA-256 pin (64 hex characters). Use --sha256 or ISO_SHA256."
+      return 1
+    }
+    if [[ $sha256 != "$ISO_SHA256" ]]; then
+      err "SHA-256 PIN MISMATCH for $orig (expected $ISO_SHA256, got $sha256)"
+      return 30
+    fi
+    ok "Windows ISO SHA-256 matches the supplied pin"
+    record "HASH algo=sha256 value=$ISO_SHA256 source=operator-pin name=$orig"
+    pin_ok=1
+  fi
+
+  if (( (signed_list && hash_ok) || iso_sig || pin_ok )); then
     record "ISO sha256=$sha256 size=$(file_size "$file") name=$orig"
     printf '%s\n' "$sha256" > "$VERIFY_REC.sha"
     return 0
@@ -2257,23 +2826,42 @@ verify_download() {
 fetch() {
   mkdir -p "$ROOT" "$DL" "$STATE"
 
+  if [[ ( $DISTRO == win11 || $DISTRO == windows ) && ! $ISO_SHA256 =~ ^[[:xdigit:]]{64}$ ]]; then
+    die "$E_USAGE" "Windows media requires a trusted SHA-256 pin. Get the expected 64-hex digest from a source you trust, then run: $0 --distro windows --sha256 DIGEST fetch (add --iso PATH if the ISO is outside the detected download folders)."
+  fi
   if iso_is_verified; then
     ok "ISO present and verified: $ISO"
     return 0
   fi
-  if [[ -z $SUMS_URL && -z $ISO_SIG_URL && $ALLOW_UNVERIFIED != 1 ]]; then
+  if [[ -z $SUMS_URL && -z $ISO_SIG_URL && -z $ISO_SHA256 && $ALLOW_UNVERIFIED != 1 ]]; then
     die "No checksum or signature source for $DISTRO. Set SUMS_URL or ISO_SIG_URL, or ALLOW_UNVERIFIED=1."
   fi
 
-  local target code rc attempt=0 resumed=0 remote have need_mb avail_mb
+  local target code rc attempt=0 resumed=0 remote=0 have need_mb avail_mb vrc=0
+  if [[ -n $ISO_FILE && ! -f $ISO_FILE ]]; then die "$E_USAGE" "--iso: no such file: $ISO_FILE"; fi
+  # Cheap checks first: if the vendor key cannot be confirmed, say so now, not after 6 GB.
+  if [[ -n $SUMS_URL || -n $ISO_SIG_URL ]]; then
+    info "Checking the vendor signing key before the big download"
+    prepare_keyring
+  fi
+  if [[ ! -s $ISO ]]; then
+    if [[ -n $ISO_URL ]]; then
+      remote=$(curl -sIL --proto-redir '=https' --connect-timeout 20 "$ISO_URL" 2>/dev/null \
+               | awk 'tolower($1)=="content-length:" {gsub("\r","",$2); n=$2} END{print n+0}' || echo 0)
+    else
+      remote=0
+    fi
+    adopt_existing_iso "$remote" || true
+  fi
+  if [[ ( $DISTRO == windows || $DISTRO == win11 ) && ! -s $ISO && -z $ISO_URL ]]; then
+    die "$E_USAGE" "No Windows ISO was found that matches the supplied SHA-256 pin. Place the ISO in a detected download folder, pass --iso PATH, or add a folder with EXTRA_ISO_DIRS. The source file is never renamed or modified."
+  fi
   if [[ -s $ISO ]]; then
     target=$ISO
     info "ISO present but not verified. Verifying now."
   else
     target="$ISO.part"
     [[ -s $ISO.part ]] && resumed=1
-    remote=$(curl -sIL --proto-redir '=https' --connect-timeout 20 "$ISO_URL" 2>/dev/null \
-             | awk 'tolower($1)=="content-length:" {gsub("\r","",$2); n=$2} END{print n+0}' || echo 0)
     have=$(file_size "$ISO.part" 2>/dev/null || echo 0)
     if (( remote > 0 )); then
       need_mb=$(( (remote - have) / 1048576 + 1 )); avail_mb=$(free_mb "$DL")
@@ -2292,6 +2880,10 @@ fetch() {
       if (( rc == 0 )) && [[ $code =~ ^[45] ]]; then
         rm -f "$ISO.part"; die "$E_NET" "The server answered HTTP $code for $ISO_URL. The partial file was discarded."
       fi
+      if (( rc == 33 )); then   # the server cannot resume: a stale partial file would never complete
+        warn "This server does not support resuming. Discarding the partial file and starting over."
+        rm -f "$ISO.part"; resumed=0
+      fi
       attempt=$((attempt+1))
       (( attempt < 5 )) || die "$E_NET" "Download kept failing (curl error $rc). Your progress is saved; re-run fetch to resume."
       warn "Download interrupted (curl error $rc). Retrying in $((attempt*5))s (attempt $attempt of 5); progress is kept."
@@ -2303,28 +2895,44 @@ fetch() {
     sync_file "$ISO.part"
   fi
 
-  if [[ -z $SUMS_URL && -z $ISO_SIG_URL ]]; then
+  if [[ -z $SUMS_URL && -z $ISO_SIG_URL && -z $ISO_SHA256 ]]; then
     [[ $target == "$ISO.part" ]] && mv -f "$ISO.part" "$ISO"
     rm -f "$ISO_VERIFIED"
     warn "ISO is UNVERIFIED (ALLOW_UNVERIFIED=1)"
     return 0
   fi
 
-  if ( verify_download "$target" "$ISO_NAME" ); then
+  ( verify_download "$target" "$ISO_NAME" ) || vrc=$?
+  if (( vrc == 0 )); then
     [[ $target == "$ISO.part" ]] && mv -f "$ISO.part" "$ISO"
     mv -f "$VERIFY_REC.tmp" "$VERIFY_REC"
     printf '%s %s %s\n' "$(cat "$VERIFY_REC.sha")" "$(file_size "$ISO")" "$(file_mtime "$ISO")" > "$ISO_VERIFIED"
     rm -f "$VERIFY_REC.sha"
     ok "ISO verified: $ISO"
-  else
-    rm -f "$VERIFY_REC.tmp" "$VERIFY_REC.sha"
-    if [[ $target == "$ISO.part" ]]; then rm -f "$ISO.part"; fi
+    return 0
+  fi
+  rm -f "$VERIFY_REC.tmp" "$VERIFY_REC.sha"
+  if (( vrc == 30 )); then
+    # A bad partial/download is disposable; never delete a user-supplied source file.
+    rm -f "$ISO.part" "$ISO_VERIFIED"
+    if [[ $target == "$ISO" ]]; then
+      local source_real="" managed_real=""
+      if [[ -n $ISO_FILE ]]; then
+        source_real=$(readlink -f "$ISO_FILE" 2>/dev/null || echo "$ISO_FILE")
+        managed_real=$(readlink -f "$ISO" 2>/dev/null || echo "$ISO")
+      fi
+      [[ -n $ISO_FILE && $source_real == "$managed_real" ]] || rm -f "$ISO"
+    fi
     if (( resumed )) && [[ ${FETCH_RETRIED:-0} != 1 ]]; then
-      warn "A resumed download failed verification (a stale partial file is the usual cause). Downloading again from scratch, once."
+      warn "A resumed download did not match its trusted checksum/signature (a stale partial file is the usual cause). Downloading again from scratch, once."
       FETCH_RETRIED=1; fetch; return
     fi
-    die "$E_INTEGRITY" "Verification FAILED. The download was discarded."
+    die "$E_INTEGRITY" "The image did not match the configured trusted checksum/signature. The managed verification mark was removed; any original --iso file was preserved."
   fi
+  # anything else (key lookup, network, checksum list): the download itself is fine, so KEEP it
+  [[ $target == "$ISO.part" ]] && mv -f "$ISO.part" "$ISO"
+  info "Your download is complete and was kept: $ISO ($(file_size "$ISO") bytes)"
+  die "$E_NET" "The download is safe; only the verification step could not finish (see above). Fix the cause or try again later, then run fetch again. It will only re-verify, not download again."
 }
 
 # =============================================================================
@@ -2343,9 +2951,33 @@ discover_layout() {
   fi
 }
 
+ensure_wimboot() {
+  local got
+  need sha256sum
+  mkdir -p "$DL"
+  if [[ -s $DL/wimboot ]]; then
+    got=$(sha256_of "$DL/wimboot" 2>/dev/null || true)
+    if [[ $got == "$WIMBOOT_SHA256" ]]; then
+      info "Using cached wimboot $WIMBOOT_VERSION after SHA-256 verification"
+      return 0
+    fi
+    warn "Cached wimboot did not match the pinned release hash; discarding that cache file."
+    rm -f "$DL/wimboot"
+  fi
+  info "Downloading pinned wimboot $WIMBOOT_VERSION"
+  vfetch "$WIMBOOT_URL" "$DL/wimboot" protected
+  got=$(sha256_of "$DL/wimboot" 2>/dev/null || true)
+  if [[ $got != "$WIMBOOT_SHA256" ]]; then
+    rm -f "$DL/wimboot"
+    die "$E_INTEGRITY" "wimboot $WIMBOOT_VERSION failed its pinned SHA-256 check; it was deleted and will not be installed."
+  fi
+  ok "wimboot $WIMBOOT_VERSION matches its pinned SHA-256"
+}
+
 extract() {
   [[ -s $ISO ]] || die "ISO missing: $ISO. Run: $0 --distro $DISTRO --arch $TARGET_ARCH fetch"
   if ! iso_is_verified; then
+    [[ $FAMILY != wimboot ]] || die "$E_INTEGRITY" "Windows Setup requires a verified ISO. Run fetch with --sha256 first (and --iso PATH if the ISO is outside detected download folders)."
     [[ $ALLOW_UNVERIFIED == 1 ]] || die "ISO is not verified. Run fetch again, or set ALLOW_UNVERIFIED=1."
     warn "Extracting from an UNVERIFIED ISO"
   fi
@@ -2362,10 +2994,43 @@ extract() {
   has "$P_KERNEL" && K=$P_KERNEL
   has "$P_INITRD" && I=$P_INITRD
   if [[ -n $P_ROOTFS ]] && has "$P_ROOTFS"; then R=$P_ROOTFS; fi
-  if [[ -z $K || -z $I || ( $FAMILY != casper && -z $R ) ]]; then
+  if [[ $FAMILY != wimboot && ( -z $K || -z $I || ( $FAMILY != casper && -z $R ) ) ]]; then
     warn "Preset paths not all found. The vendor may have changed its layout; discovering."
     discover_layout "$list"
   fi
+  if [[ $FAMILY == wimboot ]]; then
+    ensure_wimboot
+    mkdir -p "$HTTP/win" "$HTTP/iso" "$STATE"
+    cp -f "$DL/wimboot" "$HTTP/wimboot"
+    info "Extracting BCD, boot.sdi, and boot.wim from the ISO"
+    local bcd_entry sdi_entry wim_entry stage="$HTTP/win.extract"
+    bcd_entry=$(awk 'tolower($0) ~ /(^|\/)boot\/bcd$/{print}' <<<"$list" | pick_shortest || true)
+    sdi_entry=$(awk 'tolower($0) ~ /(^|\/)boot\/boot\.sdi$/{print}' <<<"$list" | pick_shortest || true)
+    wim_entry=$(awk 'tolower($0)=="sources/boot.wim"{print; exit}' <<<"$list")
+    [[ -n $wim_entry ]] || wim_entry=$(awk 'tolower($0) ~ /(^|\/)boot\.wim$/{print}' <<<"$list" | pick_shortest || true)
+    [[ -n $bcd_entry && -n $sdi_entry && -n $wim_entry ]] || \
+      die "$E_USAGE" "This ISO is not WIM-based Windows Setup media (needs boot/BCD, boot/boot.sdi, and sources/boot.wim). For other bootable Windows ISOs, use the verified read-only USB route: $0 usb-boot."
+    rm -rf "$stage"; mkdir -p "$stage"
+    bsdtar -xOf "$ISO" "$dot$bcd_entry" > "$stage/bcd" || { rm -rf "$stage"; die "Could not extract Windows BCD."; }
+    bsdtar -xOf "$ISO" "$dot$sdi_entry" > "$stage/boot.sdi" || { rm -rf "$stage"; die "Could not extract Windows boot.sdi."; }
+    bsdtar -xOf "$ISO" "$dot$wim_entry" > "$stage/boot.wim" || { rm -rf "$stage"; die "Could not extract Windows boot.wim."; }
+    [[ -s $stage/bcd && -s $stage/boot.sdi && -s $stage/boot.wim ]] || { rm -rf "$stage"; die "Windows boot files extracted empty."; }
+    mkdir -p "$HTTP/win/boot" "$HTTP/win/sources"
+    mv -f "$stage/bcd" "$HTTP/win/boot/bcd"
+    mv -f "$stage/boot.sdi" "$HTTP/win/boot/boot.sdi"
+    mv -f "$stage/boot.wim" "$HTTP/win/sources/boot.wim"
+    rmdir "$stage"
+    rm -f "$HTTP/iso/windows.iso"
+    ln -f "$ISO" "$HTTP/iso/windows.iso" 2>/dev/null || \
+      ln -sf "$(readlink -f "$ISO")" "$HTTP/iso/windows.iso"
+    {
+      printf 'KERNEL_REL=wimboot\nINITRD_REL=win/sources/boot.wim\nROOTFS_REL=win/boot/bcd\nSHA_REL=win/boot/boot.sdi\nBASEDIR=\nUCODE_RELS=\n'
+    } | atomic_write "$LAYOUT"
+    chmod -R a+rX "$HTTP"
+    ok "Windows Setup boot files ready; verified ISO is streamed at /iso/windows.iso"
+    return 0
+  fi
+
   [[ -n $K ]] || die "No kernel found in the ISO. List it with: bsdtar -tf $ISO | less"
   [[ -n $I ]] || die "No initrd found in the ISO"
   [[ $FAMILY == casper || -n $R ]] || die "No root filesystem image found in the ISO"
@@ -2466,6 +3131,7 @@ kernel_args() {
              [[ -n $SHA_REL ]] && t+=" checksum=y"
              [[ -n $P_EXTRA_ARGS ]] && t+=" $P_EXTRA_ARGS" ;;
     dracut)  t="root=live:@BASE@/@ROOTFS@ rd.live.image rd.neednet=1 ip=dhcp quiet rhgb" ;;
+    wimboot) t="" ;;
     *) die "internal: unknown family $FAMILY" ;;
   esac
   t=${U_BOOT_ARGS:-$t}
@@ -2492,8 +3158,15 @@ require_ipxe_matches_ca() {
 configure() {
   resolve_network
   load_layout
+  save_profile
   write_libs
-  require_ipxe_matches_ca
+  if [[ $BOOT_LOADER == shim ]]; then
+    shim_supported || die "$E_USAGE" "Ubuntu's signed boot files work for Ubuntu on x86_64 only. Use the iPXE route for $DISTRO / $TARGET_ARCH."
+    shim_ready || die "$E_ENV" "Ubuntu's signed boot files are missing. Run: $0 shim-fetch"
+    VERIFIED_BOOT=0    # iPXE's own signature chain is not used; the firmware checks Ubuntu's signatures instead
+  else
+    require_ipxe_matches_ca
+  fi
   if [[ $VERIFIED_BOOT == 1 ]]; then
     [[ -s $ATTEST/codesign.key ]] || die "Run: $0 attest-init"
   fi
@@ -2508,6 +3181,20 @@ configure() {
     echo "set base http://${PHONE_IP}:${HTTP_PORT}"
     echo "echo netboot-android: ${P_LABEL} (${TARGET_ARCH}) from \${base}"
     echo "echo This image needs about ${CLIENT_RAM_GB} GB of RAM on this PC."
+    if [[ $FAMILY == wimboot ]]; then
+      echo "echo Full verified ISO: \${base}/iso/windows.iso (HTTP byte ranges supported)"
+      echo "echo This boots WIM-based Windows Setup/WinPE."
+      echo "echo Setup does NOT automatically install from the HTTP ISO URL; its source must be provided separately."
+      echo "kernel --name wimboot \${base}/${KERNEL_REL} || goto fail"
+      [[ $vb == 1 ]] && echo "imgverify wimboot \${base}/${KERNEL_REL}.sig || goto fail"
+      echo "initrd --name bcd \${base}/${ROOTFS_REL} bcd || goto fail"
+      [[ $vb == 1 ]] && echo "imgverify bcd \${base}/${ROOTFS_REL}.sig || goto fail"
+      echo "initrd --name boot.sdi \${base}/${SHA_REL} boot.sdi || goto fail"
+      [[ $vb == 1 ]] && echo "imgverify boot.sdi \${base}/${SHA_REL}.sig || goto fail"
+      echo "initrd --name boot.wim \${base}/${INITRD_REL} boot.wim || goto fail"
+      [[ $vb == 1 ]] && echo "imgverify boot.wim \${base}/${INITRD_REL}.sig || goto fail"
+      echo "boot || goto fail"
+    else
     echo "kernel --name kernel \${base}/${KERNEL_REL} ${args} || goto fail"
     [[ $vb == 1 ]] && echo "imgverify kernel \${base}/${KERNEL_REL}.sig || goto fail"
     local n=0 u
@@ -2519,27 +3206,40 @@ configure() {
     echo "initrd --name initrd \${base}/${INITRD_REL} || goto fail"
     [[ $vb == 1 ]] && echo "imgverify initrd \${base}/${INITRD_REL}.sig || goto fail"
     echo "boot || goto fail"
+    fi
     echo ":fail"
     echo "echo Boot failed, or a signature did not verify. Refusing to boot."
     echo "shell"
-  } > "$TFTP/boot.ipxe"
+  } | atomic_write "$TFTP/boot.ipxe"
 
   if [[ $vb == 1 ]]; then
     info "Signing boot files with the local code-signing certificate"
     cms_sign "$TFTP/boot.ipxe"
     cms_sign "$HTTP/$KERNEL_REL"
     cms_sign "$HTTP/$INITRD_REL"
-    local u
-    for u in $UCODE_RELS; do cms_sign "$HTTP/$u"; done
-    ok "Signed: boot.ipxe, kernel, initrd${UCODE_RELS:+, microcode}"
+    if [[ $FAMILY == wimboot ]]; then
+      cms_sign "$HTTP/$ROOTFS_REL"
+      cms_sign "$HTTP/$SHA_REL"
+      ok "Signed: boot.ipxe, wimboot, BCD, boot.sdi, and boot.wim"
+    else
+      local u
+      for u in $UCODE_RELS; do cms_sign "$HTTP/$u"; done
+      ok "Signed: boot.ipxe, kernel, initrd${UCODE_RELS:+, microcode}"
+    fi
+  elif [[ $BOOT_LOADER == shim ]]; then
+    info "Secure Boot route: Ubuntu's own signatures protect shim, grub and the kernel; nothing of yours needs signing"
   else
     warn "VERIFIED_BOOT=0: boot files are NOT signed and the client will not check them"
   fi
+  [[ $BOOT_LOADER == shim ]] && write_grub_cfg
 
   # dnsmasq appends ".0" to pxe-service basenames that have no extension
   [[ -s $TFTP/undionly.kpxe ]] && cp -f "$TFTP/undionly.kpxe" "$TFTP/undionly.0"
+  prepare_tftp_serve
 
-  info "Writing dnsmasq.conf ($MODE mode on $IFACE, $NET/$PREFIX_LEN)"
+  local mode_label=$MODE
+  [[ $DHCP_MODE == usb ]] && mode_label="USB RNDIS direct"
+  info "Writing dnsmasq.conf ($mode_label mode on $IFACE, $NET/$PREFIX_LEN)"
   {
     echo "# netboot-android $SCRIPT_VERSION - generated $(now_iso)"
     echo "port=0"
@@ -2553,7 +3253,7 @@ configure() {
     echo "pid-file=$RUN/dnsmasq.pid"
     echo "dhcp-leasefile=$RUN/dnsmasq.leases"
     echo "enable-tftp"
-    echo "tftp-root=$TFTP"
+    echo "tftp-root=$TFTP_SERVE"
     if [[ $MODE == proxy ]]; then
       echo "# Proxy-DHCP: the existing DHCP server keeps assigning addresses"
       echo "dhcp-range=$NET,proxy,$MASK"
@@ -2570,7 +3270,10 @@ configure() {
     echo "dhcp-match=set:efi64,option:client-arch,9"
     echo "dhcp-match=set:arm64,option:client-arch,11"
     echo "pxe-prompt=\"netboot-android\",0"
-    if [[ $TARGET_ARCH == x86_64 ]]; then
+    if [[ $BOOT_LOADER == shim ]]; then
+      echo "pxe-service=tag:!ipxe,X86-64_EFI,\"netboot-android (UEFI, Secure Boot ok)\",shimx64.efi"
+      echo "pxe-service=tag:!ipxe,BC_EFI,\"netboot-android (UEFI, Secure Boot ok)\",shimx64.efi"
+    elif [[ $TARGET_ARCH == x86_64 ]]; then
       echo "pxe-service=tag:!ipxe,x86PC,\"netboot-android (BIOS)\",undionly"
       echo "pxe-service=tag:!ipxe,X86-64_EFI,\"netboot-android (UEFI)\",ipxe.efi"
       echo "pxe-service=tag:!ipxe,BC_EFI,\"netboot-android (UEFI)\",ipxe.efi"
@@ -2579,13 +3282,15 @@ configure() {
     fi
     echo "# First match wins"
     echo "dhcp-boot=tag:ipxe,boot.ipxe"
-    if [[ $TARGET_ARCH == x86_64 ]]; then
+    if [[ $BOOT_LOADER == shim ]]; then
+      echo "dhcp-boot=tag:efi64,shimx64.efi"
+    elif [[ $TARGET_ARCH == x86_64 ]]; then
       echo "dhcp-boot=tag:efi64,tag:!ipxe,ipxe.efi"
       echo "dhcp-boot=tag:!efi64,tag:!arm64,tag:!ipxe,undionly.kpxe"
     else
       echo "dhcp-boot=tag:arm64,tag:!ipxe,ipxe-arm64.efi"
     fi
-  } > "$DNSMASQ_CONF"
+  } | atomic_write "$DNSMASQ_CONF"
 
   chmod -R a+rX "$TFTP" "$HTTP" 2>/dev/null || true
   chmod a+rx "$ROOT"
@@ -2594,9 +3299,9 @@ configure() {
   write_manifest
   {
     echo "configured=$(now_iso)"
-    echo "iface=$IFACE mode=$MODE net=$NET/$PREFIX_LEN phone=$PHONE_IP port=$HTTP_PORT"
+    echo "iface=$IFACE mode=$MODE net=$NET/$PREFIX_LEN phone=$PHONE_IP port=$HTTP_PORT loader=$BOOT_LOADER"
     echo "args=$args"
-  } > "$STATE/$DISTRO-$TARGET_ARCH.config"
+  } | atomic_write "$STATE/$DISTRO-$TARGET_ARCH.config"
 
   ok "Configured"
   info "Kernel arguments: $args"
@@ -2605,23 +3310,64 @@ configure() {
   fi
 }
 
+prepare_tftp_serve() {
+  local stage="$TFTP_SERVE.new" f
+  rm -rf -- "$stage"
+  mkdir -p "$stage"
+  while IFS= read -r f; do
+    [[ -f $TFTP/$f && ! -L $TFTP/$f ]] || die "$E_INTEGRITY" "Required TFTP loader is missing or symlinked: $f"
+    cp -f -- "$TFTP/$f" "$stage/$f"
+  done < <(boot_files)
+  [[ -f $TFTP/boot.ipxe && ! -L $TFTP/boot.ipxe ]] || die "$E_INTEGRITY" "Generated boot.ipxe is missing or symlinked."
+  cp -f -- "$TFTP/boot.ipxe" "$stage/boot.ipxe"
+  if [[ $VERIFIED_BOOT == 1 ]]; then
+    [[ -f $TFTP/boot.ipxe.sig && ! -L $TFTP/boot.ipxe.sig ]] || die "$E_INTEGRITY" "Signed boot.ipxe is missing or symlinked."
+    cp -f -- "$TFTP/boot.ipxe.sig" "$stage/boot.ipxe.sig"
+  fi
+  [[ ! -s $TFTP/undionly.0 ]] || cp -f -- "$TFTP/undionly.0" "$stage/undionly.0"
+  if [[ $BOOT_LOADER == shim ]]; then
+    [[ -f $TFTP/grub/grub.cfg && ! -L $TFTP/grub/grub.cfg ]] || die "$E_INTEGRITY" "Generated grub.cfg is missing or symlinked."
+    mkdir -p "$stage/grub"
+    cp -f -- "$TFTP/grub/grub.cfg" "$stage/grub/grub.cfg"
+  fi
+  chmod -R a+rX "$stage"
+  chmod -R a-w "$stage"
+  [[ ! -e $TFTP_SERVE ]] || chmod -R u+w "$TFTP_SERVE"
+  rm -rf -- "$TFTP_SERVE"
+  mv -- "$stage" "$TFTP_SERVE"
+}
+
 # =============================================================================
 # Integrity manifest
 # =============================================================================
+manifest_abs() {
+  case "$1" in
+    tftp/*) printf '%s/%s' "$TFTP_SERVE" "${1#tftp/}" ;;
+    http/*) printf '%s/%s' "$HTTP" "${1#http/}" ;;
+    *)      printf '%s/%s' "$ROOT" "$1" ;;
+  esac
+}
+
 manifest_files() {
   local f u
   echo "tftp/boot.ipxe"
   [[ $VERIFIED_BOOT == 1 ]] && echo "tftp/boot.ipxe.sig"
-  for f in $(ipxe_files_for_arch); do echo "tftp/$f"; done
-  [[ -s $TFTP/undionly.0 ]] && echo "tftp/undionly.0"
+  for f in $(boot_files); do echo "tftp/$f"; done
+  [[ $BOOT_LOADER == shim ]] && echo "tftp/grub/grub.cfg"
+  [[ $BOOT_LOADER != shim && -s $TFTP/undionly.0 ]] && echo "tftp/undionly.0"
   echo "http/$KERNEL_REL"
   echo "http/$INITRD_REL"
   [[ -n $ROOTFS_REL ]] && echo "http/$ROOTFS_REL"
   [[ -n $SHA_REL ]] && echo "http/$SHA_REL"
+  [[ $FAMILY == wimboot ]] && echo "http/iso/windows.iso"
   for u in $UCODE_RELS; do echo "http/$u"; done
   if [[ $VERIFIED_BOOT == 1 ]]; then
     echo "http/$KERNEL_REL.sig"
     echo "http/$INITRD_REL.sig"
+    if [[ $FAMILY == wimboot ]]; then
+      echo "http/$ROOTFS_REL.sig"
+      echo "http/$SHA_REL.sig"
+    fi
     for u in $UCODE_RELS; do echo "http/$u.sig"; done
   fi
   echo "dnsmasq.conf"
@@ -2656,10 +3402,12 @@ write_manifest() {
   tmp="$MANIFEST.tmp"; fpt="$MANIFEST.fp.tmp"
   : > "$tmp"; : > "$fpt"
   while IFS= read -r rel; do
-    f="$ROOT/$rel"
+    f=$(manifest_abs "$rel")
     [[ -f $f ]] || die "Manifest: missing $rel"
     sz=$(file_size "$f"); fp=$(fp_of "$f")
     if [[ $FAMILY == casper && $rel == "http/$ROOTFS_REL" ]] && iso_is_verified; then
+      h=$(iso_verified_sha)
+    elif [[ $FAMILY == wimboot && $rel == "http/iso/windows.iso" ]] && iso_is_verified; then
       h=$(iso_verified_sha)
     elif (( sz >= BIG_BYTES && trust )) && [[ ${ofp[$rel]:-} == "$fp" && -n ${oh[$rel]:-} ]]; then
       h=${oh[$rel]}; reused=$((reused+1))
@@ -2696,7 +3444,7 @@ verify_manifest() {
   fi
   info "Integrity gate: checking every served file (mode: $mode)"
   while read -r h s rel; do
-    f="$ROOT/$rel"
+    f=$(manifest_abs "$rel")
     if [[ ! -f $f ]]; then err "MISSING: $rel"; bad=$((bad+1)); continue; fi
     if [[ $(file_size "$f") != "$s" ]]; then err "SIZE CHANGED: $rel"; bad=$((bad+1)); continue; fi
     if (( s >= BIG_BYTES && trust )) && [[ ${ofp[$rel]:-} == "$(fp_of "$f")" ]]; then
@@ -2718,7 +3466,7 @@ deep_verify_bg() {
   command -v ionice >/dev/null 2>&1 && np="ionice -c3"
   for item in "${BIG_FAST[@]}"; do
     h=${item%% *}; rel=${item#* }
-    cur=$($np nice -n 19 sha256sum "$ROOT/$rel" 2>/dev/null | awk '{print $1}')
+    cur=$($np nice -n 19 sha256sum "$(manifest_abs "$rel")" 2>/dev/null | awk '{print $1}')
     if [[ $cur != "$h" ]]; then
       printf '%s\n' "$rel" > "$RUN/DEEP_FAIL"
       err "BACKGROUND VERIFY FAILED for $rel: it changed on disk. Stopping the servers."
@@ -2848,6 +3596,19 @@ verify_attest() {
 # Restorable point-in-time copy of $ROOT (keys, attestation, pins, state, TFTP
 # files, configs). Rebuildable bulk (extracted http/, src/, run/) is skipped, and
 # downloads/ only with BACKUP_DL=1. Each archive gets a SHA-256 sidecar.
+backup_fingerprint() {
+  local base; base=$(basename "$ROOT")
+  [[ -d $ROOT ]] || return 0
+  ( cd "$(dirname "$ROOT")" && find "$base" \
+      \( -path "$base/http" -o -path "$base/run" -o -path "$base/src" \
+         -o -path "$base/state/lock.d" -o -path "$base/state/undo.d" \) -prune -o \
+      -type f ! -name '*.log' ! -name '*.log.*' ! -name '*.tmp' ! -name '*.part' ! -name 'last-serve' ! -name 'offsite.status' \
+      -exec stat -c '%n %s %Y' {} + 2>/dev/null ) \
+    | { if (( ${BACKUP_DL:-0} )); then cat; else grep -v "^$base/downloads/" ; fi; } \
+    | grep -v "^$(basename "$BACKUP_DIR")/" | LC_ALL=C sort | sha256sum | cut -d' ' -f1
+}
+BACKUP_FP_FILE="$BACKUP_DIR/.last-fingerprint"
+
 backup_create() {
   local label=${1:-manual} base parent ts out
   need tar; need sha256sum
@@ -2862,7 +3623,7 @@ backup_create() {
   info "Backing up $ROOT -> $out"
   if ! ( umask 077; tar -C "$parent" -czpf "$out.part" "${ex[@]}" "$base" ) 2>/dev/null; then
     rm -f "$out.part"
-    die "Backup failed (unreadable files? run: sudo chown -R \$(id -u) $ROOT). Set AUTO_BACKUP=0 to skip."
+    die "Backup failed (unreadable files? run: sudo chown -R \$(id -u) $ROOT)."
   fi
   tar -tzf "$out.part" >/dev/null 2>&1 || { rm -f "$out.part"; die "Backup archive failed its read-back test"; }
   mv -f "$out.part" "$out"
@@ -2871,6 +3632,7 @@ backup_create() {
     "$(tar -tzf "$out" | grep -vc '/$' || true)" > "$out.meta"
   chmod 600 "$out" "$out.sha256" 2>/dev/null || true
   ok "Backup written: $out ($(file_size "$out") bytes)"
+  backup_fingerprint > "$BACKUP_FP_FILE" 2>/dev/null || true
   backup_prune
   backup_upload "$out"
 }
@@ -2972,9 +3734,29 @@ backup_verify() {
 
 # Runs before anything that can change or remove served state.
 auto_backup() {
-  [[ $AUTO_BACKUP == 1 ]] || { warn "AUTO_BACKUP=0: skipping the pre-run backup"; return 0; }
+  [[ $AUTO_BACKUP == 1 ]] || return 0      # backups happen only when you ask for them
   [[ -d $ROOT ]] || return 0
-  backup_create "auto-$1"
+  local now last
+  now=$(backup_fingerprint 2>/dev/null || true)
+  last=$(cat "$BACKUP_FP_FILE" 2>/dev/null || true)
+  if [[ -n $now && $now == "$last" ]] && compgen -G "$BACKUP_DIR/netboot-*.tar.gz" >/dev/null; then
+    ok "Nothing has changed since the last backup. Skipping it."
+    return 0
+  fi
+  # A backup is a safety net, never a gate: if it cannot finish, say so and carry on.
+  if ! ( backup_create "auto-$1" ); then
+    warn "The automatic backup did not finish, so I am continuing without it. Fix it later with: $0 backup   (or turn it off: $0 backup-auto off)"
+  fi
+  return 0
+}
+
+# Turn the automatic backup on or off for good (saved in the settings file)
+backup_auto_cmd() {
+  case "${1:-}" in
+    on)  save_setting AUTO_BACKUP 1 && ok "Automatic backups are ON: one is taken before serve or clean, only when something changed." ;;
+    off) save_setting AUTO_BACKUP 0 && ok "Automatic backups are OFF (the default). Take one yourself any time with: $0 backup" ;;
+    *)   info "Backups are $([[ $AUTO_BACKUP == 1 ]] && echo "AUTOMATIC (before serve and clean)" || echo "ONLY WHEN YOU ASK (the default)"). Take one: $0 backup   |   Automatic: $0 backup-auto on" ;;
+  esac
 }
 
 restore() {
@@ -3027,49 +3809,112 @@ require_ready() {
   [[ -n $PYTHON ]] || die "python3 not found. Run: $0 deps"
   [[ -f $DNSMASQ_CONF && -f $LIB/httpd.py ]] || die "Not configured. Run: $0 --distro $DISTRO --arch $TARGET_ARCH configure"
   load_layout
-  require_ipxe_matches_ca
+  if [[ $BOOT_LOADER == shim ]]; then
+    shim_ready || die "$E_ENV" "Ubuntu's signed boot files are missing. Run: $0 shim-fetch"
+  else
+    require_ipxe_matches_ca
+  fi
+}
+
+next_ip_rule_pref() {
+  local p rules exclude=${1:-}
+  rules=$(ip_q -4 rule show) || return 1
+  for ((p=8900; p<10000; p++)); do
+    [[ $p == "$exclude" ]] && continue
+    if ! grep -qE "^[[:space:]]*$p:" <<<"$rules"; then printf '%s' "$p"; return 0; fi
+  done
+  return 1
 }
 
 setup_direct() {
-  local ip=${DIRECT_CIDR%/*}
-  if ! ip_q -4 -o addr show dev "$IFACE" | grep -q "inet $ip/"; then
+  local ip=${DIRECT_CIDR%/*} link_info addr_missing=0 link_was_up=0
+  local from_pref="" to_pref="" rule_output
+  local -a undo_steps=()
+  [[ $DIRECT_CIDR =~ ^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}/(0|[1-9][0-9]?)$ ]] || die "$E_USAGE" "Invalid DIRECT_CIDR: $DIRECT_CIDR"
+  ip_to_int "$ip" >/dev/null
+  if ! ip_q -4 -o addr show dev "$IFACE" | grep -Fq "inet $DIRECT_CIDR"; then
+    addr_missing=1
+    undo_steps+=("ip -4 addr del '$DIRECT_CIDR' dev '$IFACE' 2>/dev/null || true")
     info "Assigning $DIRECT_CIDR to $IFACE"
-    JID_DIRECT=$(journal_push "ip addr del $DIRECT_CIDR dev $IFACE 2>/dev/null; ip rule del from $ip lookup main pref 9000 2>/dev/null; ip rule del to ${NET:-0.0.0.0}/${PREFIX_LEN:-24} lookup main pref 9001 2>/dev/null; true")
-    run_root "ip link set $IFACE up && ip addr add $DIRECT_CIDR dev $IFACE" || die "$E_ENV" "Could not assign $DIRECT_CIDR to $IFACE"
-    DIRECT_ADDED=1
+  fi
+  link_info=$(ip_q -o link show dev "$IFACE" | head -n1 || true)
+  if ! grep -qE '<[^>]*[,<]UP([,>])' <<<"$link_info"; then
+    link_was_up=0
+    undo_steps+=("ip link set dev '$IFACE' down 2>/dev/null || true")
+  else
+    link_was_up=1
+  fi
+
+  if (( IS_ANDROID )); then
+    # Only add rules we own, at currently-unused priorities; never delete a
+    # pre-existing Android or administrator rule during rollback.
+    rule_output=$(ip_q -4 rule show) || rule_output=""
+    if ! grep -Fq "from $ip lookup main" <<<"$rule_output"; then
+      from_pref=$(next_ip_rule_pref) || die "$E_ENV" "No free IPv4 policy-rule priority is available for the USB link."
+      undo_steps+=("ip -4 rule del from '$ip' lookup main pref '$from_pref' 2>/dev/null || true")
+    fi
+    if ! grep -Fq "to $NET/$PREFIX_LEN lookup main" <<<"$rule_output"; then
+      to_pref=$(next_ip_rule_pref "$from_pref") || die "$E_ENV" "No free IPv4 policy-rule priority is available for the USB subnet."
+      undo_steps+=("ip -4 rule del to '$NET/$PREFIX_LEN' lookup main pref '$to_pref' 2>/dev/null || true")
+    fi
+  fi
+
+  if ((${#undo_steps[@]})); then
+    local undo="set -e; "
+    local step
+    for step in "${undo_steps[@]}"; do undo+="$step; "; done
+    if (( addr_missing )); then
+      undo+="if ip -4 -o addr show dev '$IFACE' 2>/dev/null | grep -Fq 'inet $DIRECT_CIDR'; then exit 1; fi; "
+    fi
+    if [[ -n $from_pref ]]; then
+      undo+="if ip -4 rule show 2>/dev/null | grep -Fq 'from $ip lookup main'; then exit 1; fi; "
+    fi
+    if [[ -n $to_pref ]]; then
+      undo+="if ip -4 rule show 2>/dev/null | grep -Fq 'to $NET/$PREFIX_LEN lookup main'; then exit 1; fi; "
+    fi
+    if (( ! link_was_up )); then
+      undo+="if ip -o link show dev '$IFACE' 2>/dev/null | grep -qE '<[^>]*[,<]UP([,>])'; then exit 1; fi; "
+    fi
+    undo+="exit 0"
+    JID_DIRECT=$(journal_push "$undo")
+  fi
+
+  run_root "ip link set dev '$IFACE' up" || die "$E_ENV" "Could not bring $IFACE up."
+  (( addr_missing )) && run_root "ip -4 addr add '$DIRECT_CIDR' dev '$IFACE'" || true
+  if (( addr_missing )) && ! ip_q -4 -o addr show dev "$IFACE" | grep -Fq "inet $DIRECT_CIDR"; then
+    die "$E_ENV" "Could not assign $DIRECT_CIDR to $IFACE."
   fi
   if (( IS_ANDROID )); then
-    # Android uses policy routing; keep replies to the direct link on that link
-    run_root "ip rule add from $ip lookup main pref 9000 2>/dev/null; ip rule add to $NET/$PREFIX_LEN lookup main pref 9001 2>/dev/null; true" || true
+    [[ -z $from_pref ]] || run_root "ip -4 rule add from '$ip' lookup main pref '$from_pref'" || die "$E_ENV" "Could not add the isolated source route rule."
+    [[ -z $to_pref ]] || run_root "ip -4 rule add to '$NET/$PREFIX_LEN' lookup main pref '$to_pref'" || die "$E_ENV" "Could not add the isolated subnet route rule."
   fi
+  DIRECT_ADDED=$(( addr_missing || ${#undo_steps[@]} > 0 ))
 }
 
 teardown_direct() {
-  (( DIRECT_ADDED )) || return 0
-  local ip=${DIRECT_CIDR%/*}
-  run_root "ip addr del $DIRECT_CIDR dev $IFACE 2>/dev/null; ip rule del from $ip lookup main pref 9000 2>/dev/null; ip rule del to $NET/$PREFIX_LEN lookup main pref 9001 2>/dev/null; true" || true
-  [[ -n ${JID_DIRECT:-} ]] && journal_drop "$JID_DIRECT"
+  [[ -n ${JID_DIRECT:-} ]] || return 0
+  journal_apply "$JID_DIRECT" || return 1
+  JID_DIRECT=""
   DIRECT_ADDED=0
 }
 
 power_save_off() {
   if (( IS_ANDROID )); then
-    JID_POWER=$(journal_push "iw dev $IFACE set power_save on 2>/dev/null; cmd wifi force-hi-perf-mode disabled 2>/dev/null; true")
+    JID_POWER=$(journal_push "if command -v iw >/dev/null 2>&1 && iw dev '$IFACE' set power_save on 2>/dev/null; then exit 0; fi; cmd wifi force-hi-perf-mode disabled 2>/dev/null")
     if run_root "command -v iw >/dev/null 2>&1 && iw dev $IFACE set power_save off" >/dev/null 2>&1; then
       ok "Wi-Fi power save disabled on $IFACE (iw)"; POWER_TWEAKED=1; return 0
     fi
     if run_root "cmd wifi force-hi-perf-mode enabled" >/dev/null 2>&1; then
       ok "Wi-Fi high-performance mode enabled"; POWER_TWEAKED=1; return 0
     fi
-    journal_drop "$JID_POWER"; JID_POWER=""
-    warn "Could not change Wi-Fi power save. Keep the screen on and Termux set to unrestricted battery use."
+    warn "Could not change Wi-Fi power save. Recovery record retained in case the setting changed partially; keep the screen on and Termux set to unrestricted battery use."
   fi
 }
 
 power_save_restore() {
-  (( POWER_TWEAKED )) || return 0
-  run_root "iw dev $IFACE set power_save on 2>/dev/null; cmd wifi force-hi-perf-mode disabled 2>/dev/null; true" >/dev/null 2>&1 || true
-  [[ -n $JID_POWER ]] && journal_drop "$JID_POWER"
+  [[ -n $JID_POWER ]] || return 0
+  journal_apply "$JID_POWER" || return 1
+  JID_POWER=""
   POWER_TWEAKED=0
 }
 
@@ -3082,25 +3927,449 @@ kill_servers() {
   run_root "pkill -f '$DNSMASQ_CONF'" >/dev/null 2>&1 || true
 }
 
-cleanup() {
+# =============================================================================
+# USB drive mode: the phone shows the verified ISO to a PC as a read-only USB drive.
+# No network, router or Ethernet needed. Needs root and a kernel with USB mass storage.
+# =============================================================================
+USB_CFG_EXPLICIT=0
+[[ -n ${USB_CFG:-} ]] && USB_CFG_EXPLICIT=1
+USB_CFG="${USB_CFG:-/config/usb_gadget}"          # the configfs gadget folder (override only for tests)
+USB_UDC_DIR="${USB_UDC_DIR:-/sys/class/udc}"
+USB_KCONFIG="${USB_KCONFIG:-/proc/config.gz}"
+USB_CDROM="${USB_CDROM:-0}"                       # 0: looks like a USB drive (best for hybrid ISOs). 1: looks like a CD drive
+USB_GNAME="netboot-android"
+USB_NET_GNAME="netboot-rndis"
+USB_GADGET_VID="${USB_GADGET_VID:-}"
+USB_GADGET_PID="${USB_GADGET_PID:-}"
+USB_NET_DEV_MAC="${USB_NET_DEV_MAC:-02:4e:42:00:00:01}"
+USB_NET_HOST_MAC="${USB_NET_HOST_MAC:-02:4e:42:00:00:02}"
+JID_USB=""
+JID_USB_NET=""
+USB_BOOT_PREV_CFG=""
+USB_BOOT_PREV_CFG_CAPTURED=0
+USB_BOOT_BINDINGS=""
+USB_BOOT_OWN_G=""
+USB_BOOT_REUSE_G=""
+USB_BOOT_REUSE_CFG=""
+USB_BOOT_RESTORE_SELINUX=0
+
+usb_udc() { ls -1 "$USB_UDC_DIR" 2>/dev/null | head -n1; }
+
+usb_prepare_configfs() {
+  local candidate mount_root=/sys/kernel/config jid
+  [[ $USB_CFG =~ ^(/[A-Za-z0-9._-]+)+$ ]] || die "$E_USAGE" "USB_CFG must be an absolute, simple configfs path."
+  [[ $USB_UDC_DIR =~ ^(/[A-Za-z0-9._-]+)+$ ]] || die "$E_USAGE" "USB_UDC_DIR must be an absolute, simple sysfs path."
+  [[ $USB_KCONFIG =~ ^(/[A-Za-z0-9._-]+)+$ ]] || die "$E_USAGE" "USB_KCONFIG must be an absolute, simple kernel-config path."
+  [[ $USB_CDROM =~ ^[01]$ ]] || die "$E_USAGE" "USB_CDROM must be 0 or 1."
+  if (( USB_CFG_EXPLICIT )); then
+    run_root "[ -d '$USB_CFG' ]" >/dev/null 2>&1 || die "$E_ENV" "Configured USB_CFG does not exist: $USB_CFG"
+    return 0
+  fi
+  for candidate in "$USB_CFG" /sys/kernel/config/usb_gadget /config/usb_gadget; do
+    if run_root "[ -d '$candidate' ]" >/dev/null 2>&1; then USB_CFG=$candidate; return 0; fi
+  done
+  if ! run_root "mountpoint -q '$mount_root'" >/dev/null 2>&1; then
+    jid=$(journal_push "if mountpoint -q '$mount_root'; then umount '$mount_root'; fi; ! mountpoint -q '$mount_root'")
+    run_root "mkdir -p '$mount_root' && mount -t configfs none '$mount_root'" >/dev/null 2>&1 || {
+      journal_apply "$jid" >/dev/null 2>&1 || true
+      die "$E_ENV" "Could not mount configfs at $mount_root."
+    }
+  fi
+  USB_CFG="$mount_root/usb_gadget"
+  run_root "[ -d '$USB_CFG' ]" >/dev/null 2>&1 || die "$E_ENV" "USB gadget configfs is unavailable at $USB_CFG."
+}
+
+usb_check() {
+  local udc cfg=no msc="unknown"
+  udc=$(run_root "ls -1 '$USB_UDC_DIR' 2>/dev/null | head -n1" 2>/dev/null || true)
+  run_root "[ -d '$USB_CFG' ]" >/dev/null 2>&1 && cfg=yes
+  if run_root "zcat '$USB_KCONFIG' 2>/dev/null | grep -qE '^CONFIG_USB_CONFIGFS_MASS_STORAGE=[ym]'" >/dev/null 2>&1; then msc=yes
+  elif run_root "[ -r '$USB_KCONFIG' ]" >/dev/null 2>&1; then msc=no; fi
+  [[ $cfg == yes ]] && ok "USB gadget folder found: $USB_CFG" || err "No USB gadget folder ($USB_CFG). This phone cannot act as a USB drive."
+  [[ -n $udc ]]     && ok "USB controller: $udc" || info "No USB controller is listed yet. That is normal until the cable is plugged in: it will be picked up when it appears."
+  case $msc in
+    yes)     ok "Kernel supports USB mass storage" ;;
+    no)      err "Kernel says it has no USB mass storage support" ;;
+    unknown) info "Could not read the kernel config. It may still work; the start will tell." ;;
+  esac
+  [[ $cfg == yes && $msc != no ]]
+}
+
+usb_boot_stop() {
+  [[ -n $JID_USB ]] || return 0
+  journal_apply "$JID_USB" || return 1
+  JID_USB=""
+}
+
+usb_cleanup() {
+  local rc=$? recovery_ok=1
   trap - EXIT
+  trap - INT TERM HUP
+  set +e
+  journal_replay || recovery_ok=0
+  (( IS_TERMUX )) && termux-wake-unlock 2>/dev/null || true
+  release_lock
+  echo
+  if (( recovery_ok )) && [[ $(journal_count) == 0 ]]; then
+    info "USB drive mode stopped. The phone's previous USB state is restored."
+  else
+    warn "USB recovery is incomplete. Records were retained; run '$0 heal' or '$0 usb-boot stop'."
+  fi
+  exit "$rc"
+}
+
+usb_boot_undo_command() {
+  local undo="set -e; " bound_g bound_udc
+  if [[ -n $USB_BOOT_OWN_G ]]; then
+    undo+="echo '' > '$USB_BOOT_OWN_G/UDC' 2>/dev/null || true; rm -f '$USB_BOOT_OWN_G/configs/c.1/mass_storage.0'; rm -rf '$USB_BOOT_OWN_G'; "
+  fi
+  if [[ -n $USB_BOOT_REUSE_G && -n $USB_BOOT_REUSE_CFG ]]; then
+    undo+="echo '' > '$USB_BOOT_REUSE_G/UDC' 2>/dev/null || true; rm -f '$USB_BOOT_REUSE_CFG/f_nb'; rm -rf '$USB_BOOT_REUSE_G/functions/mass_storage.nb0'; "
+  fi
+  if (( USB_BOOT_PREV_CFG_CAPTURED )); then
+    undo+="setprop sys.usb.config '$USB_BOOT_PREV_CFG'; i=0; while [ \"\$(getprop sys.usb.config 2>/dev/null)\" != '$USB_BOOT_PREV_CFG' ] && [ \"\$i\" -lt 10 ]; do sleep 1; i=\$((i+1)); done; [ \"\$(getprop sys.usb.config 2>/dev/null)\" = '$USB_BOOT_PREV_CFG' ]; "
+  fi
+  while IFS='|' read -r bound_g bound_udc; do
+    [[ -n $bound_g && -n $bound_udc ]] || continue
+    undo+="if [ -f '$bound_g/UDC' ]; then cur=\$(cat '$bound_g/UDC' 2>/dev/null); if [ -z \"\$cur\" ]; then echo '$bound_udc' > '$bound_g/UDC'; fi; [ \"\$(cat '$bound_g/UDC' 2>/dev/null)\" = '$bound_udc' ]; else exit 1; fi; "
+  done <<<"$USB_BOOT_BINDINGS"
+  if (( USB_BOOT_RESTORE_SELINUX )); then undo+="setenforce 1; [ \"\$(getenforce 2>/dev/null)\" = Enforcing ]; "; fi
+  [[ -z $USB_BOOT_OWN_G ]] || undo+="[ ! -e '$USB_BOOT_OWN_G' ]; "
+  [[ -z $USB_BOOT_REUSE_CFG ]] || undo+="[ ! -e '$USB_BOOT_REUSE_CFG/f_nb' ] && [ ! -e '$USB_BOOT_REUSE_G/functions/mass_storage.nb0' ]; "
+  (( ! USB_BOOT_PREV_CFG_CAPTURED )) || undo+="[ \"\$(getprop sys.usb.config 2>/dev/null)\" = '$USB_BOOT_PREV_CFG' ]; "
+  undo+="exit 0"
+  printf '%s' "$undo"
+}
+
+# What the phone itself says about why the USB gadget was refused (shown only after a failure)
+usb_diag() {
+  local line
+  info "SELinux now: $(run_root 'getenforce' 2>/dev/null || echo unknown)   root context: $(run_root 'id -Z' 2>/dev/null || echo unknown)"
+  info "Kernel: $(uname -r)"
+  info "Gadgets present: $(run_root "ls '$USB_CFG'" 2>/dev/null | tr '\n' ' ')"
+  info "Functions the kernel offers: $(run_root "ls '$USB_CFG/$USB_GNAME/functions' 2>/dev/null; zcat '$USB_KCONFIG' 2>/dev/null | grep -E 'CONFIGFS_(MASS_STORAGE|F_FS|ECM|RNDIS|NCM)=' | tr '\n' ' '" 2>/dev/null)"
+  info "Kernel messages about it (last lines):"
+  run_root "dmesg 2>/dev/null | grep -iE 'avc|gadget|configfs|mass_storage|fsg|usb_cfg|denied' | tail -n 12" 2>/dev/null | sed 's/^/    /' || true
+}
+
+# Creates the gadget folders and points them at the ISO; does not connect it to the USB port yet.
+usb_prepare_gadget() {
+  local g_path=$1 vid=$2 pid=$3
+  rm -f "$RUN/usb.ok"
+  run_root "set -e
+G='$g_path'
+mkdir -p \"\$G\"
+echo '0x$vid' > \"\$G/idVendor\"; echo '0x$pid' > \"\$G/idProduct\"
+mkdir -p \"\$G/strings/0x409\"
+echo 'netboot-android' > \"\$G/strings/0x409/manufacturer\"
+echo '$DISTRO live drive' > \"\$G/strings/0x409/product\"
+echo '0001' > \"\$G/strings/0x409/serialnumber\"
+mkdir -p \"\$G/configs/c.1/strings/0x409\"
+echo 'mass storage' > \"\$G/configs/c.1/strings/0x409/configuration\"
+mkdir -p \"\$G/functions/mass_storage.0\"
+F=\"\$G/functions/mass_storage.0/lun.0\"
+mkdir -p \"\$F\"
+echo 1 > \"\$F/ro\"
+echo '$USB_CDROM' > \"\$F/cdrom\"
+echo '$ISO' > \"\$F/file\"
+ln -sf \"\$G/functions/mass_storage.0\" \"\$G/configs/c.1/mass_storage.0\"" >/dev/null 2>"$RUN/usb.err" && : > "$RUN/usb.ok"
+  [[ -e $RUN/usb.ok ]]
+}
+
+# Second way, if the phone refuses a gadget of our own: add the drive to the gadget Android already runs,
+# the same way Android's own init scripts do (their folder names, our function name).
+USB_REUSE_G=""
+USB_REUSE_CFGDIR=""
+usb_prepare_reuse() {
+  local cfgdir
+  rm -f "$RUN/usb.ok"
+  cfgdir=$(run_root "ls -d '$USB_CFG'/*/configs/* 2>/dev/null | grep -v '/$USB_GNAME/' | head -n1" 2>/dev/null || true)
+  [[ -n $cfgdir ]] || { echo "the phone has no USB setup of its own to reuse" > "$RUN/usb.err"; return 1; }
+  [[ $cfgdir == "$USB_CFG/"* && $cfgdir =~ ^(/[A-Za-z0-9._-]+)+$ ]] || { echo "Android returned an unexpected configfs path" > "$RUN/usb.err"; return 1; }
+  USB_REUSE_G=${cfgdir%/configs/*}
+  USB_REUSE_CFGDIR=$cfgdir
+  [[ $USB_REUSE_G =~ ^(/[A-Za-z0-9._-]+)+$ ]] || { echo "Android returned an unexpected gadget path" > "$RUN/usb.err"; return 1; }
+  run_root "[ ! -e '$cfgdir/f_nb' ] && [ ! -L '$cfgdir/f_nb' ] && [ ! -e '$USB_REUSE_G/functions/mass_storage.nb0' ]" >/dev/null 2>&1 || {
+    echo "Android's existing gadget already uses one of the script's reserved paths" > "$RUN/usb.err"; return 1;
+  }
+  USB_BOOT_REUSE_G=$USB_REUSE_G
+  USB_BOOT_REUSE_CFG=$USB_REUSE_CFGDIR
+  journal_replace "$JID_USB" "$(usb_boot_undo_command)" || { echo "could not durably record rollback for Android's existing gadget" > "$RUN/usb.err"; return 1; }
+  run_root "set -e
+G='$USB_REUSE_G'
+mkdir -p \"\$G/functions/mass_storage.nb0\"
+F=\"\$G/functions/mass_storage.nb0/lun.0\"
+mkdir -p \"\$F\"
+echo 1 > \"\$F/ro\"
+echo '$USB_CDROM' > \"\$F/cdrom\"
+echo '$ISO' > \"\$F/file\"
+ln -sf \"\$G/functions/mass_storage.nb0\" '$cfgdir/f_nb'" >/dev/null 2>"$RUN/usb.err" && : > "$RUN/usb.ok"
+  [[ -e $RUN/usb.ok ]]
+}
+
+usb_boot_start() {
+  local udc g prev_cfg bindings g_path size_mb vid pid bound_g bound_udc
+  (( IS_PROOT )) && die "$E_ENV" "You are inside proot. Leave it ('exit') and run this in Termux."
+  [[ -s $ISO ]] || die "$E_ENV" "No ISO downloaded yet. Run: $0 fetch"
+  iso_is_verified || die "$E_INTEGRITY" "The ISO is not marked as verified. Run: $0 fetch (it checks the signature and checksum first)"
+  trap usb_cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  usb_prepare_configfs
+  if [[ $DISTRO == windows || $DISTRO == win11 ]]; then USB_CDROM=1; fi
+  usb_check || die "$E_ENV" "This phone cannot act as a USB drive (see above)."
+  mkdir -p "$RUN"
+  udc=$(run_root "ls -1 '$USB_UDC_DIR' 2>/dev/null | head -n1" 2>/dev/null || true)
+  g_path="$USB_CFG/$USB_GNAME"
+  run_root "[ ! -e '$g_path' ]" >/dev/null 2>&1 || die "$E_BUSY" "USB gadget path already exists: $g_path. It was not changed; recover a recorded run with '$0 usb-boot stop'."
+  vid=${USB_GADGET_VID:-$(usb_net_prop ro.usb.vid sys.usb.vid vendor.usb.vid ro.boot.usb.vendorid || true)}
+  pid=${USB_GADGET_PID:-$(usb_net_prop ro.usb.pid sys.usb.pid vendor.usb.pid ro.boot.usb.productid || true)}
+  [[ $vid =~ ^(0[xX])?[[:xdigit:]]{4}$ && $pid =~ ^(0[xX])?[[:xdigit:]]{4}$ ]] || \
+    die "$E_ENV" "Could not read valid Android USB VID/PID. Set USB_GADGET_VID and USB_GADGET_PID to this device's own IDs; vendor IDs will not be impersonated."
+  vid=${vid#0x}; vid=${vid#0X}; pid=${pid#0x}; pid=${pid#0X}
+  prev_cfg=$(run_root "getprop sys.usb.config 2>/dev/null" 2>/dev/null) || die "$E_ENV" "Could not read Android's current USB configuration; refusing to change it."
+  [[ $prev_cfg =~ ^[A-Za-z0-9_,.-]*$ ]] || die "$E_ENV" "Unexpected sys.usb.config value; refusing to change it."
+  bindings=$(run_root "for g in '$USB_CFG'/*; do [ -f \"\$g/UDC\" ] || continue; u=\$(cat \"\$g/UDC\" 2>/dev/null); [ -z \"\$u\" ] || printf '%s|%s\\n' \"\$g\" \"\$u\"; done" 2>/dev/null || true)
+  while IFS='|' read -r bound_g bound_udc; do
+    [[ -n $bound_g && -n $bound_udc ]] || continue
+    [[ $bound_g == "$USB_CFG/"* && $bound_g =~ ^(/[A-Za-z0-9._-]+)+$ && ${bound_g##*/} =~ ^[A-Za-z0-9_.-]+$ && $bound_udc =~ ^[A-Za-z0-9_.-]+$ ]] || \
+      die "$E_ENV" "Android returned an unexpected active USB gadget binding; refusing to take over the port."
+  done <<<"$bindings"
+  USB_BOOT_PREV_CFG=$prev_cfg
+  USB_BOOT_PREV_CFG_CAPTURED=1
+  USB_BOOT_BINDINGS=$bindings
+  USB_BOOT_OWN_G=$g_path
+  USB_BOOT_REUSE_G=""; USB_BOOT_REUSE_CFG=""
+  USB_BOOT_RESTORE_SELINUX=0
+  JID_USB=$(journal_push "$(usb_boot_undo_command)")
+  (( IS_TERMUX )) && { termux-wake-lock 2>/dev/null || true; }
+
+  info "Switching the phone's USB port to drive mode (USB file transfer and adb pause until you stop)"
+  run_root "setprop sys.usb.config none 2>/dev/null; sleep 1; [ \"\$(getprop sys.usb.config 2>/dev/null)\" = none ]" >/dev/null 2>&1 || die "$E_ENV" "Android did not release its current USB configuration."
+  while IFS='|' read -r bound_g bound_udc; do
+    [[ -n $bound_g && -n $bound_udc ]] || continue
+    run_root "if [ -f '$bound_g/UDC' ] && [ \"\$(cat '$bound_g/UDC' 2>/dev/null)\" = '$bound_udc' ]; then echo '' > '$bound_g/UDC'; fi; [ -z \"\$(cat '$bound_g/UDC' 2>/dev/null)\" ]" >/dev/null 2>&1 || die "$E_ENV" "Could not safely unbind the previous USB gadget at $bound_g."
+  done <<<"$bindings"
+
+  if ! usb_prepare_gadget "$g_path" "$vid" "$pid"; then
+    local why; why=$(tr '\n' ' ' < "$RUN/usb.err" 2>/dev/null | cut -c1-240)
+    if [[ $why == *"not permitted"* || $why == *"ermission denied"* ]] && (( IS_ANDROID )) && [[ $(run_root "getenforce" 2>/dev/null) == Enforcing ]]; then
+      warn "Android's SELinux blocked this step ($why)"
+      info "Usual fix: let SELinux be permissive only while the USB drive is on. It is switched back automatically when you stop."
+      if ask_yn "Allow SELinux permissive for this USB session?" n; then
+        USB_BOOT_RESTORE_SELINUX=1
+        journal_replace "$JID_USB" "$(usb_boot_undo_command)" || die "$E_ENV" "Could not durably record SELinux rollback."
+        run_root "setenforce 0" >/dev/null 2>&1 || die "$E_ENV" "Could not change SELinux on this phone."
+        usb_prepare_gadget "$g_path" "$vid" "$pid" || why=$(tr '\n' ' ' < "$RUN/usb.err" 2>/dev/null | cut -c1-240)
+      fi
+    fi
+    if [[ ! -e $RUN/usb.ok ]]; then
+      info "The phone refused a USB drive of our own. Trying the phone's own USB setup instead (the way Android does it)."
+      if usb_prepare_reuse; then g_path=$USB_REUSE_G; ok "Using the phone's own USB setup: ${g_path##*/}"; fi
+    fi
+    if [[ ! -e $RUN/usb.ok ]]; then
+      why="$why / second try: $(tr '\n' ' ' < "$RUN/usb.err" 2>/dev/null | cut -c1-160)"
+      usb_diag
+      usb_boot_stop
+      die "$E_ENV" "Could not switch on USB drive mode: ${why:-unknown error}. If SELinux was already permissive, this phone's kernel or vendor setup does not allow a USB drive gadget here."
+    fi
+  fi
+  # Everything is prepared. Connect it to the USB port now, or as soon as the port shows up (cable plugged in).
+  local bind_err="" last_msg="" shown_msg="" tries=0
+  while true; do
+    [[ -n $udc ]] || udc=$(run_root "ls -1 '$USB_UDC_DIR' 2>/dev/null | head -n1" 2>/dev/null || true)
+    if [[ -n $udc ]]; then
+      if run_root "echo '$udc' > '$g_path/UDC'" >/dev/null 2>"$RUN/usb.err"; then
+        [[ $(run_root "cat '$g_path/UDC'" 2>/dev/null) == "$udc" ]] && break
+      fi
+      bind_err=$(tr '\n' ' ' < "$RUN/usb.err" 2>/dev/null | cut -c1-160)
+      tries=$((tries+1))
+      (( tries < 8 )) || { usb_boot_stop; die "$E_ENV" "The USB port would not switch over (${bind_err:-no message}). Unplug the cable, run '$0 usb-boot stop', and try again."; }
+      last_msg="USB port busy, retrying (${bind_err:-no message})"
+    else
+      last_msg="Waiting for the USB cable. Plug the phone into the PC when you are ready."
+    fi
+    [[ $last_msg == "$shown_msg" ]] || { info "$last_msg"; shown_msg=$last_msg; }
+    sleep 2
+  done
+
+  size_mb=$(( $(file_size "$ISO") / 1048576 ))
+  echo
+  local secure_boot_note
+  case "$DISTRO" in
+    windows|win11) secure_boot_note="For unmodified Microsoft media, Secure Boot uses Microsoft's boot signature; the SHA-256 pin is separate." ;;
+    ubuntu|ubuntu24) secure_boot_note="Keep Secure Boot on for Ubuntu's signed boot files." ;;
+    *) secure_boot_note="Secure Boot behavior depends on this ISO and the PC's firmware." ;;
+  esac
+  box \
+    "USB DRIVE MODE: ON" \
+    "" \
+    "Showing: $(basename "$ISO") (${size_mb} MB, read-only, verified)" \
+    "" \
+    "NOW, ON THE PC:" \
+    "1. Plug the phone's USB-C cable into the PC." \
+    "2. Turn the PC on and tap its boot-menu key (F12, F9, Esc, F8)." \
+    "3. Choose the USB device from the list (not the hard drive)." \
+    "4. $secure_boot_note" \
+    "" \
+    "No network is used. Press Ctrl+C here to stop and restore USB."
+  local last="" st
+  while true; do
+    st=$(cat "$USB_UDC_DIR/$udc/state" 2>/dev/null || true)
+    if [[ $st != "$last" ]]; then
+      [[ $st == configured ]] && ok "The PC is connected and sees the drive"
+      [[ -z $last || $st != configured ]] && info "USB state: ${st:-unknown}"
+      last=$st
+    fi
+    sleep 2
+  done
+}
+
+usb_boot() {
+  case "${1:-start}" in
+    check)  usb_check ;;
+    stop)   journal_replay; ok "USB settings restored" ;;
+    start)  usb_boot_start ;;
+    *)      die "$E_USAGE" "Usage: $0 usb-boot [start|stop|check]" ;;
+  esac
+}
+
+usb_netboot() {
+  case "${1:-stop}" in
+    stop) journal_replay; ok "Pending USB gadget/network changes restored" ;;
+    *)    die "$E_USAGE" "Usage: $0 usb-netboot stop" ;;
+  esac
+}
+
+usb_net_prop() {
+  local key value
+  for key in "$@"; do
+    value=$(run_root "getprop '$key' 2>/dev/null" 2>/dev/null || true)
+    if [[ -n $value ]]; then printf '%s' "$value"; return 0; fi
+  done
+  return 1
+}
+
+usb_net_stop() {
+  [[ -n $JID_USB_NET ]] || return 0
+  journal_apply "$JID_USB_NET" || return 1
+  JID_USB_NET=""
+}
+
+# Optional Android USB-to-Ethernet gadget. This is never run for --help, setup,
+# or normal Wi-Fi/direct serving; selecting --mode usb is the explicit opt-in.
+initialize_usb_netboot_bridge() {
+  local prev_cfg vid pid g_path bindings bound_g bound_udc undo
+  (( IS_ANDROID )) || die "$E_ENV" "USB RNDIS gadget mode is Android-only."
+  (( ! IS_PROOT )) || die "$E_ENV" "USB RNDIS gadget mode cannot run from proot; use Termux itself."
+  [[ $DHCP_MODE == usb ]] || return 0
+  [[ $USB_NET_IFACE =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || die "$E_USAGE" "Invalid USB_NET_IFACE: $USB_NET_IFACE"
+  [[ $USB_CFG =~ ^(/[A-Za-z0-9._-]+)+$ ]] || die "$E_USAGE" "Invalid USB_CFG path: $USB_CFG"
+  [[ $USB_UDC_DIR =~ ^(/[A-Za-z0-9._-]+)+$ ]] || die "$E_USAGE" "Invalid USB_UDC_DIR path: $USB_UDC_DIR"
+  [[ $USB_NET_DEV_MAC =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ && $USB_NET_HOST_MAC =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]] || \
+    die "$E_USAGE" "USB_NET_DEV_MAC and USB_NET_HOST_MAC must be colon-separated six-byte MAC addresses."
+
+  usb_prepare_configfs
+  g_path="$USB_CFG/$USB_NET_GNAME"
+  run_root "[ ! -e '$g_path' ]" >/dev/null 2>&1 || die "$E_BUSY" "USB gadget path already exists: $g_path. It was not changed; inspect it before retrying."
+
+  vid=${USB_GADGET_VID:-$(usb_net_prop ro.usb.vid sys.usb.vid vendor.usb.vid ro.boot.usb.vendorid || true)}
+  pid=${USB_GADGET_PID:-$(usb_net_prop ro.usb.pid sys.usb.pid vendor.usb.pid ro.boot.usb.productid || true)}
+  [[ $vid =~ ^(0[xX])?[[:xdigit:]]{4}$ && $pid =~ ^(0[xX])?[[:xdigit:]]{4}$ ]] || \
+    die "$E_ENV" "Could not read valid Android USB VID/PID. Set USB_GADGET_VID and USB_GADGET_PID to this device's own four-digit hexadecimal IDs; the script will not impersonate another vendor."
+  vid=${vid#0x}; vid=${vid#0X}; pid=${pid#0x}; pid=${pid#0X}
+
+  IFACE=$USB_NET_IFACE
+  prev_cfg=$(run_root "getprop sys.usb.config 2>/dev/null" 2>/dev/null) || die "$E_ENV" "Could not read Android's current USB configuration; refusing to change it."
+  [[ $prev_cfg =~ ^[a-zA-Z0-9_,.-]*$ ]] || die "$E_ENV" "Android returned an unexpected sys.usb.config value; refusing to replace it."
+  bindings=$(run_root "for g in '$USB_CFG'/*; do [ -f \"\$g/UDC\" ] || continue; u=\$(cat \"\$g/UDC\" 2>/dev/null); [ -z \"\$u\" ] || printf '%s|%s\\n' \"\$g\" \"\$u\"; done" 2>/dev/null || true)
+  undo="set -e; echo '' > '$g_path/UDC' 2>/dev/null || true; rm -f '$g_path/configs/c.1/rndis.usb0'; rm -rf '$g_path'; "
+  undo+="setprop sys.usb.config '$prev_cfg'; "
+  undo+="i=0; while [ \"\$(getprop sys.usb.config 2>/dev/null)\" != '$prev_cfg' ] && [ \"\$i\" -lt 10 ]; do sleep 1; i=\$((i+1)); done; "
+  undo+="[ \"\$(getprop sys.usb.config 2>/dev/null)\" = '$prev_cfg' ]; "
+  while IFS='|' read -r bound_g bound_udc; do
+    [[ -n $bound_g && -n $bound_udc ]] || continue
+    [[ $bound_g == "$USB_CFG/"* && $bound_g != "$g_path" && $bound_g =~ ^(/[A-Za-z0-9._-]+)+$ && $bound_udc =~ ^[A-Za-z0-9_.-]+$ ]] || \
+      die "$E_ENV" "Android returned an unexpected active USB gadget binding; refusing to replace it."
+    [[ ${bound_g##*/} =~ ^[A-Za-z0-9_.-]+$ ]] || die "$E_ENV" "Android returned an unsafe USB gadget name."
+    undo+="if [ -f '$bound_g/UDC' ]; then cur=\$(cat '$bound_g/UDC' 2>/dev/null); if [ -z \"\$cur\" ]; then echo '$bound_udc' > '$bound_g/UDC'; fi; [ \"\$(cat '$bound_g/UDC' 2>/dev/null)\" = '$bound_udc' ]; else exit 1; fi; "
+  done <<<"$bindings"
+  undo+="[ ! -e '$g_path' ]; exit 0"
+  JID_USB_NET=$(journal_push "$undo")
+  info "Switching USB to the dedicated RNDIS network gadget. ADB and the phone's current USB function will pause until serving stops."
+
+  # Record the undo first; never remove an Android-owned gadget directory.
+  mkdir -p "$RUN"
+  run_root "setprop sys.usb.config none 2>/dev/null; sleep 1; [ \"\$(getprop sys.usb.config 2>/dev/null)\" = none ]" >/dev/null 2>&1 || \
+    die "$E_ENV" "Android did not release its current USB gadget configuration. No existing gadget was removed."
+  run_root "set -e
+    G='$g_path'
+    mkdir -p \"\$G/strings/0x409\" \"\$G/configs/c.1/strings/0x409\" \"\$G/functions/rndis.usb0\"
+    echo '0x$vid' > \"\$G/idVendor\"
+    echo '0x$pid' > \"\$G/idProduct\"
+    echo '0x0100' > \"\$G/bcdDevice\"
+    echo '0x0200' > \"\$G/bcdUSB\"
+    echo 'netboot-android' > \"\$G/strings/0x409/manufacturer\"
+    echo 'USB netboot RNDIS' > \"\$G/strings/0x409/product\"
+    echo 'netboot-$$' > \"\$G/strings/0x409/serialnumber\"
+    echo '0x80' > \"\$G/configs/c.1/bmAttributes\"
+    echo '250' > \"\$G/configs/c.1/MaxPower\"
+    echo '$USB_NET_DEV_MAC' > \"\$G/functions/rndis.usb0/dev_addr\"
+    echo '$USB_NET_HOST_MAC' > \"\$G/functions/rndis.usb0/host_addr\"
+    ln -s \"\$G/functions/rndis.usb0\" \"\$G/configs/c.1/rndis.usb0\"
+    U=\$(ls -1 '$USB_UDC_DIR' 2>/dev/null | head -n1)
+    [ -n \"\$U\" ]
+    echo \"\$U\" > \"\$G/UDC\"
+  " >/dev/null 2>"$RUN/usb-net.err" || {
+    local why
+    why=$(tr '\n' ' ' < "$RUN/usb-net.err" 2>/dev/null | cut -c1-240)
+    die "$E_ENV" "Could not initialize the RNDIS gadget (${why:-kernel/configfs refused it}). Its recorded cleanup will restore the prior USB mode."
+  }
+
+  local tries=0
+  until ip_q -o link show dev "$IFACE" >/dev/null 2>&1; do
+    (( ++tries < 20 )) || die "$E_ENV" "The RNDIS gadget bound, but interface $IFACE did not appear. Set USB_NET_IFACE to the interface name this kernel creates."
+    sleep 0.5
+  done
+  DIRECT_CIDR=$USB_NET_CIDR
+  ok "USB RNDIS interface is ready: $IFACE ($USB_NET_CIDR)"
+}
+
+cleanup() {
+  local rc=$? recovery_ok=1
+  trap - EXIT
+  trap - INT TERM HUP
+  set +e
   kill_servers
-  teardown_direct
-  power_save_restore
+  journal_replay || recovery_ok=0
   (( IS_TERMUX )) && termux-wake-unlock 2>/dev/null || true
   run_root "chown -R $(id -u):$(id -g) '$RUN'" >/dev/null 2>&1 || true
   if [[ -n $TAIL_PID ]]; then kill "$TAIL_PID" 2>/dev/null || true; fi
   if [[ -n $DEEP_PID ]]; then pkill -P "$DEEP_PID" 2>/dev/null || true; kill "$DEEP_PID" 2>/dev/null || true; fi
-  note_serve "stopped"
+  if (( recovery_ok )) && [[ $(journal_count) == 0 ]]; then
+    note_serve "stopped"
+  else
+    note_serve "recovery-pending ($(journal_count) journal record(s)); run $0 heal"
+    warn "Some host state could not be restored. Recovery records were retained; run '$0 heal' or '$0 usb-netboot stop'."
+  fi
   release_lock
   echo
   info "Servers stopped"
+  exit "$rc"
 }
 
 serve() {
   if (( IS_PROOT )); then
     die "$E_ENV" "You are inside a proot Linux environment. It cannot see the phone's network or open the DHCP/TFTP ports, so it cannot serve a PC. Type 'exit' to return to Termux and run this there (rooted). This environment is good for building the loader: $0 proot-build"
   fi
+  trap cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  note_serve "starting ($DISTRO/$TARGET_ARCH; mode=$DHCP_MODE)"
+  journal_replay || die "$E_ENV" "A previous run has unfinished host cleanup. Run '$0 heal' before starting again."
+  [[ $DHCP_MODE != usb ]] || initialize_usb_netboot_bridge
   resolve_network
   require_ready
   [[ $MODE == direct ]] && setup_direct
@@ -3110,20 +4379,15 @@ serve() {
     || die "Network changed since configure (now $IFACE $PHONE_IP). Run: $0 configure"
 
   auto_backup serve
-  journal_replay
   verify_manifest
   save_profile
-  note_serve "started ($DISTRO/$TARGET_ARCH on $IFACE $PHONE_IP)"
 
   if port_in_use tcp "$HTTP_PORT"; then die "$E_BUSY" "TCP $HTTP_PORT is in use. Set HTTP_PORT=... or run: $0 clean"; fi
   if port_in_use udp 67; then warn "UDP 67 is in use. dnsmasq may fail to bind (see selinux or hotspot notes)."; fi
   if port_in_use udp 69; then warn "UDP 69 is in use. TFTP may fail to bind."; fi
 
-  trap cleanup EXIT
-  trap 'exit 130' INT TERM
-
   (( IS_TERMUX )) && { termux-wake-lock 2>/dev/null || true; }
-  power_save_off
+  [[ $IFACE == wlan* || $IFACE == wl* ]] && power_save_off
 
   mkdir -p "$RUN"
   DNS_LOG="$ROOT/dnsmasq.log"
@@ -3131,15 +4395,17 @@ serve() {
   info "Starting the HTTP server on $PHONE_IP:$HTTP_PORT (log: $HTTP_LOG)"
   start_http || die "$E_ENV" "HTTP server failed to start. See $HTTP_LOG.err"
 
-  local vb_text="ON (signed, client verifies)"
+  local vb_text="ON (signed, client verifies)" mode_label=$MODE
+  [[ $DHCP_MODE == usb ]] && mode_label="USB RNDIS direct"
   [[ $VERIFIED_BOOT == 1 ]] || vb_text="OFF"
+  [[ $BOOT_LOADER == shim ]] && vb_text="Ubuntu signed chain (Secure Boot ok)"
   echo
   box \
     "PXE SERVER STATUS: RUNNING" \
     "" \
     "Live system    : $P_LABEL / $TARGET_ARCH" \
     "Client RAM     : about $CLIENT_RAM_GB GB or more" \
-    "Interface      : $IFACE ($MODE DHCP)" \
+    "Interface      : $IFACE ($mode_label DHCP)" \
     "Subnet         : $NET/$PREFIX_LEN" \
     "Server IP      : $PHONE_IP" \
     "Client URL     : $BASE_URL" \
@@ -3159,9 +4425,9 @@ serve() {
   info "Starting dnsmasq ($MODE DHCP + TFTP) as root"
   start_dns
   tail -n 0 -F "$DNS_LOG" 2>/dev/null & TAIL_PID=$!
-  sleep 1
-  dns_alive || die "$E_ENV" "dnsmasq exited. If it could not bind a port, check: $0 selinux status, and whether a hotspot or another DHCP/TFTP service holds ports 67/69."
+  wait_dns_up || die "$E_ENV" "dnsmasq exited right after starting. Its last words: $(tail -n 3 "$DNS_LOG" 2>/dev/null | tr '\n' ' ' | cut -c1-300). If it could not bind a port, check: $0 selinux status, and whether a hotspot or another DHCP/TFTP service holds ports 67/69."
   protect_pid "$(run_root "cat '$RUN/dnsmasq.pid'" 2>/dev/null || true)"
+  note_serve "started ($DISTRO/$TARGET_ARCH on $IFACE $PHONE_IP; mode=$DHCP_MODE)"
   ok "Ready. Boot the PC from the network now."
   pc_instructions
   watchdog || true
@@ -3170,7 +4436,10 @@ serve() {
 
 # ---- server processes, supervised by watchdog() ------------------------------------
 start_http() {
-  HTTPD_LOG="$HTTP_LOG" HTTPD_ALLOW="$ISO" "$PYTHON" "$LIB/httpd.py" "$PHONE_IP" "$HTTP_PORT" "$HTTP" >> "$HTTP_LOG.err" 2>&1 &
+  local iso_pin=""
+  if [[ $DISTRO == windows || $DISTRO == win11 ]]; then iso_pin=$ISO_SHA256; fi
+  HTTPD_LOG="$HTTP_LOG" HTTPD_ALLOW="$ISO" HTTPD_MANIFEST="$MANIFEST" HTTPD_ISO_PATH="$ISO" HTTPD_ISO_SHA256="$iso_pin" \
+    "$PYTHON" "$LIB/httpd.py" "$PHONE_IP" "$HTTP_PORT" "$HTTP" >> "$HTTP_LOG.err" 2>&1 &
   SERVE_HTTP_PID=$!
   local i
   for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -3184,14 +4453,56 @@ start_http() {
 http_health() { curl -fsS -m 2 -o /dev/null "http://$PHONE_IP:$HTTP_PORT/healthz" 2>/dev/null; }
 http_stats()  { curl -fsS -m 2 "http://$PHONE_IP:$HTTP_PORT/healthz" 2>/dev/null || true; }
 
-start_dns() {
-  local ldp=""
-  (( IS_TERMUX )) && ldp="LD_LIBRARY_PATH=$PREFIX/lib "
-  { run_root "${ldp}$DNSMASQ --no-daemon --conf-file=$DNSMASQ_CONF" || true; } >> "$DNS_LOG" 2>&1 &
+DNS_JOB=""
+trusted_dnsmasq_binary() {
+  local bin=${DNSMASQ:-} real owner perm mode
+  [[ -n $bin ]] || return 1
+  [[ $bin == /* ]] || bin=$(command -v -- "$bin" 2>/dev/null || true)
+  [[ $bin == /* && -f $bin && -x $bin ]] || return 1
+  real=$(readlink -f "$bin" 2>/dev/null) || return 1
+  [[ $real != *"'"* && ! $real =~ [[:cntrl:]] ]] || return 1
+  owner=$(stat -c %u "$real" 2>/dev/null) || return 1
+  perm=$(stat -c %a "$real" 2>/dev/null) || return 1
+  [[ $perm =~ ^[0-7]{3,4}$ ]] || return 1
+  mode=$((8#$perm))
+  (( mode & 0022 )) && return 1
+  if (( IS_TERMUX )); then
+    [[ $real == "$PREFIX/"* || $owner == 0 ]] || return 1
+  else
+    [[ $owner == 0 ]] || return 1
+  fi
+  printf '%s' "$real"
 }
 
+start_dns() {
+  local ldp="" bin bin_q conf_q lib_q
+  bin=$(trusted_dnsmasq_binary) || die "$E_INTEGRITY" "Refusing to run dnsmasq as root: its path, owner, or permissions are unsafe. Install it through the host package manager."
+  printf -v bin_q '%q' "$bin"
+  printf -v conf_q '%q' "$DNSMASQ_CONF"
+  if (( IS_TERMUX )); then
+    printf -v lib_q '%q' "$PREFIX/lib"
+    ldp="LD_LIBRARY_PATH=$lib_q "
+  fi
+  run_root "rm -f '$RUN/dnsmasq.pid'" >/dev/null 2>&1 || true     # a leftover file must not vouch for a dead dnsmasq
+  { run_root "${ldp}${bin_q} --no-daemon --conf-file=${conf_q}" || true; } >> "$DNS_LOG" 2>&1 &
+  DNS_JOB=$!
+}
+
+# dnsmasq runs in the foreground under that job, so the job being alive means dnsmasq is alive.
+# (The PID file is only a fallback: on some phones it appears late or cannot be read.)
 dns_alive() {
+  if [[ -n $DNS_JOB ]] && kill -0 "$DNS_JOB" 2>/dev/null; then return 0; fi
   run_root "p=\$(cat '$RUN/dnsmasq.pid' 2>/dev/null); [ -n \"\$p\" ] && kill -0 \"\$p\" 2>/dev/null" >/dev/null 2>&1
+}
+
+# dnsmasq that cannot bind a port exits within a fraction of a second; give it a few seconds of proof
+wait_dns_up() {
+  local i
+  for i in 1 2 3 4 5 6 7 8; do
+    sleep 0.5
+    dns_alive || return 1
+  done
+  return 0
 }
 
 stop_dns() {
@@ -3227,8 +4538,8 @@ wd_restart() {   # http | dns
   case "$1" in
     http) kill "$SERVE_HTTP_PID" 2>/dev/null || true
           if start_http; then ok "HTTP server restarted"; log_event WARN "watchdog restarted http"; else warn "HTTP restart failed; will retry"; fi ;;
-    dns)  stop_dns; start_dns; sleep 1
-          if dns_alive; then ok "dnsmasq restarted"; log_event WARN "watchdog restarted dnsmasq"; protect_pid "$(run_root "cat '$RUN/dnsmasq.pid'" 2>/dev/null || true)"; else warn "dnsmasq restart failed; will retry"; fi ;;
+    dns)  stop_dns; start_dns
+          if wait_dns_up; then ok "dnsmasq restarted"; log_event WARN "watchdog restarted dnsmasq"; protect_pid "$(run_root "cat '$RUN/dnsmasq.pid'" 2>/dev/null || true)"; else warn "dnsmasq restart failed; will retry"; fi ;;
   esac
   return 0
 }
@@ -3364,7 +4675,15 @@ check() {
   local ma; ma=$(mem_avail_mb)
   if (( ma > 0 && ma < 300 )); then warn "Only $ma MB of RAM free. Close other apps so Android keeps the servers alive."; fi
 
-  if ( resolve_network ) >/dev/null 2>&1; then
+  if [[ $DHCP_MODE == usb ]]; then
+    if (( IS_ANDROID )); then
+      ok "USB RNDIS link will be created when serving starts: $USB_NET_IFACE $USB_NET_CIDR"
+      info "The Android gadget controller, this device's VID/PID, and RNDIS kernel support are checked at startup."
+      warn "The PC's firmware must support USB RNDIS network boot; many UEFI systems only PXE-boot supported Ethernet adapters."
+    else
+      err "USB gadget network mode is Android-only."; fails=$((fails+1))
+    fi
+  elif ( resolve_network ) >/dev/null 2>&1; then
     resolve_network
     link_state=$(ip_q -o link show "$IFACE")
     ok "Network: $IFACE $PHONE_IP/$PREFIX_LEN, mode $MODE${link_state:+, link up}"
@@ -3375,7 +4694,7 @@ check() {
   elif (( IS_PROOT )); then
     warn "Inside a proot Linux: the phone's network and ports 67/69 are not reachable from here. Use this environment to BUILD the loader (run: $0 proot-build). Serve from Termux itself."
   else
-    err "No usable network interface (set IFACE=..., or --mode direct for a cable)"; fails=$((fails+1))
+    err "No usable network interface (set IFACE=..., or choose --mode direct/usb for a cable)"; fails=$((fails+1))
   fi
 
   if (( ! IS_ANDROID )); then
@@ -3399,11 +4718,17 @@ check() {
   (( expired == 0 )) && ok "Valid pins for all hosts in use"
   [[ -s $PIN_AUDIT ]] && grep -q INTERCEPTION "$PIN_AUDIT" && warn "Pin audit log contains INTERCEPTION entries: $PIN_AUDIT"
 
-  if [[ -s $IPXE_BUILT ]]; then ok "iPXE: $(head -n1 "$IPXE_BUILT")"; else warn "iPXE not built or imported yet"; fi
+  if [[ $BOOT_LOADER == shim ]]; then
+    if shim_ready; then ok "Ubuntu's signed boot files (shim + grub) present"; else warn "Ubuntu's signed boot files not fetched yet (run: $0 shim-fetch)"; fi
+  elif [[ -s $IPXE_BUILT ]]; then ok "iPXE: $(head -n1 "$IPXE_BUILT")"; else warn "iPXE not built or imported yet"; fi
   if iso_is_verified; then ok "ISO present and verified"; elif [[ -s $ISO ]]; then warn "ISO present but not verified"; else warn "ISO not downloaded"; fi
   if [[ -f $LAYOUT ]]; then ok "Boot files extracted"; else warn "Not extracted yet"; fi
   if [[ -f $MANIFEST ]]; then ok "Configured (manifest present)"; else warn "Not configured yet"; fi
-  info "Client needs about $CLIENT_RAM_GB GB RAM. Disable Secure Boot and enable network (PXE) boot in its firmware."
+  if [[ $BOOT_LOADER == shim ]]; then
+    info "Client needs about $CLIENT_RAM_GB GB RAM and network (PXE) boot enabled. Leave Secure Boot as it is."
+  else
+    info "Client needs about $CLIENT_RAM_GB GB RAM and network (PXE) boot enabled. This loader is not Secure Boot signed: only Ubuntu has a signed route."
+  fi
 
   echo
   if (( fails == 0 )); then ok "All required checks passed"; else err "$fails required check(s) failed"; return 1; fi
@@ -3421,6 +4746,8 @@ clean() {
     ok "Extracted and served files removed"
   fi
   rm -f -- "$TFTP/boot.ipxe" "$TFTP/boot.ipxe.sig" "$TFTP/undionly.0" "$DNSMASQ_CONF" "$HTTP_LOG"
+  [[ ! -e $TFTP_SERVE ]] || chmod -R u+w "$TFTP_SERVE"
+  rm -rf -- "${TFTP_SERVE:?}"
   rm -f -- "$STATE"/*.layout "$STATE"/*.manifest "$STATE"/*.config
   rm -rf -- "${RUN:?}"
   ok "Generated configs and manifests removed"
@@ -3435,11 +4762,24 @@ mem_avail_mb() { awk '/MemAvailable/ {printf "%d", $2/1024}' /proc/meminfo 2>/de
 is_pid_alive() { [[ -n ${1:-} ]] && kill -0 "$1" 2>/dev/null; }
 
 PROFILE="$STATE/profile"
+PROFILE_IFACE_LOADED=0
 save_profile() {
   mkdir -p "$STATE"
-  { printf "DISTRO='%s'\n" "$DISTRO"; printf "TARGET_ARCH='%s'\n" "$TARGET_ARCH"
-    printf "DHCP_MODE='%s'\n" "$DHCP_MODE"; printf "IFACE='%s'\n" "${IFACE:-}"
-    printf "HTTP_PORT='%s'\n" "$HTTP_PORT"; } | atomic_write "$PROFILE" || true
+  local v
+  for v in "$DISTRO" "$TARGET_ARCH" "$DHCP_MODE" "$HTTP_PORT" "$USB_NET_IFACE" "$USB_NET_CIDR" "$BOOT_LOADER"; do
+    [[ $v != *"'"* && $v != *$'\n'* && $v != *$'\r'* ]] || { warn "Settings contain an unsafe character; profile was not updated."; return 1; }
+  done
+  [[ ${IFACE:-} != *"'"* && ${IFACE:-} != *$'\n'* && ${IFACE:-} != *$'\r'* ]] || { warn "Interface name contains an unsafe character; profile was not updated."; return 1; }
+  {
+    printf "DISTRO='%s'\n" "$DISTRO"
+    printf "TARGET_ARCH='%s'\n" "$TARGET_ARCH"
+    printf "DHCP_MODE='%s'\n" "$DHCP_MODE"
+    if [[ $DHCP_MODE != usb && ( " $CLI_SET " == *" IFACE "* || -n ${PRE_ENV[IFACE]:-} || $PROFILE_IFACE_LOADED == 1 ) ]]; then printf "IFACE='%s'\n" "${IFACE:-}"; fi
+    printf "HTTP_PORT='%s'\n" "$HTTP_PORT"
+    printf "USB_NET_IFACE='%s'\n" "$USB_NET_IFACE"
+    printf "USB_NET_CIDR='%s'\n" "$USB_NET_CIDR"
+    [[ $BOOT_LOADER_AUTO == 1 ]] || printf "BOOT_LOADER_PICK='%s'\n" "$BOOT_LOADER"
+  } | atomic_write "$PROFILE"
 }
 load_profile() {   # applies only values you did not give on the command line / environment
   [[ -r $PROFILE ]] || return 1
@@ -3450,8 +4790,23 @@ load_profile() {   # applies only values you did not give on the command line / 
     val=${val:1:${#val}-2}
     [[ $val != *\'* && -n $val ]] || continue
     case "$name" in
-      DISTRO|TARGET_ARCH|DHCP_MODE|IFACE|HTTP_PORT)
-        [[ " $CLI_SET " == *" $name "* || -n ${PRE_ENV[$name]:-} ]] || printf -v "$name" '%s' "$val" ;;
+      DISTRO|TARGET_ARCH|DHCP_MODE|IFACE|HTTP_PORT|USB_NET_IFACE|USB_NET_CIDR)
+        [[ $val != *$'\n'* && $val != *$'\r'* && $val != *\'* ]] || continue
+        case "$name" in
+          USB_NET_IFACE) [[ $val =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || continue ;;
+          USB_NET_CIDR) [[ $val =~ ^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}/(0|[1-9][0-9]?)$ ]] || continue ;;
+          HTTP_PORT) [[ $val =~ ^[0-9]{1,5}$ ]] && (( 10#$val >= 1 && 10#$val <= 65535 )) || continue ;;
+          IFACE) [[ $DHCP_MODE != usb && $val =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || continue ;;
+          DHCP_MODE) [[ $val == auto || $val == proxy || $val == direct || $val == usb ]] || continue ;;
+        esac
+        if [[ " $CLI_SET " != *" $name "* && -z ${PRE_ENV[$name]:-} ]]; then
+          printf -v "$name" '%s' "$val"
+          [[ $name != IFACE ]] || PROFILE_IFACE_LOADED=1
+        fi ;;
+      BOOT_LOADER_PICK)   # only a choice you made yourself is remembered; older profiles stored a default here
+        [[ $val == shim || $val == ipxe ]] || continue
+        [[ " $CLI_SET " == *" BOOT_LOADER "* || -n ${PRE_ENV[BOOT_LOADER]:-} ]] && continue
+        BOOT_LOADER=$val; BOOT_LOADER_AUTO=0 ;;
     esac
   done < "$PROFILE"
   return 0
@@ -3528,7 +4883,12 @@ diagnose() {
   elif [[ -s $TFTP/ipxe.efi && -f $IPXE_BUILT ]] && grep -q '^source=cloud' "$IPXE_BUILT"; then
     finding WARN LOADERTRUST "The iPXE loader came from GitHub without a saved approval" "$0 ipxe-fetch new"
   fi
+  if [[ $BOOT_LOADER == shim ]]; then
+    if shim_ready; then finding OK IPXE "Ubuntu's signed boot files present (Secure Boot ok)" ""
+    else finding FAIL IPXE "Ubuntu's signed boot files not fetched yet" "$0 shim-fetch"; fi
+  else
   [[ -s $TFTP/ipxe.efi ]] && finding OK IPXE "iPXE loader present" "" || finding FAIL IPXE "iPXE loader missing (this phone can build it itself)" "$([[ $HOST_ARCH == aarch64 && $TARGET_ARCH == x86_64 ]] && echo "$0 ipxe-phone" || echo "$0 build-ipxe")"
+  fi
   iso_is_verified && finding OK ISO "$P_LABEL image verified" "" || finding FAIL ISO "$P_LABEL image not downloaded/verified" "$0 --distro $DISTRO --arch $TARGET_ARCH fetch"
   [[ -f $LAYOUT ]] && finding OK EXTRACT "Boot files extracted" "" || finding FAIL EXTRACT "Boot files not extracted" "$0 --distro $DISTRO --arch $TARGET_ARCH extract"
   if [[ -f $MANIFEST && -f $TFTP/boot.ipxe ]]; then
@@ -3543,7 +4903,7 @@ diagnose() {
   fi
   # backups
   last=$(ls -1t "$BACKUP_DIR"/netboot-*.tar.gz 2>/dev/null | head -n1 || true)
-  if [[ -z $last ]]; then finding INFO BACKUP "No backup yet (one is taken automatically before serve)" ""
+  if [[ -z $last ]]; then finding INFO BACKUP "No backup (optional: $0 backup)" ""
   else
     age=$(( ( $(date +%s) - $(file_mtime "$last") ) / 3600 ))
     (( age < 168 )) && finding OK BACKUP "Last backup $age h ago" "" || finding WARN BACKUP "Last backup is $((age/24)) days old" "$0 backup"
@@ -3578,6 +4938,7 @@ verdict() {   # 0 ready, 1 attention
 }
 
 status() {
+  load_profile && set_distro || true
   printf '%sStatus: %s / %s  (network mode %s)%s\n' "$C_BOLD" "$P_LABEL" "$TARGET_ARCH" "$DHCP_MODE" "$C_RESET"
   diagnose; print_findings; verdict
 }
@@ -3587,7 +4948,12 @@ doctor() { status; }
 # Safe repairs only. Everything here is idempotent and never touches keys, backups, or downloads.
 heal_safe() {
   local did=0 d
-  if [[ $(journal_count) -gt 0 ]]; then journal_replay; did=1; fi
+  if [[ $(journal_count) -gt 0 ]]; then
+    if journal_replay; then did=1; else
+      warn "Automatic recovery is incomplete; retained the failing journal record(s) for another attempt."
+      return 1
+    fi
+  fi
   if orphans_running; then info "Stopping leftover server processes"; kill_servers; did=1; fi
   for d in "$HTTP.new" "$STATE"/.conf.* "$MANIFEST.tmp" "$MANIFEST.fp.tmp" "$VERIFY_REC.tmp" "$VERIFY_REC.sha"; do
     [[ -e $d ]] && { rm -rf -- "$d"; did=1; ok "Removed leftover: ${d#"$ROOT"/}"; }
@@ -3610,6 +4976,7 @@ heal_safe() {
 }
 
 heal() {
+  load_profile && set_distro || true
   info "Checking and repairing (safe fixes only; nothing is deleted that you cannot rebuild)"
   heal_safe
   diagnose
@@ -3721,6 +5088,8 @@ pick_goal() {
 }
 
 pc_instructions() {
+  local sb1="Secure Boot: this distro has no signed network route," sb2="so turn it OFF for this one (only Ubuntu works with it on)."
+  if [[ $BOOT_LOADER == shim ]]; then sb1="Do NOT touch Secure Boot. Leave it exactly as it is."; sb2="(Very old BIOS-only PCs cannot network-boot this way.)"; fi
   echo
   box \
     "NOW, ON THE PC YOU WANT TO BOOT:" \
@@ -3732,8 +5101,10 @@ pc_instructions() {
     "     (not sure? try F12, then Esc, then F2 to open settings)" \
     "3. Pick: Network, PXE, or IPv4 Network Boot. UEFI is fine." \
     "4. If it will not list network boot: in settings turn ON" \
-    "   network boot and turn OFF Secure Boot, then try again." \
+    "   network boot, then try again." \
     "" \
+    "$sb1" \
+    "$sb2" \
     "A good sign: text scrolls here when the PC asks for its files." \
     "Stop the server with Ctrl+C when the PC has booted."
   echo
@@ -3758,6 +5129,21 @@ EOF
 }
 
 # Picks the one screen that makes sense for the current state.
+# Everything in order, skipping what is already done
+run_all() {
+  once() { local d=$1; shift; if [[ $GUIDE_REDO != 1 ]] && "$d"; then info "Already done, skipping: $1"; else "$@"; fi; }
+  once g_done_deps deps
+  once g_done_attest attest_init
+  once g_done_sign self_sign
+  once g_done_pins pins_refresh
+  once g_done_ipxe build_ipxe
+  fetch
+  once g_done_extract extract
+  once g_done_configure configure
+  once g_done_report attest_report
+  serve
+}
+
 easy_home() {
   if [[ ! -t 0 || ! -t 1 ]]; then interactive; return; fi
   if (( IS_PROOT )); then proot_build_flow; return; fi
@@ -3877,6 +5263,12 @@ check_soft() {
 
 guided_run() {
   local title=$1 why=$2 donefn=$3 a; shift 3
+  # A finished step is skipped on its own. Use --redo to be offered it again.
+  if [[ -n $donefn && $GUIDE_REDO != 1 ]] && "$donefn"; then
+    GSTEP=$((GSTEP+1)); GUIDE_SKIPPED=$((GUIDE_SKIPPED+1))
+    printf '%s[+]%s Step %d of %d: %s %s(already done, skipping)%s\n' "$C_GREEN" "$C_RESET" "$GSTEP" "$GTOTAL" "$title" "$C_DIM" "$C_RESET"
+    return 0
+  fi
   gstep_head "$title" "$why"
   if [[ -n $donefn ]] && "$donefn"; then
     ok "Already done."
@@ -3896,18 +5288,79 @@ guided_run() {
   done
 }
 
+g_done_deps()    { [[ -z $(missing_tools) ]]; }
+g_done_check()   {   # the pre-flight only matters on a first run or when the basics are broken
+  g_done_deps && [[ -n $(attest_fpr) ]] || return 1
+  diagnose
+  local i
+  for i in "${!F_LVL[@]}"; do
+    [[ ${F_LVL[$i]} == FAIL ]] || continue
+    case "${F_TAG[$i]}" in DISK|FSTYPE|TOOLS) return 1 ;; esac
+  done
+  return 0
+}
 g_done_attest()  { [[ -n $(attest_fpr) ]]; }
-g_done_sign()    { [[ -s $ATTEST/script.sha256.asc ]]; }
-g_done_ipxe()    { [[ -s $TFTP/ipxe.efi ]]; }
+g_done_sign()    { [[ $(self_status) == ok ]]; }
+g_done_pins() {   # every server we talk to already has a valid pin
+  local h
+  for h in $(pin_hosts_for_target); do
+    [[ -n $(active_pins "$h") ]] || return 1
+  done
+  return 0
+}
+g_done_ipxe()    { if [[ $BOOT_LOADER == shim ]]; then shim_ready; else [[ -s $TFTP/ipxe.efi ]]; fi; }
 g_done_fetch()   { iso_is_verified; }
-g_done_extract() { [[ -f $LAYOUT ]]; }
+g_done_extract() {   # the layout record exists and the files it names are really there
+  [[ -f $LAYOUT ]] || return 1
+  ( KERNEL_REL=""; INITRD_REL=""; ROOTFS_REL=""
+    # shellcheck disable=SC1090
+    source "$LAYOUT"
+    [[ -s $HTTP/$KERNEL_REL && -s $HTTP/$INITRD_REL ]] && { [[ -z $ROOTFS_REL ]] || [[ -s $HTTP/$ROOTFS_REL ]]; } )
+}
+g_done_configure() {   # configured for the current network, the chosen loader, and the current extraction
+  local cfg_ip cur conf="$STATE/$DISTRO-$TARGET_ARCH.config"
+  [[ -f $MANIFEST && -f $TFTP/boot.ipxe && -f $conf ]] || return 1
+  [[ -f $LAYOUT && ! $LAYOUT -nt $MANIFEST ]] || return 1
+  if [[ $BOOT_LOADER == shim ]]; then
+    grep -q 'loader=shim' "$conf" || return 1
+  else
+    ! grep -q 'loader=shim' "$conf" || return 1
+  fi
+  cfg_ip=$(sed -n 's|^set base http://\([0-9.]*\):.*|\1|p' "$TFTP/boot.ipxe" | head -n1)
+  cur=$( ( LOG_QUIET=1; resolve_network >/dev/null 2>&1 && printf '%s' "$PHONE_IP" ) 2>/dev/null || true )
+  [[ -n $cur && $cur == "$cfg_ip" ]]
+}
+g_done_report() {   # a signed report newer than the current configuration
+  local latest
+  latest=$(ls -1t "$ATTEST"/reports/*.asc 2>/dev/null | head -n1 || true)
+  [[ -n $latest && -f $MANIFEST && ! $MANIFEST -nt $latest ]]
+}
 
 guided_ipxe() {
   local host_cpu c
+  if g_done_ipxe && [[ $GUIDE_REDO != 1 ]]; then
+    GSTEP=$((GSTEP+1)); GUIDE_SKIPPED=$((GUIDE_SKIPPED+1))
+    printf '%s[+]%s Step %d of %d: Boot loader %s(already in place, skipping)%s\n' "$C_GREEN" "$C_RESET" "$GSTEP" "$GTOTAL" "$C_DIM" "$C_RESET"
+    return 0
+  fi
   gstep_head "Get the network-boot loader (iPXE)" \
     "iPXE is the tiny program the PC runs first. It is built with YOUR key inside," \
     "so it only boots files you signed. Building takes 10-30 minutes on a phone."
   if g_done_ipxe; then ok "Already done."; ask_yn "Do it again anyway?" n || return 0; fi
+  if shim_supported; then
+    echo
+    say "${C_BOLD}Ubuntu can use its own signed boot files, which is the easy way:${C_RESET}"
+    say "  1) Ubuntu's signed boot files  ${C_GREEN}recommended: nothing to build, ready in about a minute${C_RESET}"
+    hint "   You never touch Secure Boot, on or off. For UEFI PCs (almost all since about 2012), not very old BIOS-only ones."
+    say "  2) iPXE with your own certificate  ${C_DIM}(a signed chain you control; has to be built or fetched)${C_RESET}"
+    read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Choose 1 or 2 [1]: " c || c=""
+    if [[ ${c:-1} != 2 ]]; then
+      BOOT_LOADER=shim; BOOT_LOADER_AUTO=0; save_profile
+      ( shim_fetch ) && ok "Ubuntu's signed boot files are ready" || warn "That did not finish. Run it again: $0 shim-fetch"
+      return 0
+    fi
+    BOOT_LOADER=ipxe; BOOT_LOADER_AUTO=0; save_profile
+  fi
   host_cpu=$(uname -m); [[ $host_cpu == aarch64 ]] && host_cpu=arm64
   if [[ $host_cpu == "$TARGET_ARCH" ]]; then
     hint "This device matches the PC's CPU ($TARGET_ARCH), so building here works and keeps everything on this device."
@@ -4071,9 +5524,18 @@ offsite_wizard() {
     fi
   fi
 
-  # 4. test
+  # 4. automatic backups: off unless you say so
   say ""
-  if ask_yn "Run a test backup now to try it out?" y; then
+  if ask_yn "Also take a backup automatically before each serve? (otherwise only when you run: $0 backup)" n; then
+    save_setting AUTO_BACKUP 1 && ok "Automatic backups are ON"
+  else
+    save_setting AUTO_BACKUP 0
+    info "Backups will only happen when you ask: $0 backup"
+  fi
+
+  # 5. test
+  say ""
+  if [[ -n ${GDRIVE_REMOTE:-}${TERABOX_COOKIE_FILE:-} ]] && ask_yn "Take a one-off test backup now to try the cloud copy?" n; then
     ( backup_create test ) || warn "The test did not finish. Your settings are saved; fix the issue and test again from the menu."
   fi
   ok "Settings saved in $STATE/backup.conf. serve and clean will use them automatically."
@@ -4091,50 +5553,62 @@ guided() {
       "- Every step says what it does, in plain words." \
       "- Press Enter to accept the suggested answer (shown in capitals)." \
       "- Type q at any question to stop safely." \
-      "- Nothing is deleted. A backup of your working folder is taken" \
-      "  before the server starts."
+      "- Nothing is deleted. Backups are optional and only" \
+      "  happen when you ask (the backup step, or --backup)."
     say ""
     ask_yn "Ready to begin?" y || { info "OK. Come back any time."; return 0; }
   fi
 
   load_profile && set_distro || true
-  gstep_head "Choose what to boot" \
-    "Now: $P_LABEL on a $TARGET_ARCH PC."
-  if [[ -r $PROFILE ]]; then
-    if ask_yn "Change that?" n; then pick_goal; fi
+  if [[ -r $PROFILE && $GUIDE_REDO != 1 ]]; then
+    GSTEP=$((GSTEP+1)); GUIDE_SKIPPED=$((GUIDE_SKIPPED+1))
+    printf '%s[+]%s Step %d of %d: What to boot: %s %s(saved choice; change it with: %s guide --redo)%s\n' "$C_GREEN" "$C_RESET" "$GSTEP" "$GTOTAL" "$P_LABEL" "$C_DIM" "$0" "$C_RESET"
   else
-    pick_goal
+    gstep_head "Choose what to boot" \
+      "Now: $P_LABEL on a $TARGET_ARCH PC."
+    if [[ -r $PROFILE ]]; then
+      if ask_yn "Change that?" n; then pick_goal; fi
+    else
+      pick_goal
+    fi
   fi
 
   guided_run "Check this device" \
-    "Looks for root, tools, free space and network. Safe: it only reads things. (under a minute)" "" check_soft
+    "Looks for root, tools, free space and network. Safe: it only reads things. (under a minute)" g_done_check check_soft
   guided_run "Install the tools needed" \
-    "Installs packages such as dnsmasq, python, gpg. Needs internet. (2-5 minutes)" "" deps
+    "Installs packages such as dnsmasq, python, gpg. Needs internet. (2-5 minutes)" g_done_deps deps
   guided_run "Create your private keys" \
     "Makes a signing key and a small certificate authority that live only on this device." g_done_attest attest_init
   guided_run "Sign this script" \
     "Records the script's fingerprint so any later tampering is noticed." g_done_sign self_sign
   guided_run "Check the download servers" \
-    "Confirms each vendor's server identity against public logs before trusting it. (about a minute)" "" pins_refresh
+    "Confirms each vendor's server identity against public logs before trusting it. (about a minute)" g_done_pins pins_refresh
   guided_ipxe
   guided_run "Download and verify the Linux image" \
     "Downloads $P_LABEL and checks the vendor's signature. Large download, so use Wi-Fi. (10-40 minutes; safe to stop and resume)" g_done_fetch fetch
   guided_run "Unpack the boot files" \
     "Pulls the kernel and files the PC needs out of the image. (1-5 minutes)" g_done_extract extract
   guided_run "Sign and prepare everything" \
-    "Signs the boot files with your key and writes the server settings for your current network." "" configure
+    "Signs the boot files with your key and writes the server settings for your current network." g_done_configure configure
 
-  gstep_head "Cloud backups (optional)" \
-    "Adds an encrypted offsite copy of your keys and settings to Google One and/or Terabox."
-  offsite_wizard
+  if [[ -f $STATE/offsite.asked && $GUIDE_REDO != 1 ]]; then
+    GSTEP=$((GSTEP+1)); GUIDE_SKIPPED=$((GUIDE_SKIPPED+1))
+    printf '%s[+]%s Step %d of %d: Cloud backups %s(already decided, skipping; change with: %s backup-setup)%s\n' "$C_GREEN" "$C_RESET" "$GSTEP" "$GTOTAL" "$C_DIM" "$0" "$C_RESET"
+  else
+    gstep_head "Cloud backups (optional)" \
+      "Adds an encrypted offsite copy of your keys and settings to Google One and/or Terabox."
+    offsite_wizard
+    : > "$STATE/offsite.asked"
+  fi
 
   guided_run "Write the signed report" \
-    "A signed record of everything above that you can re-check later." "" attest_report
+    "A signed record of everything above that you can re-check later." g_done_report attest_report
 
+  (( GUIDE_SKIPPED == 0 )) || info "Skipped $GUIDE_SKIPPED step(s) that were already done. (--redo shows them again.)"
   gstep_head "Start the boot server" \
-    "Plug the PC into the same network (or cable), set it to network (PXE) boot," \
-    "Secure Boot off, then power it on. Press Ctrl+C here to stop the server."
-  hint "A backup of your working folder is taken first, automatically."
+    "Plug the PC into the same network (or cable) and set it to network (PXE)" \
+    "boot, then power it on. Press Ctrl+C here to stop the server."
+  hint "No backup is taken unless you ask for one (./netboot-android.sh backup, or --backup)."
   if ask_yn "Start the server now?" y; then
     run_step serve
   else
@@ -4160,7 +5634,7 @@ choose_target() {
       *) warn "Enter 1 or 2" ;;
     esac
   done
-  echo "Select the live system:"
+  echo "Select the OS or installer:"
   select choice in \
     "ubuntu        Ubuntu 26.04.1 desktop        (x86_64, arm64)" \
     "ubuntu24      Ubuntu 24.04.5.1 desktop      (x86_64)" \
@@ -4168,7 +5642,8 @@ choose_target() {
     "fedora        Fedora Workstation 44 live    (x86_64)" \
     "arch          Arch Linux latest             (x86_64)" \
     "systemrescue  SystemRescue 13.02            (x86_64)" \
-    "parrot        Parrot Security 7.4           (x86_64, arm64)"; do
+    "parrot        Parrot Security 7.4           (x86_64, arm64)" \
+    "windows       Windows Setup from WIM-based ISO (x86_64)"; do
     case "$REPLY" in
       1) DISTRO=ubuntu; break ;;
       2) DISTRO=ubuntu24; break ;;
@@ -4177,9 +5652,14 @@ choose_target() {
       5) DISTRO=arch; break ;;
       6) DISTRO=systemrescue; break ;;
       7) DISTRO=parrot; break ;;
-      *) warn "Enter a number from 1 to 7" ;;
+      8) DISTRO=windows; break ;;
+      *) warn "Enter a number from 1 to 8" ;;
     esac
   done
+  if [[ ( $DISTRO == win11 || $DISTRO == windows ) && $TARGET_ARCH != x86_64 ]]; then
+    warn "WIM-based Windows PXE setup is x86_64 only; switching the target architecture to x86_64."
+    TARGET_ARCH=x86_64
+  fi
   ( set_distro ) || { warn "That combination is not available"; return 0; }
   set_distro
   ok "Target: $P_LABEL / $TARGET_ARCH (client RAM about $CLIENT_RAM_GB GB)"
@@ -4191,12 +5671,14 @@ choose_mode() {
   select choice in \
     "auto    Detect" \
     "proxy   Same Wi-Fi/router network (router keeps handing out addresses)" \
-    "direct  Ethernet cable straight from this device to the PC"; do
+    "direct  Ethernet cable straight from this device to the PC" \
+    "usb     Android USB RNDIS link (ADB and the current USB mode pause while serving)"; do
     case "$REPLY" in
       1) DHCP_MODE=auto; break ;;
       2) DHCP_MODE=proxy; break ;;
       3) DHCP_MODE=direct; break ;;
-      *) warn "Enter 1, 2, or 3" ;;
+      4) DHCP_MODE=usb; break ;;
+      *) warn "Enter 1, 2, 3, or 4" ;;
     esac
   done
   ok "Network mode: $DHCP_MODE"
@@ -4282,24 +5764,24 @@ interactive() {
 usage() {
   cat <<EOF
 netboot-android.sh $SCRIPT_VERSION
-Verified PXE live boot of Linux ISOs from a rooted Android phone or any Linux host.
+Verified PXE boot of Linux ISOs and WIM-based Windows Setup media from Android or Linux.
 
 START HERE
-  $0                         Run with no arguments and press Enter. It asks one simple
-                             question the first time, then sets everything up for you.
-  $0 go                      Already set up? Start serving a PC right now.
+  $0                         Open the easy screen. Choose guided setup the first time.
+  $0 guide                   Walk through setup one step at a time.
+  $0 go                      After setup, check everything and start serving a PC.
   $0 status                  What is ready, and what needs attention.
   $0 shortcut                Make a one-tap "Boot-a-PC" button (Termux:Widget).
 
 USAGE
-  $0 [--distro NAME] [--arch ARCH] [--mode MODE] [--iface IF] COMMAND [args]
+  $0 [--distro NAME] [--arch ARCH] [--mode MODE] [--iface IF] [--iso PATH] [--sha256 HEX] COMMAND [args]
   $0 -h | --help
   $0                         (no arguments: the easy screen for your situation)
   $0 --yes COMMAND           (accept suggested answers; never trusts a changed script)
 
 FIRST RUN, IN ORDER
   check, deps, attest-init, self-sign, pins refresh, build-ipxe (or import-ipxe),
-  fetch, extract, configure, attest, serve
+  fetch, extract, configure, attest, serve. The guide runs these steps for you.
 
 COMMANDS
   go                    Heal, check, and start serving with your last settings (daily/emergency)
@@ -4310,7 +5792,7 @@ COMMANDS
   easy                  The zero-argument screen (same as running with no arguments)
   menu                  Full menu of every step
   shortcut              Create the one-tap Termux:Widget "Boot-a-PC" shortcut
-  guide                 Step-by-step guided setup (best for first time)
+  guide [--redo]        Guided setup; completed steps are skipped unless you use --redo
   ui, interactive       Menu of every step (no arguments does this too)
   backup-setup          Guided setup of Google One / Terabox cloud backups
   check                 Pre-flight: root, tools, ports 67/69/4011/$HTTP_PORT, storage,
@@ -4330,13 +5812,19 @@ COMMANDS
   build-ipxe            Build iPXE at IPXE_COMMIT with the boot CA and a
                         verify-first script embedded
   import-ipxe DIR       Use iPXE binaries built on another machine
+  shim-fetch            Ubuntu only: get Ubuntu's own signed boot files (shim + grub). No building,
+                        works with Secure Boot on or off (UEFI PCs). Use with --shim or BOOT_LOADER=shim
+  usb-boot [stop|check] No network at all: the phone shows the verified ISO to a PC as a read-only USB drive
+                        (rooted phone with USB mass-storage support; plug the phone into the PC and boot from USB)
+  usb-netboot stop    Restore the previous Android USB function after an interrupted RNDIS session
   ipxe-phone            Build the x86_64 loader ON THIS PHONE (sets up a small compiler first)
   proot-build           Inside a proot Linux on the phone: build the loader for your Termux install
   xbuild-setup          Only set up that on-phone compiler (Debian via proot-distro)
   ipxe-cloud            Build the loader on GitHub instead (WEAKER trust; asks first)
   ipxe-request          Print what to paste into the GitHub build page
   ipxe-fetch [new]      Download, verify, pin, and install the GitHub-built loader (new = replace the pinned one)
-  fetch                 Download the ISO and verify it against the vendor key
+  fetch                 Download a Linux ISO and verify its vendor signature/checksum
+                        Windows: verify a local ISO against the required SHA-256 pin
   extract               Pull kernel, initrd, root image (and microcode) from the ISO
   configure             Sign boot files, write boot.ipxe, dnsmasq.conf, and the manifest
   attest                Write a signed attestation report (also served to clients)
@@ -4344,21 +5832,35 @@ COMMANDS
   backup                Archive the working folder (SHA-256 sidecar) into $BACKUP_DIR
   terabox-install       Build the unofficial Terabox CLI (fcr--/tbc, pinned) for offsite backups
   backup-list           List backups, newest first
+  backup-auto on|off    Make backups automatic before serve and clean (off is the default); when on it
+                        skips itself if nothing changed. --backup asks for one on a single run
   restore ARCHIVE       Verify a backup, save the current state, then restore it
                         (add --dry-run to only list what would be replaced)
-  serve                 Backs up the working folder, integrity gate, then HTTP + dnsmasq (DHCP/TFTP) as root
+  serve                 Check file integrity, then start HTTP + dnsmasq (DHCP/TFTP) as root
+                        Automatic backup is off by default; turn it on with backup-auto on
   logs                  Follow the HTTP access log
   selinux {status|permissive|enforcing}
                         Android only. Permissive lowers device security.
-  clean                 Back up, stop servers, remove generated files (keeps ISOs, keys, pins)
+  clean                 Stop servers and remove generated files (keeps ISOs, keys, pins)
+                        Automatic backup is off by default; turn it on with backup-auto on
   all                   deps, attest-init, self-sign, pins refresh, build-ipxe, fetch,
                         extract, configure, attest, serve
 
 OPTIONS
-  --distro NAME   ubuntu (default), ubuntu24, debian, fedora, arch, systemrescue, parrot
+  --distro NAME   ubuntu (default), ubuntu24, debian, fedora, arch, systemrescue, parrot, windows (win11 alias)
   --arch ARCH     x86_64 (default) or arm64: the CPU of the PC that boots, not this device
-  --mode MODE     auto (default), proxy (existing router DHCP), direct (cable to the PC)
+  --iso PATH      Optional source ISO path; filename can be anything. Windows also scans
+                  detected download folders and adopts only a file matching --sha256.
+  --sha256 HEX    Expected Windows ISO SHA-256 (64 hex characters, from a trusted source)
+                  Windows ISO bytes are re-hashed before use and again before HTTP listens.
+  --mode MODE     auto, proxy, direct, or usb (Android USB RNDIS gadget; interrupts ADB/USB mode)
   --iface IF      Network interface (default: detected)
+
+RECOVERY AND STATE
+  USB network settings persist in the local profile. Before changing host USB, address,
+  route, or Wi-Fi state, the script syncs a private undo journal. Ctrl+C, TERM, and HUP
+  attempt immediate rollback; after a forced kill or power loss, the next locked command
+  replays the journal. Run '$0 heal' explicitly to inspect and retry recovery.
 
 TARGETS
   ubuntu        Ubuntu 26.04.1 desktop       x86_64, arm64   client RAM ~10 GB (arm64 ~7)
@@ -4367,16 +5869,45 @@ TARGETS
   fedora        Fedora Workstation 44 live   x86_64          client RAM ~6 GB
   arch          Arch Linux latest            x86_64          client RAM ~4 GB
   systemrescue  SystemRescue 13.02           x86_64          client RAM ~4 GB
+  windows       Windows Setup (WIM-based PXE) x86_64           WIM ISO + trusted SHA-256 pin; older bootable ISOs via usb-boot
   parrot        Parrot Security 7.4          x86_64, arm64   client RAM ~12 GB
 
+WINDOWS ISO SAFETY AND LIMITS
+  The PXE installer supports x86_64 WIM-based media containing boot/BCD,
+  boot/boot.sdi, and sources/boot.wim. It does not guarantee every Windows
+  release, custom ISO, or PC will work. Windows media is local by default:
+  place it in a detected download folder or pass --iso PATH.
+  Supply the expected 64-character SHA-256 with --sha256 or ISO_SHA256.
+  Get that value separately from a source you trust. Matching the value proves
+  only that the ISO bytes match it; it does not prove Microsoft made the ISO.
+  Windows Setup can start from the PXE boot files, but installation needs a
+  separate source; the streamed ISO URL is not an automatic install source.
+  For other bootable Windows ISOs, usb-boot may work if the phone and PC support it.
+
+NETWORK AND SECURITY NOTES
+  serve starts local DHCP/PXE, TFTP, and HTTP services. They have no password
+  and use unencrypted transfers. Use a private network you trust; never expose
+  these ports to the public internet. Proxy is for a normal router network.
+  Direct mode must be the only DHCP server on a direct or isolated link.
+  Windows and most custom iPXE routes need Secure Boot off. Ubuntu has its own
+  signed route on supported PCs. Follow the on-screen instructions.
+  A matching hash, local signatures, and this script's checks cannot prove
+  every downloaded file or source is harmless. Review and trust the script,
+  ISO, hash source, and package repositories before use.
+
 ENVIRONMENT VARIABLES
-  NETBOOT_HOME          Working directory                         (default: ~/netboot)
+  NETBOOT_HOME          Working directory                         (default: auto-selected from writable host data storage with the most free space)
+  EXTRA_ISO_DIRS        Additional local folders to search, separated by colons
   IFACE                 Network interface                         (default: detected)
   NET                   Network address override                  (default: detected)
   HTTP_PORT             HTTP port                                 (default: 8000)
-  DHCP_MODE             auto | proxy | direct                     (default: auto)
+  DHCP_MODE             auto | proxy | direct | usb               (default: auto)
   DIRECT_CIDR           Address used in direct mode               (default: 10.42.0.1/24)
+  USB_NET_IFACE         USB RNDIS network interface                (default: usb0)
+  USB_NET_CIDR          USB link address and DHCP subnet            (default: 192.168.42.1/24)
+  USB_GADGET_VID/PID    USB vendor/product IDs; Android IDs are detected when available
   ISO_URL               Override the ISO URL (must still be listed in the vendor checksums)
+  ISO_SHA256            Expected Windows ISO SHA-256 (same as --sha256; required for Windows)
   SUMS_URL, SUMS_SIG_URL, ISO_SIG_URL
                         Override verification sources
   KEY_FPR               Override the vendor signing key fingerprint
@@ -4394,9 +5925,11 @@ ENVIRONMENT VARIABLES
   MIN_FREE_MB           Storage required by check                 (default: per target)
   CT_BOOTSTRAP=1        Reach the CT API without a pin, once, if its pins expired
   ALLOW_UNPINNED=1      Fetch transport-trusted content without a pin (not recommended)
-  ALLOW_UNVERIFIED=1    Accept an ISO with no verified signature (not recommended)
+  ALLOW_UNVERIFIED=1    Accept an ISO with no verified signature (ignored for Windows)
+  IPXE_ALLOW_UNATTESTED=1
+                        Accept a cloud-built iPXE loader without valid provenance (not recommended)
   ACCEPT_SCRIPT_CHANGE=1  Run even though the script changed since self-sign
-  AUTO_BACKUP           1 (default): back up before serve and clean. 0: skip
+  AUTO_BACKUP           0 (default): backups only when you ask. 1: also back up before serve and clean (only if something changed)
   BACKUP_DIR            Where backups go                          (default: ~/netboot-backups)
   BACKUP_KEEP           Newest backups kept                       (default: 5)
   BACKUP_DL             1: include downloads/ (ISOs) in backups   (default: 0)
@@ -4414,14 +5947,28 @@ BUILDING iPXE FOR A DIFFERENT CPU
   the PC's iPXE natively. Copy $ATTEST/ca.crt and this script to any x86_64 Linux
   machine, then run:
     TRUST_CA=ca.crt FALLBACK_SERVER=<phone IP> ./netboot-android.sh --arch x86_64 build-ipxe
-  Copy ~/netboot/tftp/ipxe.efi and undionly.kpxe back to the phone and run:
+  Copy $TFTP/ipxe.efi and undionly.kpxe back to the phone and run:
     ./netboot-android.sh import-ipxe DIR
+
+HOST AND CLIENT COMPATIBILITY
+  The server requires Linux, or rooted Android/Termux with the required kernel
+  USB-gadget features. Windows PXE clients must be x86_64 and support network
+  boot; USB-RNDIS boot also depends on firmware and the Android kernel exposing
+  RNDIS. No script can add PXE or gadget support to firmware/kernel hardware
+  that does not provide it. Native Windows and macOS are not server hosts.
+  The storage root is selected from writable host data directories; each
+  distro/architecture gets its own ISO and state filenames. Windows ISO lookup
+  can scan common download directories and adopts a file only when its full
+  SHA-256 matches the supplied trusted pin.
 
 EXAMPLES
   $0 --distro debian all                       Full verified setup for Debian live
   $0 pins refresh                              Re-validate pins against CT
   $0 --mode direct --iface eth0 serve          Cable from a USB Ethernet adapter to the PC
+  $0 --mode usb --distro windows serve         Android RNDIS bridge; UEFI must support USB network boot
   $0 --distro parrot --arch arm64 fetch        Download and verify Parrot for an ARM64 PC
+  $0 --distro windows --sha256 TRUSTED_64_HEX_DIGEST fetch
+  $0 --distro windows --iso "/path/to/any-named-Windows.iso" --sha256 TRUSTED_64_HEX_DIGEST all
   $0 verify-attest                             Prove nothing changed since the last report
   $0 fingerprints                              Values to compare on another device
 EOF
@@ -4436,6 +5983,14 @@ parse_args() {
       -h|--help)  usage; exit 0 ;;
       --dry-run)  DRY_RUN=1 ;;
       -y|--yes)   ASSUME_YES=1 ;;
+      --no-backup) AUTO_BACKUP=0 ;;
+      --redo)      GUIDE_REDO=1 ;;
+      --backup)    AUTO_BACKUP=1 ;;
+      --shim|--secure-boot) BOOT_LOADER=shim; BOOT_LOADER_AUTO=0; CLI_SET+=" BOOT_LOADER" ;;
+      --iso)      [[ $# -ge 2 ]] || die "--iso requires a path"; ISO_FILE="$2"; shift ;;
+      --iso=*)    ISO_FILE="${1#*=}" ;;
+      --sha256)   [[ $# -ge 2 ]] || die "--sha256 requires a 64-character SHA-256 digest"; U_ISO_SHA256="$2"; shift ;;
+      --sha256=*) U_ISO_SHA256="${1#*=}" ;;
       --distro)   [[ $# -ge 2 ]] || die "--distro requires a value"; DISTRO="$2"; CLI_SET+=" DISTRO"; shift ;;
       --distro=*) DISTRO="${1#*=}"; CLI_SET+=" DISTRO" ;;
       --arch)     [[ $# -ge 2 ]] || die "--arch requires a value"; TARGET_ARCH="$2"; CLI_SET+=" TARGET_ARCH"; shift ;;
@@ -4454,14 +6009,19 @@ parse_args() {
 if [[ ${NETBOOT_SOURCE_ONLY:-0} == 1 ]]; then return 0; fi   # lets tests source the functions
 parse_args "$@"
 COMMAND="${COMMAND:-ui}"
+load_profile || true
 set_distro
 case "$COMMAND" in
   help|fingerprints|release-stamp|verify-upstream) ;;
   *) guard_root; log_rotate ;;
 esac
 case "$COMMAND" in
-  deps|attest-init|self-sign|pins|build-ipxe|ipxe-phone|xbuild-setup|import-ipxe|proot-build|fetch|extract|configure|attest|serve|clean|backup|restore|terabox-install|all)
+  deps|attest-init|self-sign|pins|build-ipxe|ipxe-phone|shim-fetch|xbuild-setup|import-ipxe|proot-build|fetch|extract|configure|attest|serve|usb-boot|usb-netboot|clean|backup|restore|terabox-install|all)
     acquire_lock ;;
+esac
+case "$COMMAND" in
+  deps|attest-init|self-sign|pins|build-ipxe|ipxe-phone|shim-fetch|xbuild-setup|import-ipxe|proot-build|fetch|extract|configure|attest|serve|usb-boot|usb-netboot|clean|backup|restore|terabox-install|all)
+    journal_replay || die "$E_ENV" "Earlier host changes remain unrecovered. Run '$0 heal' before continuing." ;;
 esac
 
 case "$COMMAND" in
@@ -4499,6 +6059,9 @@ case "$COMMAND" in
   build-ipxe)     build_ipxe ;;
   import-ipxe)    import_ipxe "${POSITIONAL[0]:-}" ;;
   ipxe-phone)     ipxe_phone ;;
+  shim-fetch)     shim_fetch ;;
+  usb-boot)       usb_boot "${POSITIONAL[0]:-start}" ;;
+  usb-netboot)    usb_netboot "${POSITIONAL[0]:-stop}" ;;
   proot-build)    proot_build_flow ;;
   xbuild-setup)   xbox_setup ;;
   ipxe-request)   ipxe_request ;;
@@ -4511,6 +6074,7 @@ case "$COMMAND" in
   verify-attest)  verify_attest "${POSITIONAL[0]:-}" ;;
   backup)         backup_create manual ;;
   backup-list)    backup_list ;;
+  backup-auto)    backup_auto_cmd "${POSITIONAL[0]:-}" ;;
   terabox-install) terabox_install ;;
   restore)        restore "${POSITIONAL[0]:-}" ;;
   serve)          serve ;;
@@ -4518,18 +6082,9 @@ case "$COMMAND" in
   selinux)        selinux_ctl "${POSITIONAL[0]:-status}" ;;
   clean)          clean ;;
   all)
-    deps
-    attest_init
-    [[ -s $ATTEST/script.sha256.asc ]] || self_sign
-    pins_refresh
-    build_ipxe
-    fetch
-    extract
-    configure
-    attest_report
-    serve ;;
+    run_all ;;
   *)
-    known_cmds="go status heal doctor guide easy menu check deps fetch extract configure serve backup restore shortcut verify clean logs"
+    known_cmds="go status heal doctor guide easy menu check deps fetch extract configure serve usb-boot usb-netboot backup restore shortcut verify clean logs"
     sugg=$( { compgen -W "$known_cmds" -- "${COMMAND:0:2}" || compgen -W "$known_cmds" -- "${COMMAND:0:1}" || true; } | tr '\n' ' ')
     err "Unknown command: $COMMAND"
     say "Did you mean: ${sugg:-go, status, heal, guide}"
