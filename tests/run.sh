@@ -231,6 +231,7 @@ test_watchdog_restarts_httpd() {
   export PIDFILE="$RUN/dnsmasq.pid"; mkdir -p "$RUN"
   DNSMASQ="$T/fake-dnsmasq"; DNSMASQ_CONF="$T/dm.conf"; touch "$DNSMASQ_CONF"; DNS_LOG="$ROOT/dnsmasq.log"
   net_check() { :; }
+  trusted_dnsmasq_binary() { :; }  # isolate watchdog behavior from the production binary trust gate
   start_dns; sleep 1
   watchdog >"$T/wd.out" 2>&1 & w=$!
   sleep 3; kill -9 "$SERVE_HTTP_PID"; sleep 8
@@ -883,7 +884,7 @@ test_importing_your_own_loader_replaces_the_github_approval() {
   assert "pinned first" test -s "$STATE/loader-x86_64.pin"
   mkdir -p "$T/mine"; cp "$TFTP/ipxe.efi" "$T/mine/ipxe.efi"; cp "$TFTP/undionly.kpxe" "$T/mine/undionly.kpxe"
   printf 'x' >> "$T/mine/undionly.kpxe"          # a different, self-built file
-  ( import_ipxe "$T/mine" ) >"$T/i.out" 2>&1
+  ( import_ipxe "$T/mine" <<<"y" ) >"$T/i.out" 2>&1
   stop_fake_github
   assert "approval cleared" test ! -s "$STATE/loader-x86_64.pin"
   assert "tells you" grep -q 'approval was cleared' "$T/i.out"
