@@ -272,10 +272,8 @@ WINDOWS_LANG="${WINDOWS_LANG:-}"
 SERVE_HTTP_PID=""
 TAIL_PID=""
 DNS_LOG=""
-DIRECT_ADDED=0
 JID_DIRECT=""
 JID_POWER=""
-POWER_TWEAKED=0
 COMMAND=""
 DRY_RUN=0
 ASSUME_YES=0
@@ -872,7 +870,6 @@ set_distro() {
   WIN_PIN_SOURCE=""
   WIN_PIN_LANG=""
   WIN_API_SKU=""
-  WIN_API_LANG=""
   if [[ $DISTRO == windows || $DISTRO == win11 ]]; then
     if [[ ${U_ISO_SHA256,,} =~ ^[[:xdigit:]]{64}$ ]]; then
       WIN_PIN_SOURCE="operator-supplied"
@@ -3151,7 +3148,7 @@ windows_choose_language() {
     }
     choice=${sku_rows[10#$n-1]}
   fi
-  IFS=$'\t' read -r WIN_API_SKU WIN_API_LANG WIN_PIN_LANG <<<"$choice"
+  IFS=$'\t' read -r WIN_API_SKU _ WIN_PIN_LANG <<<"$choice"
   ISO_SHA256=$("$PYTHON" "$LIB/windows_iso.py" match "$WIN_HASH_PAGE" "$WIN_PIN_LANG") || {
     WINDOWS_API_ERROR="Microsoft's selected language did not uniquely match its published checksum table."
     return 1
@@ -3178,7 +3175,7 @@ windows_resolve_download() {
     windows_manual_fallback "$WINDOWS_API_ERROR"
     return 1
   }
-  if [[ ${current_hash,,} != ${ISO_SHA256,,} ]]; then
+  if [[ ${current_hash,,} != "${ISO_SHA256,,}" ]]; then
     WINDOWS_API_ERROR="Microsoft's current ISO hash for $WIN_PIN_LANG differs from the saved pin; refusing to download a different image."
     windows_manual_fallback "$WINDOWS_API_ERROR"
     return 1
@@ -3193,7 +3190,6 @@ windows_resolve_download() {
     while IFS=$'\t' read -r id lang label; do
       if [[ "${label,,}" == "${WIN_PIN_LANG,,}" || "${lang,,}" == "${WIN_PIN_LANG,,}" ]]; then
         sku=$id
-        WIN_API_LANG=$lang
         break
       fi
     done <<<"$rows"
@@ -4467,24 +4463,22 @@ setup_direct() {
     [[ -z $from_pref ]] || run_root "ip -4 rule add from '$ip' lookup main pref '$from_pref'" || die "$E_ENV" "Could not add the isolated source route rule."
     [[ -z $to_pref ]] || run_root "ip -4 rule add to '$NET/$PREFIX_LEN' lookup main pref '$to_pref'" || die "$E_ENV" "Could not add the isolated subnet route rule."
   fi
-  DIRECT_ADDED=$(( addr_missing || ${#undo_steps[@]} > 0 ))
 }
 
 teardown_direct() {
   [[ -n ${JID_DIRECT:-} ]] || return 0
   journal_apply "$JID_DIRECT" || return 1
   JID_DIRECT=""
-  DIRECT_ADDED=0
 }
 
 power_save_off() {
   if (( IS_ANDROID )); then
     JID_POWER=$(journal_push "if command -v iw >/dev/null 2>&1 && iw dev '$IFACE' set power_save on 2>/dev/null; then exit 0; fi; cmd wifi force-hi-perf-mode disabled 2>/dev/null")
     if run_root "command -v iw >/dev/null 2>&1 && iw dev $IFACE set power_save off" >/dev/null 2>&1; then
-      ok "Wi-Fi power save disabled on $IFACE (iw)"; POWER_TWEAKED=1; return 0
+      ok "Wi-Fi power save disabled on $IFACE (iw)"; return 0
     fi
     if run_root "cmd wifi force-hi-perf-mode enabled" >/dev/null 2>&1; then
-      ok "Wi-Fi high-performance mode enabled"; POWER_TWEAKED=1; return 0
+      ok "Wi-Fi high-performance mode enabled"; return 0
     fi
     warn "Could not change Wi-Fi power save. Recovery record retained in case the setting changed partially; keep the screen on and Termux set to unrestricted battery use."
   fi
@@ -4494,7 +4488,6 @@ power_save_restore() {
   [[ -n $JID_POWER ]] || return 0
   journal_apply "$JID_POWER" || return 1
   JID_POWER=""
-  POWER_TWEAKED=0
 }
 
 kill_servers() {
@@ -4687,7 +4680,7 @@ ln -sf \"\$G/functions/mass_storage.nb0\" '$cfgdir/f_nb'" >/dev/null 2>"$RUN/usb
 }
 
 usb_boot_start() {
-  local udc g prev_cfg bindings g_path size_mb vid pid bound_g bound_udc
+  local udc prev_cfg bindings g_path size_mb vid pid bound_g bound_udc
   (( IS_PROOT )) && die "$E_ENV" "You are inside proot. Leave it ('exit') and run this in Termux."
   [[ -s $ISO ]] || die "$E_ENV" "No ISO downloaded yet. Run: $0 fetch"
   iso_is_verified || die "$E_INTEGRITY" "The ISO is not marked as verified. Run: $0 fetch (it checks the signature and checksum first)"
