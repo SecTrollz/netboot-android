@@ -99,6 +99,8 @@ Run:
 
 On a new setup, choose **Windows Setup** for the current Windows 11 x64 installer. Choose **Something else** to see the other operating systems. Windows network boot supports x86-64 PCs only.
 
+If the guide shows a previously saved system, answer **no** when it asks whether to keep that choice, then select **3) Windows Setup**. The first **Ready to begin?** prompt accepts only yes or no; choose the operating system at the next prompt.
+
 The guide checks the server, offers to install required tools, creates local signing keys, checks download-server identities, builds the iPXE boot program, and prepares the selected system. Read each prompt. Installing tools changes the server by adding packages through its normal software installer, called a package manager. Cloud backup is optional; skip it unless you choose to set it up.
 
 If you already used the guide and it remembers a different system, run:
