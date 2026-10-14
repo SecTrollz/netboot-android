@@ -6161,25 +6161,23 @@ guided() {
       "" \
       "- Every step says what it does, in plain words." \
       "- Press Enter to accept the suggested answer (shown in capitals)." \
+      "- Next, you can keep or change the saved system." \
       "- Type q at any question to stop safely." \
       "- Nothing is deleted. Backups are optional and only" \
       "  happen when you ask (the backup step, or --backup)."
     say ""
-    ask_yn "Ready to begin?" y || { info "OK. Come back any time."; return 0; }
+    ask_yn "Ready to begin? (then choose the boot system)" y || { info "OK. Come back any time."; return 0; }
   fi
 
   load_profile && set_distro || true
-  if [[ -r $PROFILE && $GUIDE_REDO != 1 ]]; then
-    GSTEP=$((GSTEP+1)); GUIDE_SKIPPED=$((GUIDE_SKIPPED+1))
-    printf '%s[+]%s Step %d of %d: What to boot: %s %s(saved choice; change it with: %s guide --redo)%s\n' "$C_GREEN" "$C_RESET" "$GSTEP" "$GTOTAL" "$P_LABEL" "$C_DIM" "$0" "$C_RESET"
-  else
-    gstep_head "Choose what to boot" \
-      "Now: $P_LABEL on a $TARGET_ARCH PC."
-    if [[ -r $PROFILE ]]; then
-      if ask_yn "Change that?" n; then pick_goal || { info "No target selected. Setup stopped safely."; return 0; }; fi
-    else
+  gstep_head "Choose what to boot" \
+    "Current choice: $P_LABEL on a $TARGET_ARCH PC."
+  if [[ -r $PROFILE ]]; then
+    if ! ask_yn "Keep this saved choice?" y; then
       pick_goal || { info "No target selected. Setup stopped safely."; return 0; }
     fi
+  else
+    pick_goal || { info "No target selected. Setup stopped safely."; return 0; }
   fi
 
   guided_run "Check this device" \
