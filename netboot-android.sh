@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  netboot-android.sh
-#  Verified PXE live boot of Linux ISOs and WIM-based Windows Setup media
+#  Verified PXE boot of Linux ISOs and WIM-based Windows Setup media
 #  from a supported Linux host or a rooted Android/Termux device.
 # =============================================================================
 #
@@ -33,10 +33,15 @@
 #       re-verified at any time.
 #
 #  LIMITS
-#    - Windows ISO verification uses a SHA-256 pin supplied by the operator;
-#      Microsoft does not publish a universal signed checksum manifest for
-#      these consumer ISO downloads. The digest proves byte-for-byte equality
-#      to that pin, not Microsoft's authorship of the pin itself.
+#    - For current Windows 11 x64, the script reads Microsoft's language-specific
+#      SHA-256 table over TLS pinned against Certificate Transparency. The
+#      checksum page is not itself a digitally signed manifest. The digest
+#      proves the ISO matches Microsoft's published value; it does not prove
+#      that the ISO has no vulnerabilities or that Windows is risk-free.
+#    - Automated Windows downloads use Microsoft's web link service. If it
+#      refuses a request, the script stops and explains how to download from
+#      Microsoft's page and verify locally. Older Windows releases need a
+#      SHA-256 from an independent trusted Microsoft source.
 #    - Windows wimboot starts Windows Setup/WinPE. The verified ISO is also
 #      exposed as an HTTP byte-range file; installing Windows still depends on
 #      the target machine's storage/network drivers and setup source handling.
@@ -53,7 +58,7 @@
 set -euo pipefail
 umask 022
 
-SCRIPT_VERSION="2026.10.13-windows-usb-net"
+SCRIPT_VERSION="2026.10.14-windows-ms-verified"
 RELEASE_TIME=""   # upload time (UTC epoch) set by release-stamp; must equal the upstream commit time
 
 # =============================================================================
@@ -261,6 +266,7 @@ U_KEY_FPR="${KEY_FPR:-}"
 U_BOOT_ARGS="${BOOT_ARGS:-}"
 U_MIN_FREE_MB="${MIN_FREE_MB:-}"
 U_ISO_SHA256="${ISO_SHA256:-}"
+WINDOWS_LANG="${WINDOWS_LANG:-}"
 
 # Runtime state
 SERVE_HTTP_PID=""
@@ -863,6 +869,19 @@ set_distro() {
   MANIFEST="$STATE/$DISTRO-$TARGET_ARCH.manifest"
   GNUPG_HOME="$ROOT/gnupg/$DISTRO"
   IPXE_BUILT="$STATE/ipxe-$TARGET_ARCH.built-from"
+  WIN_PIN_SOURCE=""
+  WIN_PIN_LANG=""
+  WIN_API_SKU=""
+  WIN_API_LANG=""
+  if [[ $DISTRO == windows || $DISTRO == win11 ]]; then
+    if [[ ${U_ISO_SHA256,,} =~ ^[[:xdigit:]]{64}$ ]]; then
+      WIN_PIN_SOURCE="operator-supplied"
+    elif [[ -z $ISO_SHA256 ]]; then
+      windows_pin_load || true
+    else
+      WIN_PIN_SOURCE="microsoft-official-sha256"
+    fi
+  fi
   # No choice for you to make: the signed route is used whenever it exists
   if [[ $BOOT_LOADER_AUTO == 1 || $BOOT_LOADER == auto ]]; then
     BOOT_LOADER_AUTO=1
@@ -1182,6 +1201,148 @@ finally:
     os.close(fd)
 for name, d in zip(names, digests):
     print(name, d.hexdigest())
+PYEOF
+
+  # Parse only Microsoft-published Windows ISO hashes and download metadata.
+  # The caller still validates hashes, URL hosts, TLS pins, and file bytes.
+  cat > "$LIB/windows_iso.py" <<'PYEOF'
+import html.parser
+import json
+import re
+import sys
+from urllib.parse import urlsplit
+
+class PageParser(html.parser.HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.rows = []
+        self.row = None
+        self.cell = None
+        self.select_product = False
+        self.option = None
+        self.editions = []
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "tr":
+            self.row = []
+        elif tag in ("td", "th") and self.row is not None:
+            self.cell = []
+        elif tag == "select":
+            self.select_product = a.get("id") == "product-edition"
+        elif tag == "option" and self.select_product:
+            self.option = [a.get("value", ""), []]
+
+    def handle_data(self, data):
+        if self.cell is not None:
+            self.cell.append(data)
+        if self.option is not None:
+            self.option[1].append(data)
+
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self.cell is not None and self.row is not None:
+            self.row.append(" ".join(" ".join(self.cell).split()))
+            self.cell = None
+        elif tag == "tr" and self.row is not None:
+            if len(self.row) >= 2 and re.fullmatch(r"[0-9a-fA-F]{64}", self.row[1].strip()):
+                self.rows.append((self.row[0].strip(), self.row[1].strip().lower()))
+            self.row = None
+        elif tag == "option" and self.option is not None:
+            value, text = self.option
+            self.editions.append((value, " ".join(" ".join(text).split())))
+            self.option = None
+        elif tag == "select":
+            self.select_product = False
+
+def normalized_language(value):
+    value = re.sub(r"\s+(?:32|64)-bit\s*$", "", value.strip(), flags=re.I)
+    return " ".join(value.casefold().split())
+
+def fail(message):
+    print(message, file=sys.stderr)
+    sys.exit(1)
+
+if len(sys.argv) < 3:
+    fail("usage: windows_iso.py hashes|edition|languages|match|links FILE [VALUE]")
+
+mode, path = sys.argv[1:3]
+if mode in ("hashes", "edition"):
+    parser = PageParser()
+    with open(path, encoding="utf-8", errors="replace") as f:
+        parser.feed(f.read())
+    if mode == "hashes":
+        seen = set()
+        for label, digest in parser.rows:
+            key = normalized_language(label)
+            if key and key not in seen:
+                print(label.replace("\t", " ") + "\t" + digest)
+                seen.add(key)
+        if not seen:
+            fail("No Microsoft SHA-256 rows found; the page layout may have changed.")
+    else:
+        arch = sys.argv[3] if len(sys.argv) > 3 else "x86_64"
+        wanted = "x64 devices" if arch == "x86_64" else "Arm64"
+        values = [value for value, text in parser.editions
+                  if value.isdigit() and "multi-edition iso" in text.casefold()
+                  and wanted.casefold() in text.casefold()]
+        if len(values) != 1:
+            fail("Could not uniquely identify Microsoft's Windows ISO product edition.")
+        print(values[0])
+elif mode == "languages":
+    try:
+        data = json.load(open(path, encoding="utf-8"))
+    except Exception as e:
+        fail("Microsoft language response is not valid JSON: " + str(e))
+    rows = data.get("Skus") if isinstance(data, dict) else None
+    if not isinstance(rows, list) or not rows:
+        fail("Microsoft did not return a language list.")
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ident = str(row.get("Id", ""))
+        lang = str(row.get("Language", ""))
+        label = str(row.get("LocalizedLanguage", ""))
+        if ident.isdigit() and lang and label:
+            print("\t".join(x.replace("\t", " ").replace("\n", " ")
+                            for x in (ident, lang, label)))
+elif mode == "match":
+    wanted = normalized_language(sys.argv[3] if len(sys.argv) > 3 else "")
+    parser = PageParser()
+    with open(path, encoding="utf-8", errors="replace") as f:
+        parser.feed(f.read())
+    matches = [digest for label, digest in parser.rows
+               if normalized_language(label) == wanted]
+    if len(set(matches)) != 1:
+        fail("Microsoft's checksum table does not uniquely match this language label.")
+    print(matches[0])
+elif mode == "links":
+    try:
+        data = json.load(open(path, encoding="utf-8"))
+    except Exception as e:
+        fail("Microsoft download response is not valid JSON: " + str(e))
+    rows = data.get("ProductDownloadOptions") if isinstance(data, dict) else None
+    if not isinstance(rows, list) or not rows:
+        fail("Microsoft did not return an ISO download link.")
+    candidates = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        uri = str(row.get("Uri", ""))
+        kind = str(row.get("DownloadType", ""))
+        parsed = urlsplit(uri)
+        host = (parsed.hostname or "").lower()
+        # Microsoft's current page labels ISO options as enum 1/isox64. The
+        # x64 product-edition selector is also checked before this result is used.
+        x64_iso = kind.strip().casefold() in ("1", "isox64", "64-bit", "iso64")
+        if (parsed.scheme == "https" and host.endswith(".microsoft.com")
+                and parsed.username is None and parsed.password is None
+                and x64_iso):
+            candidates.append(uri)
+    if len(candidates) != 1:
+        fail("Microsoft did not return exactly one HTTPS ISO link on a microsoft.com host.")
+    print(candidates[0])
+else:
+    fail("unknown mode: " + mode)
 PYEOF
 }
 
@@ -2728,7 +2889,394 @@ adopt_existing_iso() {   # adopt_existing_iso REMOTE_BYTES
   return 1
 }
 
+windows_page_url() {
+  case "$TARGET_ARCH" in
+    x86_64) printf '%s\n' "https://www.microsoft.com/en-us/software-download/windows11" ;;
+    *) die "$E_USAGE" "Automatic Windows ISO downloads are currently limited to Microsoft's x64 Windows 11 page." ;;
+  esac
+}
+
+windows_manual_fallback() {
+  local reason=${1:-"Microsoft's download service is unavailable"}
+  err "$reason"
+  say "No ISO was accepted or marked ready."
+  say "For a manual download, use Microsoft's official page: $(windows_page_url)"
+  say "Then run: $0 --distro windows --iso \"/path/to/the-downloaded-file.iso\" fetch"
+  say "The script will compare the file's SHA-256 with Microsoft's published language hashes."
+  say "A mismatch is rejected. For older Windows releases, supply a SHA-256 from a trusted Microsoft source."
+}
+
+windows_fetch_hash_table() {
+  local host=www.microsoft.com page url rows
+  [[ -n $PYTHON ]] || die "$E_ENV" "Python 3 is required to read Microsoft's checksum table. Run: $0 deps"
+  mkdir -p "$DL"
+  write_libs
+  WIN_PAGE_URL=$(windows_page_url)
+  page="$DL/windows11-${TARGET_ARCH}-official.html"
+  if [[ -z $(pins_curl_arg "$host") ]]; then
+    pins_refresh "$host" || die "$E_NET" "Could not validate Microsoft's certificate against Certificate Transparency."
+  fi
+  if ! (vfetch "$WIN_PAGE_URL" "$page" strict); then
+    warn "The pinned Microsoft page could not be fetched; refreshing its public certificate pins once."
+    pins_refresh "$host" || die "$E_NET" "Microsoft pin refresh failed. No checksum was trusted."
+    rm -f "$page"
+    (vfetch "$WIN_PAGE_URL" "$page" strict) || die "$E_NET" "Could not fetch Microsoft's official checksum page. Nothing was marked ready."
+  fi
+  rows=$("$PYTHON" "$LIB/windows_iso.py" hashes "$page") \
+    || die "$E_INTEGRITY" "Microsoft's page did not contain a recognizable SHA-256 table. No ISO was trusted."
+  [[ -n $rows ]] || die "$E_INTEGRITY" "Microsoft returned an empty checksum table."
+  WIN_HASH_PAGE=$page
+  WIN_HASH_ROWS=$rows
+  WIN_PAGE_SHA256=$(sha256_of "$page") || die "$E_INTEGRITY" "Could not fingerprint Microsoft's checksum page."
+  WIN_CHECKED_AT=$(now_iso)
+}
+
+windows_pin_load() {
+  local pin="$STATE/windows-$TARGET_ARCH.vendor-pin" key value
+  local rec_arch="" rec_lang="" rec_sha="" rec_page="" rec_page_sha="" rec_source=""
+  [[ -s $pin && -s $pin.asc && -n $(attest_fpr) ]] || return 1
+  if ! gpg_verify_file "$pin"; then
+    warn "Saved Windows vendor-pin record has an invalid signature; it will not be trusted."
+    return 1
+  fi
+  while IFS='=' read -r key value; do
+    case "$key" in
+      arch) rec_arch=$value ;;
+      language) rec_lang=$value ;;
+      sha256) rec_sha=${value,,} ;;
+      page) rec_page=$value ;;
+      page_sha256) rec_page_sha=${value,,} ;;
+      checked_at) WIN_CHECKED_AT=$value ;;
+      source) rec_source=$value ;;
+    esac
+  done < "$pin"
+  [[ $rec_arch == "$TARGET_ARCH" && $rec_sha =~ ^[[:xdigit:]]{64}$ ]] || {
+       warn "Saved Windows vendor-pin record is incomplete or for a different target; it will not be trusted."
+       return 1
+     }
+  case "$rec_source" in
+    microsoft-official-sha256)
+      [[ $rec_page_sha =~ ^[[:xdigit:]]{64}$ \
+         && $rec_page == "https://www.microsoft.com/en-us/software-download/windows11" \
+         && -n $rec_lang ]] || {
+           warn "Saved Microsoft checksum record is incomplete; it will not be trusted."
+           return 1
+         }
+      ;;
+    operator-supplied)
+      [[ $rec_page == "operator-supplied" && $rec_page_sha == "none" \
+         && $rec_lang == "operator-supplied" ]] || {
+           warn "Saved operator checksum record is incomplete; it will not be trusted."
+           return 1
+         }
+      ;;
+    *)
+      warn "Saved Windows checksum has an unknown source label; it will not be trusted."
+      return 1
+      ;;
+  esac
+  ISO_SHA256=$rec_sha
+  WIN_PIN_SOURCE=$rec_source
+  WIN_PIN_LANG=$rec_lang
+  WIN_PAGE_SHA256=$rec_page_sha
+  return 0
+}
+
+windows_pin_save() {
+  local pin="$STATE/windows-$TARGET_ARCH.vendor-pin" tmp page_digest
+  [[ $ISO_SHA256 =~ ^[[:xdigit:]]{64}$ && -n $WIN_PIN_LANG && -n $WIN_PAGE_URL ]] || return 1
+  page_digest=${WIN_PAGE_SHA256:-}
+  [[ $page_digest =~ ^[[:xdigit:]]{64}$ ]] || return 1
+  mkdir -p "$STATE"
+  tmp="$pin.tmp.$$"
+  {
+    printf 'version=1\n'
+    printf 'arch=%s\n' "$TARGET_ARCH"
+    printf 'language=%s\n' "$WIN_PIN_LANG"
+    printf 'sha256=%s\n' "${ISO_SHA256,,}"
+    printf 'source=microsoft-official-sha256\n'
+    printf 'page=%s\n' "$WIN_PAGE_URL"
+    printf 'page_sha256=%s\n' "$page_digest"
+    printf 'checked_at=%s\n' "${WIN_CHECKED_AT:-unknown}"
+  } > "$tmp" || return 1
+  chmod 600 "$tmp"
+  if [[ -z $(attest_fpr) ]] || ! gpg_sign_file "$tmp" || [[ ! -s $tmp.asc ]]; then
+    rm -f "$tmp" "$tmp.asc"
+    die "$E_INTEGRITY" "Could not sign Microsoft's checksum record. The ISO will not be accepted without durable, verifiable state."
+  fi
+  sync_file "$tmp" || { rm -f "$tmp" "$tmp.asc"; die "$E_ENV" "Could not save the checksum record safely."; }
+  sync_file "$tmp.asc" || { rm -f "$tmp" "$tmp.asc"; die "$E_ENV" "Could not save the checksum signature safely."; }
+  mv -f "$tmp" "$pin" && mv -f "$tmp.asc" "$pin.asc" || {
+    rm -f "$tmp" "$tmp.asc"
+    die "$E_ENV" "Could not commit the signed Windows checksum record."
+  }
+  chmod 600 "$pin" "$pin.asc"
+  info "Saved Microsoft's checksum and language in a locally signed state record."
+}
+
+windows_operator_pin_save() {
+  local pin="$STATE/windows-$TARGET_ARCH.vendor-pin" tmp
+  [[ $ISO_SHA256 =~ ^[[:xdigit:]]{64}$ && -n $(attest_fpr) ]] \
+    || die "$E_INTEGRITY" "An operator checksum cannot be saved without a valid SHA-256 and local signing key."
+  mkdir -p "$STATE"
+  tmp="$pin.tmp.$$"
+  {
+    printf 'version=1\n'
+    printf 'arch=%s\n' "$TARGET_ARCH"
+    printf 'language=operator-supplied\n'
+    printf 'sha256=%s\n' "${ISO_SHA256,,}"
+    printf 'source=operator-supplied\n'
+    printf 'page=operator-supplied\n'
+    printf 'page_sha256=none\n'
+    printf 'checked_at=%s\n' "$(now_iso)"
+  } > "$tmp" || die "$E_ENV" "Could not create the operator checksum record."
+  chmod 600 "$tmp"
+  if ! gpg_sign_file "$tmp" || [[ ! -s $tmp.asc ]]; then
+    rm -f "$tmp" "$tmp.asc"
+    die "$E_INTEGRITY" "Could not sign the operator checksum record."
+  fi
+  sync_file "$tmp" && sync_file "$tmp.asc" \
+    || { rm -f "$tmp" "$tmp.asc"; die "$E_ENV" "Could not save the operator checksum record safely."; }
+  mv -f "$tmp" "$pin" && mv -f "$tmp.asc" "$pin.asc" \
+    || { rm -f "$tmp" "$tmp.asc"; die "$E_ENV" "Could not commit the signed operator checksum record."; }
+  chmod 600 "$pin" "$pin.asc"
+  WIN_PIN_SOURCE="operator-supplied"
+  WIN_PIN_LANG="operator-supplied"
+  info "Saved the explicitly supplied checksum in a locally signed record. This does not confirm its publisher."
+}
+
+windows_match_local_iso() {
+  local file=$1 digest label expected
+  [[ -s $file ]] || return 1
+  digest=$(sha256_of "$file") || return 1
+  while IFS=$'\t' read -r label expected; do
+    [[ $expected =~ ^[[:xdigit:]]{64}$ ]] || continue
+    if [[ ${digest,,} == "${expected,,}" ]]; then
+      WIN_PIN_LANG=${label% 64-bit}
+      ISO_SHA256=${expected,,}
+      WIN_PIN_SOURCE="microsoft-official-sha256"
+      windows_pin_save || true
+      ok "Local Windows ISO matches Microsoft's published SHA-256 for $WIN_PIN_LANG."
+      return 0
+    fi
+  done <<<"${WIN_HASH_ROWS:-}"
+  return 1
+}
+
+windows_api_get() {
+  local action=$1 query=$2 dest=$3 pins url code rc=0
+  local host=www.microsoft.com
+  if [[ -z ${WIN_SESSION_ID:-} ]]; then
+    WIN_SESSION_ID=$("$PYTHON" -c 'import uuid; print(uuid.uuid4())') \
+      || { WINDOWS_API_ERROR="Could not create a Microsoft download session ID"; return 1; }
+  fi
+  WINDOWS_API_ERROR=""
+  pins=$(pins_curl_arg "$host")
+  if [[ -z $pins ]]; then
+    pins_refresh "$host" || { WINDOWS_API_ERROR="Microsoft certificate pin validation failed"; return 1; }
+    pins=$(pins_curl_arg "$host")
+  fi
+  [[ -n $pins ]] || { WINDOWS_API_ERROR="No active Microsoft certificate pin"; return 1; }
+  url="https://www.microsoft.com/software-download-connector/api/$action?profile=606624d44113&$query"
+  code=$(curl -sS --proto '=https' --tlsv1.2 --pinnedpubkey "$pins" \
+      --connect-timeout 20 --max-time 60 \
+      -H 'Accept: application/json, text/javascript, */*; q=0.01' \
+      -H 'X-Requested-With: XMLHttpRequest' \
+      -H "Referer: $WIN_PAGE_URL" \
+      -o "$dest.tmp" -w '%{http_code}' "$url") || rc=$?
+  if (( rc != 0 )); then
+    rm -f "$dest.tmp"
+    WINDOWS_API_ERROR="Microsoft link lookup failed (curl error $rc)"
+    return 1
+  fi
+  if [[ $code != 200 ]]; then
+    rm -f "$dest.tmp"
+    WINDOWS_API_ERROR="Microsoft link lookup returned HTTP $code"
+    return 1
+  fi
+  mv -f "$dest.tmp" "$dest" || {
+    rm -f "$dest.tmp"
+    WINDOWS_API_ERROR="Could not save Microsoft's response"
+    return 1
+  }
+  return 0
+}
+
+windows_language_skus() {
+  local edition=$1 response="$DL/windows11-languages.json" rc=0
+  windows_api_get getskuinformationbyproductedition \
+    "ProductEditionId=$edition&SKU=undefined&friendlyFileName=undefined&Locale=en-us&sessionID=$WIN_SESSION_ID" \
+    "$response" || { rm -f "$response"; return 1; }
+  "$PYTHON" "$LIB/windows_iso.py" languages "$response" || rc=$?
+  rm -f "$response"
+  return "$rc"
+}
+
+windows_choose_language() {
+  local rows line n=0 choice="" id lang label wanted=${WINDOWS_LANG:-}
+  local -a sku_rows=()
+  local edition
+  edition=$("$PYTHON" "$LIB/windows_iso.py" edition "$WIN_HASH_PAGE" "$TARGET_ARCH") \
+    || return 1
+  rows=$(windows_language_skus "$edition") || return 1
+  mapfile -t sku_rows <<<"$rows"
+  (( ${#sku_rows[@]} > 0 )) || return 1
+  if [[ -n $wanted ]]; then
+    for line in "${sku_rows[@]}"; do
+      IFS=$'\t' read -r id lang label <<<"$line"
+      if [[ "${lang,,}" == "${wanted,,}" || "${label,,}" == "${wanted,,}" ]]; then
+        choice=$line
+        break
+      fi
+    done
+    [[ -n $choice ]] || {
+      WINDOWS_API_ERROR="WINDOWS_LANG '$wanted' did not match a Microsoft language code or name."
+      return 1
+    }
+  else
+    [[ -t 0 ]] || {
+      WINDOWS_API_ERROR="Set WINDOWS_LANG to a Microsoft language name or code for a non-interactive download."
+      return 1
+    }
+    say "Choose the language for the Windows installer (there is no automatic default):"
+    for line in "${sku_rows[@]}"; do
+      IFS=$'\t' read -r id lang label <<<"$line"
+      n=$((n+1))
+      printf '  %2d) %s (%s)\n' "$n" "$label" "$lang"
+    done
+    read -r -p "Language number: " n || return 1
+    [[ $n =~ ^[1-9][0-9]{0,2}$ ]] && (( 10#$n <= ${#sku_rows[@]} )) || {
+      WINDOWS_API_ERROR="A valid language number is required; no language was selected."
+      return 1
+    }
+    choice=${sku_rows[10#$n-1]}
+  fi
+  IFS=$'\t' read -r WIN_API_SKU WIN_API_LANG WIN_PIN_LANG <<<"$choice"
+  ISO_SHA256=$("$PYTHON" "$LIB/windows_iso.py" match "$WIN_HASH_PAGE" "$WIN_PIN_LANG") || {
+    WINDOWS_API_ERROR="Microsoft's selected language did not uniquely match its published checksum table."
+    return 1
+  }
+  ISO_SHA256=${ISO_SHA256,,}
+  WIN_PIN_SOURCE="microsoft-official-sha256"
+  windows_pin_save || true
+  ok "Selected $WIN_PIN_LANG; its expected SHA-256 came from Microsoft's page."
+}
+
+windows_resolve_download() {
+  local sku=$WIN_API_SKU rows line id lang label wanted response uri host current_hash
+  local edition
+  [[ $WIN_PIN_SOURCE == microsoft-official-sha256 ]] || {
+    WINDOWS_API_ERROR="An official Microsoft checksum is required before resolving a Windows download."
+    windows_manual_fallback "$WINDOWS_API_ERROR"
+    return 1
+  }
+  if [[ -z ${WIN_HASH_PAGE:-} ]]; then
+    windows_fetch_hash_table || return 1
+  fi
+  current_hash=$("$PYTHON" "$LIB/windows_iso.py" match "$WIN_HASH_PAGE" "$WIN_PIN_LANG") || {
+    WINDOWS_API_ERROR="The saved Windows language is not on Microsoft's current checksum page."
+    windows_manual_fallback "$WINDOWS_API_ERROR"
+    return 1
+  }
+  if [[ ${current_hash,,} != ${ISO_SHA256,,} ]]; then
+    WINDOWS_API_ERROR="Microsoft's current ISO hash for $WIN_PIN_LANG differs from the saved pin; refusing to download a different image."
+    windows_manual_fallback "$WINDOWS_API_ERROR"
+    return 1
+  fi
+  if [[ -z $sku ]]; then
+    edition=$("$PYTHON" "$LIB/windows_iso.py" edition "$WIN_HASH_PAGE" "$TARGET_ARCH") \
+      || { WINDOWS_API_ERROR="Microsoft's product edition could not be identified."; windows_manual_fallback "$WINDOWS_API_ERROR"; return 1; }
+    rows=$(windows_language_skus "$edition") || {
+      windows_manual_fallback "${WINDOWS_API_ERROR:-Microsoft did not provide language options.}"
+      return 1
+    }
+    while IFS=$'\t' read -r id lang label; do
+      if [[ "${label,,}" == "${WIN_PIN_LANG,,}" || "${lang,,}" == "${WIN_PIN_LANG,,}" ]]; then
+        sku=$id
+        WIN_API_LANG=$lang
+        break
+      fi
+    done <<<"$rows"
+  fi
+  [[ $sku =~ ^[0-9]+$ ]] || {
+    WINDOWS_API_ERROR="Could not match the saved language to Microsoft's current download options."
+    windows_manual_fallback "$WINDOWS_API_ERROR"
+    return 1
+  }
+  response="$DL/windows11-download.json"
+  windows_api_get GetProductDownloadLinksBySku \
+    "ProductEditionId=undefined&SKU=$sku&friendlyFileName=undefined&Locale=en-us&sessionID=$WIN_SESSION_ID" \
+    "$response" || {
+      windows_manual_fallback "${WINDOWS_API_ERROR:-Microsoft did not return a download link.}"
+      return 1
+    }
+  uri=$("$PYTHON" "$LIB/windows_iso.py" links "$response") || {
+    rm -f "$response"
+    WINDOWS_API_ERROR="Microsoft's response did not contain one trusted ISO link."
+    windows_manual_fallback "$WINDOWS_API_ERROR"
+    return 1
+  }
+  rm -f "$response"
+  host=$(url_host "$uri" 2>/dev/null || true)
+  [[ $uri == https://* && ( $host == microsoft.com || $host == *.microsoft.com ) ]] || {
+    WINDOWS_API_ERROR="Microsoft returned a download URL outside its HTTPS domain."
+    windows_manual_fallback "$WINDOWS_API_ERROR"
+    return 1
+  }
+  ISO_URL=$uri
+  ISO_NAME="Windows11.iso"
+  ok "Microsoft supplied an official Windows ISO link; the ISO will be checked against the published SHA-256 before use."
+}
+
+windows_prepare_pin() {
+  local digest
+  if [[ -n ${U_ISO_SHA256:-} ]]; then
+    [[ $ISO_SHA256 =~ ^[[:xdigit:]]{64}$ ]] \
+      || die "$E_USAGE" "The supplied Windows SHA-256 must contain exactly 64 hexadecimal characters."
+    WIN_PIN_SOURCE="operator-supplied"
+    return 0
+  fi
+  if [[ $WIN_PIN_SOURCE == operator-supplied && -n ${WINDOWS_LANG:-} ]]; then
+    # An explicit language is the user's signal to replace a remembered
+    # operator pin with the current Microsoft Windows 11 release.
+    ISO_SHA256=""
+    WIN_PIN_SOURCE=""
+    WIN_PIN_LANG=""
+  fi
+  if [[ -n $ISO_FILE ]]; then
+    [[ -f $ISO_FILE ]] || die "$E_USAGE" "--iso: no such file: $ISO_FILE"
+    if [[ $WIN_PIN_SOURCE == operator-supplied && $ISO_SHA256 =~ ^[[:xdigit:]]{64}$ ]]; then
+      digest=$(sha256_of "$ISO_FILE") || die "$E_INTEGRITY" "Could not hash the selected Windows ISO."
+      [[ ${digest,,} == "${ISO_SHA256,,}" ]] \
+        || die "$E_INTEGRITY" "The selected ISO does not match the saved operator-supplied pin. The file was preserved."
+      return 0
+    fi
+    windows_fetch_hash_table
+    windows_match_local_iso "$ISO_FILE" || {
+      die "$E_INTEGRITY" "The supplied ISO does not match any SHA-256 on Microsoft's current Windows 11 page. The original file was preserved. For older Windows media, provide an independently trusted Microsoft SHA-256 with --sha256."
+    }
+    return 0
+  fi
+  if [[ -n $ISO_SHA256 && ( $WIN_PIN_SOURCE == microsoft-official-sha256 || $WIN_PIN_SOURCE == operator-supplied ) ]]; then
+    return 0
+  fi
+  windows_fetch_hash_table
+  if [[ -s $ISO ]]; then
+    windows_match_local_iso "$ISO" || {
+      die "$E_INTEGRITY" "The existing Windows ISO does not match a hash on Microsoft's current page. It was preserved and will not be booted. Use --iso PATH to verify a different file, or explicitly choose a current Microsoft download."
+    }
+    return 0
+  fi
+  windows_choose_language || {
+    windows_manual_fallback "${WINDOWS_API_ERROR:-Microsoft did not provide a usable language selection.}"
+    die "$E_NET" "No Windows ISO was downloaded or marked ready."
+  }
+}
+
 iso_is_verified() {
+  if [[ ( $DISTRO == win11 || $DISTRO == windows ) && -z $ISO_SHA256 ]]; then
+    windows_pin_load || return 1
+  fi
   [[ -s $ISO && -s $ISO_VERIFIED ]] || return 1
   local recorded size mtime current
   read -r recorded size mtime < "$ISO_VERIFIED" || return 1
@@ -2748,9 +3296,13 @@ iso_is_verified() {
 iso_verified_sha() { awk '{print $1}' "$ISO_VERIFIED"; }
 
 verify_download() {
-  local file=$1 orig=$2 list="" signed_list=0 iso_sig=0 hash_ok=0 pin_ok=0 sha256 algohash expect
+  local file=$1 orig=$2 list="" signed_list=0 iso_sig=0 hash_ok=0 pin_ok=0 sha256 algohash expect record_url
   : > "$VERIFY_REC.tmp"
-  record "TARGET distro=$DISTRO arch=$TARGET_ARCH url=$ISO_URL"
+  record_url=$ISO_URL
+  if [[ ( $DISTRO == windows || $DISTRO == win11 ) && $WIN_PIN_SOURCE == microsoft-official-sha256 ]]; then
+    record_url="Microsoft official Windows download service (expiring URL not stored)"
+  fi
+  record "TARGET distro=$DISTRO arch=$TARGET_ARCH url=$record_url"
 
   if [[ -n $SUMS_URL || -n $ISO_SIG_URL ]]; then prepare_keyring; fi
 
@@ -2809,8 +3361,13 @@ verify_download() {
       err "SHA-256 PIN MISMATCH for $orig (expected $ISO_SHA256, got $sha256)"
       return 30
     fi
-    ok "Windows ISO SHA-256 matches the supplied pin"
-    record "HASH algo=sha256 value=$ISO_SHA256 source=operator-pin name=$orig"
+    if [[ $WIN_PIN_SOURCE == microsoft-official-sha256 ]]; then
+      ok "Windows ISO SHA-256 matches Microsoft's published value for $WIN_PIN_LANG"
+      record "HASH algo=sha256 value=$ISO_SHA256 source=microsoft-official-page language=\"$WIN_PIN_LANG\" page_sha256=${WIN_PAGE_SHA256:-saved-pin} name=$orig"
+    else
+      ok "Windows ISO SHA-256 matches the explicitly supplied pin"
+      record "HASH algo=sha256 value=$ISO_SHA256 source=operator-pin name=$orig"
+    fi
     pin_ok=1
   fi
 
@@ -2826,8 +3383,15 @@ verify_download() {
 fetch() {
   mkdir -p "$ROOT" "$DL" "$STATE"
 
-  if [[ ( $DISTRO == win11 || $DISTRO == windows ) && ! $ISO_SHA256 =~ ^[[:xdigit:]]{64}$ ]]; then
-    die "$E_USAGE" "Windows media requires a trusted SHA-256 pin. Get the expected 64-hex digest from a source you trust, then run: $0 --distro windows --sha256 DIGEST fetch (add --iso PATH if the ISO is outside the detected download folders)."
+  if [[ ( $DISTRO == windows || $DISTRO == win11 ) && -z $(attest_fpr) ]]; then
+    info "Creating a local signing key so Microsoft's checksum can be remembered safely."
+    attest_init
+  fi
+  if [[ -n $ISO_FILE && ! -f $ISO_FILE ]]; then die "$E_USAGE" "--iso: no such file: $ISO_FILE"; fi
+  if [[ $DISTRO == win11 || $DISTRO == windows ]]; then
+    windows_prepare_pin
+    [[ $ISO_SHA256 =~ ^[[:xdigit:]]{64}$ ]] \
+      || die "$E_USAGE" "Windows media requires a trusted 64-character SHA-256 from Microsoft's page or an independent source."
   fi
   if iso_is_verified; then
     ok "ISO present and verified: $ISO"
@@ -2838,7 +3402,6 @@ fetch() {
   fi
 
   local target code rc attempt=0 resumed=0 remote=0 have need_mb avail_mb vrc=0
-  if [[ -n $ISO_FILE && ! -f $ISO_FILE ]]; then die "$E_USAGE" "--iso: no such file: $ISO_FILE"; fi
   # Cheap checks first: if the vendor key cannot be confirmed, say so now, not after 6 GB.
   if [[ -n $SUMS_URL || -n $ISO_SIG_URL ]]; then
     info "Checking the vendor signing key before the big download"
@@ -2854,7 +3417,13 @@ fetch() {
     adopt_existing_iso "$remote" || true
   fi
   if [[ ( $DISTRO == windows || $DISTRO == win11 ) && ! -s $ISO && -z $ISO_URL ]]; then
-    die "$E_USAGE" "No Windows ISO was found that matches the supplied SHA-256 pin. Place the ISO in a detected download folder, pass --iso PATH, or add a folder with EXTRA_ISO_DIRS. The source file is never renamed or modified."
+    if [[ $WIN_PIN_SOURCE == microsoft-official-sha256 ]]; then
+      windows_resolve_download || die "$E_NET" "Could not resolve an official Microsoft ISO link. No unverified ISO was used."
+    elif [[ $WIN_PIN_SOURCE == operator-supplied ]]; then
+      die "$E_USAGE" "No local ISO matches the saved operator-supplied SHA-256. To select current Windows 11 instead, rerun with --windows-language en-us (or another Microsoft language) before windows-download."
+    else
+      die "$E_USAGE" "No Windows ISO was found that matches the supplied SHA-256 pin. Place the ISO in a detected download folder, pass --iso PATH, or add a folder with EXTRA_ISO_DIRS. The source file is never renamed or modified."
+    fi
   fi
   if [[ -s $ISO ]]; then
     target=$ISO
@@ -2878,7 +3447,11 @@ fetch() {
       if [[ $code == 416 ]]; then info "Download was already complete"; break; fi
       if (( rc == 0 )) && [[ $code =~ ^[23] ]]; then break; fi
       if (( rc == 0 )) && [[ $code =~ ^[45] ]]; then
-        rm -f "$ISO.part"; die "$E_NET" "The server answered HTTP $code for $ISO_URL. The partial file was discarded."
+        rm -f "$ISO.part"
+        if [[ $DISTRO == win11 || $DISTRO == windows ]]; then
+          die "$E_NET" "The Microsoft ISO download server answered HTTP $code. The partial download was discarded; no ISO was marked ready."
+        fi
+        die "$E_NET" "The server answered HTTP $code for $ISO_URL. The partial file was discarded."
       fi
       if (( rc == 33 )); then   # the server cannot resume: a stale partial file would never complete
         warn "This server does not support resuming. Discarding the partial file and starting over."
@@ -2905,6 +3478,9 @@ fetch() {
   ( verify_download "$target" "$ISO_NAME" ) || vrc=$?
   if (( vrc == 0 )); then
     [[ $target == "$ISO.part" ]] && mv -f "$ISO.part" "$ISO"
+    if [[ ( $DISTRO == windows || $DISTRO == win11 ) && $WIN_PIN_SOURCE == operator-supplied ]]; then
+      windows_operator_pin_save
+    fi
     mv -f "$VERIFY_REC.tmp" "$VERIFY_REC"
     printf '%s %s %s\n' "$(cat "$VERIFY_REC.sha")" "$(file_size "$ISO")" "$(file_mtime "$ISO")" > "$ISO_VERIFIED"
     rm -f "$VERIFY_REC.sha"
@@ -2915,6 +3491,9 @@ fetch() {
   if (( vrc == 30 )); then
     # A bad partial/download is disposable; never delete a user-supplied source file.
     rm -f "$ISO.part" "$ISO_VERIFIED"
+    if [[ ( $DISTRO == windows || $DISTRO == win11 ) && $target == "$ISO" ]]; then
+      die "$E_INTEGRITY" "The Windows ISO failed its trusted SHA-256 check. The original file was preserved and its verification mark was removed."
+    fi
     if [[ $target == "$ISO" ]]; then
       local source_real="" managed_real=""
       if [[ -n $ISO_FILE ]]; then
@@ -5069,17 +5648,44 @@ proot_build_flow() {
 # Easy mode: the zero-argument screen, one plain question, and a one-tap shortcut
 # =============================================================================
 pick_goal() {
-  local c=1
+  local c="" valid=0
   say "${C_BOLD}What do you want to do?${C_RESET}"
   say "  1) Rescue or repair a PC          ${C_DIM}(SystemRescue: small and fast, about 4 GB of RAM)${C_RESET}"
   say "  2) Try a full desktop             ${C_DIM}(Ubuntu: about 10 GB of RAM)${C_RESET}"
-  say "  3) Something else                 ${C_DIM}(shows the full list)${C_RESET}"
-  if [[ $ASSUME_YES != 1 ]]; then
-    read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Choose 1, 2 or 3 [1]: " c || c=1
+  say "  3) Windows Setup                  ${C_DIM}(current Microsoft Windows 11 x64 installer)${C_RESET}"
+  say "  4) Something else                 ${C_DIM}(shows the full list)${C_RESET}"
+  if [[ $ASSUME_YES == 1 ]]; then
+    if [[ " ${CLI_SET:-} " == *" DISTRO "* ]]; then
+      case "$DISTRO" in
+        systemrescue) c=1 ;;
+        ubuntu|ubuntu24) c=2 ;;
+        windows|win11) c=3 ;;
+        *) die "$E_USAGE" "--yes cannot guess this target. Choose it explicitly with --distro, then retry." ;;
+      esac
+    elif [[ -r $PROFILE ]]; then
+      case "$DISTRO" in
+        systemrescue) c=1 ;;
+        ubuntu|ubuntu24) c=2 ;;
+        windows|win11) c=3 ;;
+        *) die "$E_USAGE" "--yes cannot change this saved target automatically. Run the guide interactively." ;;
+      esac
+    else
+      die "$E_USAGE" "--yes needs an explicit --distro or a saved target; it will not choose an operating system for you."
+    fi
+  else
+    while (( ! valid )); do
+      read -r -p "${C_BOLD}${C_BLUE}?${C_RESET} Choose 1, 2, 3, or 4 (no default): " c || c=q
+      case "$c" in
+        1|2|3|4) valid=1 ;;
+        q|Q) return 1 ;;
+        *) warn "Choose 1, 2, 3, or 4. Nothing has been selected." ;;
+      esac
+    done
   fi
-  case "${c:-1}" in
+  case "$c" in
     2) DISTRO=ubuntu; TARGET_ARCH=x86_64 ;;
-    3) choose_target; choose_mode ;;
+    3) DISTRO=windows; TARGET_ARCH=x86_64 ;;
+    4) choose_target; choose_mode ;;
     *) DISTRO=systemrescue; TARGET_ARCH=x86_64 ;;
   esac
   set_distro
@@ -5161,7 +5767,7 @@ easy_home() {
     echo
     ask_yn "Start now?" y || { info "OK. Run me again whenever you are ready."; return 0; }
     echo
-    pick_goal
+    pick_goal || { info "No target selected. Nothing was started."; return 0; }
     GUIDE_WELCOMED=1 guided
     return 0
   fi
@@ -5194,14 +5800,17 @@ easy_home() {
   box \
     "READY.  $P_LABEL" \
     "" \
-    "Enter = boot a PC now      m = full menu" \
+    "b = boot this verified choice   w = set up Windows" \
+    "m = full menu                   Enter = do nothing" \
     "s = status                 q = quit"
   echo
   read -r -p "${C_BOLD}${C_BLUE}>${C_RESET} " key || key=q
   case "${key,,}" in
-    "")  with_lock go_cmd ;;
+    b)   with_lock go_cmd ;;
+    w)   DISTRO=windows; TARGET_ARCH=x86_64; set_distro; save_profile; GUIDE_WELCOMED=1; guided ;;
     m)   interactive ;;
     s)   status || true ;;
+    "")  info "Nothing was started. Press b to start the verified selection." ;;
     *)   info "Bye." ;;
   esac
 }
@@ -5567,9 +6176,9 @@ guided() {
     gstep_head "Choose what to boot" \
       "Now: $P_LABEL on a $TARGET_ARCH PC."
     if [[ -r $PROFILE ]]; then
-      if ask_yn "Change that?" n; then pick_goal; fi
+      if ask_yn "Change that?" n; then pick_goal || { info "No target selected. Setup stopped safely."; return 0; }; fi
     else
-      pick_goal
+      pick_goal || { info "No target selected. Setup stopped safely."; return 0; }
     fi
   fi
 
@@ -5584,8 +6193,13 @@ guided() {
   guided_run "Check the download servers" \
     "Confirms each vendor's server identity against public logs before trusting it. (about a minute)" g_done_pins pins_refresh
   guided_ipxe
-  guided_run "Download and verify the Linux image" \
-    "Downloads $P_LABEL and checks the vendor's signature. Large download, so use Wi-Fi. (10-40 minutes; safe to stop and resume)" g_done_fetch fetch
+  if [[ $DISTRO == windows || $DISTRO == win11 ]]; then
+    guided_run "Get and verify the Windows ISO" \
+      "Uses Microsoft's current x64 ISO and published SHA-256. If Microsoft's link service blocks downloads, download from the official page and give the file path. No ISO is ready until its bytes match a trusted hash." g_done_fetch fetch
+  else
+    guided_run "Download and verify the Linux image" \
+      "Downloads $P_LABEL and checks the vendor's signature. Large download, so use Wi-Fi. (10-40 minutes; safe to stop and resume)" g_done_fetch fetch
+  fi
   guided_run "Unpack the boot files" \
     "Pulls the kernel and files the PC needs out of the image. (1-5 minutes)" g_done_extract extract
   guided_run "Sign and prepare everything" \
@@ -5609,10 +6223,10 @@ guided() {
     "Plug the PC into the same network (or cable) and set it to network (PXE)" \
     "boot, then power it on. Press Ctrl+C here to stop the server."
   hint "No backup is taken unless you ask for one (./netboot-android.sh backup, or --backup)."
-  if ask_yn "Start the server now?" y; then
+  if ask_yn "Start the server now?" n; then
     run_step serve
   else
-    info "Whenever you are ready, choose 'Start the PXE server' in the menu."
+    info "Nothing was started. Choose 'Start the PXE server' when you are ready."
   fi
 }
 
@@ -5643,7 +6257,7 @@ choose_target() {
     "arch          Arch Linux latest             (x86_64)" \
     "systemrescue  SystemRescue 13.02            (x86_64)" \
     "parrot        Parrot Security 7.4           (x86_64, arm64)" \
-    "windows       Windows Setup from WIM-based ISO (x86_64)"; do
+    "windows       Windows Setup from a WIM-based ISO (x86_64)"; do
     case "$REPLY" in
       1) DISTRO=ubuntu; break ;;
       2) DISTRO=ubuntu24; break ;;
@@ -5706,6 +6320,7 @@ interactive() {
     "Build iPXE from source"
     "Import iPXE built elsewhere"
     "Download and verify the ISO"
+    "Windows: download or verify an official ISO"
     "Extract boot files"
     "Configure (sign boot files, write dnsmasq)"
     "Write signed attestation report"
@@ -5739,6 +6354,7 @@ interactive() {
       "Build iPXE"*)                run_step build_ipxe ;;
       "Import iPXE"*)               read -r -p "Directory holding the iPXE binaries: " dir; run_step import_ipxe "$dir" ;;
       "Download and verify"*)       run_step fetch ;;
+      "Windows: download"*)         DISTRO=windows; TARGET_ARCH=x86_64; set_distro; save_profile; run_step fetch ;;
       "Extract boot files")         run_step extract ;;
       "Configure"*)                 run_step configure ;;
       "Write signed"*)              run_step attest_report ;;
@@ -5769,12 +6385,12 @@ Verified PXE boot of Linux ISOs and WIM-based Windows Setup media from Android o
 START HERE
   $0                         Open the easy screen. Choose guided setup the first time.
   $0 guide                   Walk through setup one step at a time.
-  $0 go                      After setup, check everything and start serving a PC.
+  $0 go                      After setup, check everything and start serving the saved choice.
   $0 status                  What is ready, and what needs attention.
   $0 shortcut                Make a one-tap "Boot-a-PC" button (Termux:Widget).
 
 USAGE
-  $0 [--distro NAME] [--arch ARCH] [--mode MODE] [--iface IF] [--iso PATH] [--sha256 HEX] COMMAND [args]
+  $0 [--distro NAME] [--arch ARCH] [--mode MODE] [--iface IF] [--iso PATH] [--sha256 HEX] [--windows-language NAME|CODE] COMMAND [args]
   $0 -h | --help
   $0                         (no arguments: the easy screen for your situation)
   $0 --yes COMMAND           (accept suggested answers; never trusts a changed script)
@@ -5784,7 +6400,7 @@ FIRST RUN, IN ORDER
   fetch, extract, configure, attest, serve. The guide runs these steps for you.
 
 COMMANDS
-  go                    Heal, check, and start serving with your last settings (daily/emergency)
+  go                    Heal, check, and serve your saved, verified choice
   status                One-screen health report: what is ready, what needs attention
   heal                  Fix safe problems automatically (stale locks, leftovers, address change)
   doctor                Same report as status, with the exact fix command for each problem
@@ -5824,7 +6440,8 @@ COMMANDS
   ipxe-request          Print what to paste into the GitHub build page
   ipxe-fetch [new]      Download, verify, pin, and install the GitHub-built loader (new = replace the pinned one)
   fetch                 Download a Linux ISO and verify its vendor signature/checksum
-                        Windows: verify a local ISO against the required SHA-256 pin
+                        Windows: get current Windows 11 x64 from Microsoft or verify a local ISO
+  windows-download      Select Windows; download or verify the current Windows 11 x64 ISO
   extract               Pull kernel, initrd, root image (and microcode) from the ISO
   configure             Sign boot files, write boot.ipxe, dnsmasq.conf, and the manifest
   attest                Write a signed attestation report (also served to clients)
@@ -5849,10 +6466,15 @@ COMMANDS
 OPTIONS
   --distro NAME   ubuntu (default), ubuntu24, debian, fedora, arch, systemrescue, parrot, windows (win11 alias)
   --arch ARCH     x86_64 (default) or arm64: the CPU of the PC that boots, not this device
-  --iso PATH      Optional source ISO path; filename can be anything. Windows also scans
-                  detected download folders and adopts only a file matching --sha256.
-  --sha256 HEX    Expected Windows ISO SHA-256 (64 hex characters, from a trusted source)
-                  Windows ISO bytes are re-hashed before use and again before HTTP listens.
+  --iso PATH      Optional source ISO path; filename can be anything. Current Windows 11
+                  files are matched against Microsoft's published language hashes.
+  --sha256 HEX    Explicit Windows SHA-256 from a trusted independent source (64 hex).
+                  Use this for older Windows releases not listed on Microsoft's current page.
+  --windows-language NAME|CODE
+                  Select a Microsoft language without an interactive prompt (for example,
+                  English or en-us). Interactive downloads ask; no language is assumed.
+  WINDOWS_LANG   Same as --windows-language; useful with --yes or automation.
+                  Windows ISO bytes are re-hashed before use and before HTTP listens.
   --mode MODE     auto, proxy, direct, or usb (Android USB RNDIS gadget; interrupts ADB/USB mode)
   --iface IF      Network interface (default: detected)
 
@@ -5869,17 +6491,22 @@ TARGETS
   fedora        Fedora Workstation 44 live   x86_64          client RAM ~6 GB
   arch          Arch Linux latest            x86_64          client RAM ~4 GB
   systemrescue  SystemRescue 13.02           x86_64          client RAM ~4 GB
-  windows       Windows Setup (WIM-based PXE) x86_64           WIM ISO + trusted SHA-256 pin; older bootable ISOs via usb-boot
+  windows       Windows Setup (WIM-based PXE) x86_64           Current Windows 11 hashes from Microsoft; older releases need a trusted pin
   parrot        Parrot Security 7.4          x86_64, arm64   client RAM ~12 GB
 
 WINDOWS ISO SAFETY AND LIMITS
   The PXE installer supports x86_64 WIM-based media containing boot/BCD,
   boot/boot.sdi, and sources/boot.wim. It does not guarantee every Windows
-  release, custom ISO, or PC will work. Windows media is local by default:
-  place it in a detected download folder or pass --iso PATH.
-  Supply the expected 64-character SHA-256 with --sha256 or ISO_SHA256.
-  Get that value separately from a source you trust. Matching the value proves
-  only that the ISO bytes match it; it does not prove Microsoft made the ISO.
+  release, custom ISO, or PC will work. Current Windows 11 x64 uses Microsoft's
+  language-specific SHA-256 table, fetched over Certificate-Transparency-pinned
+  HTTPS. If Microsoft's direct-link service refuses the request, download from
+  the official page and pass --iso PATH; the script checks the file against that
+  page. The checksum page is not a digitally signed manifest.
+  For older releases, use --sha256 with a value from an independent trusted
+  Microsoft source. A hash match proves only that bytes match the published value.
+  Microsoft pins and explicitly supplied older-release hashes are saved in
+  locally GPG-signed records with their source clearly labeled. It re-hashes
+  the ISO before use and before HTTP listens. Invalid records are never trusted.
   Windows Setup can start from the PXE boot files, but installation needs a
   separate source; the streamed ISO URL is not an automatic install source.
   For other bootable Windows ISOs, usb-boot may work if the phone and PC support it.
@@ -5906,8 +6533,9 @@ ENVIRONMENT VARIABLES
   USB_NET_IFACE         USB RNDIS network interface                (default: usb0)
   USB_NET_CIDR          USB link address and DHCP subnet            (default: 192.168.42.1/24)
   USB_GADGET_VID/PID    USB vendor/product IDs; Android IDs are detected when available
-  ISO_URL               Override the ISO URL (must still be listed in the vendor checksums)
-  ISO_SHA256            Expected Windows ISO SHA-256 (same as --sha256; required for Windows)
+  ISO_URL               Override the ISO URL; Windows bytes still need a trusted SHA-256
+  ISO_SHA256            Explicit Windows SHA-256 from a trusted independent source
+  WINDOWS_LANG          Microsoft language name/code for non-interactive downloads
   SUMS_URL, SUMS_SIG_URL, ISO_SIG_URL
                         Override verification sources
   KEY_FPR               Override the vendor signing key fingerprint
@@ -5991,6 +6619,8 @@ parse_args() {
       --iso=*)    ISO_FILE="${1#*=}" ;;
       --sha256)   [[ $# -ge 2 ]] || die "--sha256 requires a 64-character SHA-256 digest"; U_ISO_SHA256="$2"; shift ;;
       --sha256=*) U_ISO_SHA256="${1#*=}" ;;
+      --windows-language) [[ $# -ge 2 ]] || die "--windows-language requires a Microsoft language name or code"; WINDOWS_LANG="$2"; shift ;;
+      --windows-language=*) WINDOWS_LANG="${1#*=}" ;;
       --distro)   [[ $# -ge 2 ]] || die "--distro requires a value"; DISTRO="$2"; CLI_SET+=" DISTRO"; shift ;;
       --distro=*) DISTRO="${1#*=}"; CLI_SET+=" DISTRO" ;;
       --arch)     [[ $# -ge 2 ]] || die "--arch requires a value"; TARGET_ARCH="$2"; CLI_SET+=" TARGET_ARCH"; shift ;;
@@ -6016,11 +6646,11 @@ case "$COMMAND" in
   *) guard_root; log_rotate ;;
 esac
 case "$COMMAND" in
-  deps|attest-init|self-sign|pins|build-ipxe|ipxe-phone|shim-fetch|xbuild-setup|import-ipxe|proot-build|fetch|extract|configure|attest|serve|usb-boot|usb-netboot|clean|backup|restore|terabox-install|all)
+  deps|attest-init|self-sign|pins|build-ipxe|ipxe-phone|shim-fetch|xbuild-setup|import-ipxe|proot-build|fetch|windows-download|extract|configure|attest|serve|usb-boot|usb-netboot|clean|backup|restore|terabox-install|all)
     acquire_lock ;;
 esac
 case "$COMMAND" in
-  deps|attest-init|self-sign|pins|build-ipxe|ipxe-phone|shim-fetch|xbuild-setup|import-ipxe|proot-build|fetch|extract|configure|attest|serve|usb-boot|usb-netboot|clean|backup|restore|terabox-install|all)
+  deps|attest-init|self-sign|pins|build-ipxe|ipxe-phone|shim-fetch|xbuild-setup|import-ipxe|proot-build|fetch|windows-download|extract|configure|attest|serve|usb-boot|usb-netboot|clean|backup|restore|terabox-install|all)
     journal_replay || die "$E_ENV" "Earlier host changes remain unrecovered. Run '$0 heal' before continuing." ;;
 esac
 
@@ -6068,6 +6698,8 @@ case "$COMMAND" in
   ipxe-fetch)     ipxe_fetch "${POSITIONAL[0]:-}" ;;
   ipxe-cloud)     ipxe_cloud ;;
   fetch)          fetch ;;
+  windows-download)
+    DISTRO=windows; TARGET_ARCH=x86_64; set_distro; save_profile; fetch ;;
   extract)        extract ;;
   configure)      configure ;;
   attest)         resolve_network; attest_report ;;
@@ -6084,7 +6716,7 @@ case "$COMMAND" in
   all)
     run_all ;;
   *)
-    known_cmds="go status heal doctor guide easy menu check deps fetch extract configure serve usb-boot usb-netboot backup restore shortcut verify clean logs"
+    known_cmds="go status heal doctor guide easy menu check deps fetch windows-download extract configure serve usb-boot usb-netboot backup restore shortcut verify clean logs"
     sugg=$( { compgen -W "$known_cmds" -- "${COMMAND:0:2}" || compgen -W "$known_cmds" -- "${COMMAND:0:1}" || true; } | tr '\n' ' ')
     err "Unknown command: $COMMAND"
     say "Did you mean: ${sugg:-go, status, heal, guide}"
