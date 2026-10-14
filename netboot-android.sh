@@ -522,7 +522,7 @@ journal_apply() {
   fi
 }
 journal_replay() {   # Newest first; failed or malformed records remain for the next recovery attempt.
-  local id n=0 failed=0 f
+  local id n=0 failed=0 f sorted
   local -a ids=()
   [[ -d $JOURNAL ]] || return 0
   for f in "$JOURNAL"/[0-9]*-[0-9]*-[0-9]*; do
@@ -535,7 +535,9 @@ journal_replay() {   # Newest first; failed or malformed records remain for the 
     fi
   done
   if ((${#ids[@]})); then
-    mapfile -t ids < <(printf '%s\n' "${ids[@]}" | LC_ALL=C sort -r)
+    sorted=$(printf '%s\n' "${ids[@]}" | LC_ALL=C sort -r)
+    ids=()
+    while IFS= read -r id; do [[ -z $id ]] || ids+=("$id"); done <<<"$sorted"
     for id in "${ids[@]}"; do
       if journal_apply "$id"; then n=$((n+1)); else failed=$((failed+1)); fi
     done
@@ -2628,7 +2630,11 @@ import_ipxe() {
   done
   (( n )) || die "No iPXE binaries found in $dir"
 
-  if [[ $VERIFIED_BOOT == 1 ]]; then
+  if [[ ${IMPORT_KEEP_PIN:-0} == 1 ]]; then
+    # ipxe_fetch already required explicit approval and verified either the signed
+    # saved pin or the exact checksummed build. Do not ask for the same approval twice.
+    :
+  elif [[ $VERIFIED_BOOT == 1 ]]; then
     [[ -s $ATTEST/ca.crt ]] || die "Run: $0 attest-init first"
     first=$(ipxe_files_for_arch | head -n1)
     [[ -s $dir/$first ]] || die "$first is required for verified boot."
@@ -3886,13 +3892,14 @@ configure() {
 }
 
 prepare_tftp_serve() {
-  local stage="$TFTP_SERVE.new" f
+  local stage="$TFTP_SERVE.new" f files
   rm -rf -- "$stage"
   mkdir -p "$stage"
+  files=$(boot_files)
   while IFS= read -r f; do
     [[ -f $TFTP/$f && ! -L $TFTP/$f ]] || die "$E_INTEGRITY" "Required TFTP loader is missing or symlinked: $f"
     cp -f -- "$TFTP/$f" "$stage/$f"
-  done < <(boot_files)
+  done <<<"$files"
   [[ -f $TFTP/boot.ipxe && ! -L $TFTP/boot.ipxe ]] || die "$E_INTEGRITY" "Generated boot.ipxe is missing or symlinked."
   cp -f -- "$TFTP/boot.ipxe" "$stage/boot.ipxe"
   if [[ $VERIFIED_BOOT == 1 ]]; then
