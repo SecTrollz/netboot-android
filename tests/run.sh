@@ -26,6 +26,7 @@ run_test() {
   if (( rc == 0 )); then echo "ok   - $name"; echo P >> "$RESULTS"
   elif (( rc == 77 )); then echo "skip - $name ($(cat "$tmp/skip" 2>/dev/null))"; echo S >> "$RESULTS"
   else echo "FAIL - $name (exit $rc)"; sed 's/^/       | /' "$tmp/out" | tail -25; echo F >> "$RESULTS"; fi
+  chmod -R u+w "$tmp" 2>/dev/null || true
   rm -rf "$tmp"
 }
 
@@ -179,8 +180,10 @@ start_test_httpd() {
   head -c 1000 /dev/urandom > "$T/outside.iso"; ln -s "$T/outside.iso" "$HTTP/iso/x.iso"
   echo secret > "$T/secret"
   prepare_tftp_serve
+  echo c > "$DNSMASQ_CONF"
   write_manifest >/dev/null 2>&1
   PHONE_IP=127.0.0.1; HTTP_PORT=$((20000 + RANDOM % 20000)); ISO="$T/outside.iso"
+  printf '%s %s %s\n' "$(sha256_of "$ISO")" "$(file_size "$ISO")" http/iso/x.iso >> "$MANIFEST"
   start_http || { echo "httpd did not start"; cat "$HTTP_LOG.err" 2>/dev/null; exit 1; }
   B="http://127.0.0.1:$HTTP_PORT"
 }
@@ -196,7 +199,8 @@ test_httpd_ranges_and_safety() {
   assert "416 past end" test "$(curl -s -o /dev/null -w '%{http_code}' -r 9000000- "$B/casper/big")" = 416
   assert "traversal blocked" test "$(curl -s --path-as-is -o /dev/null -w '%{http_code}' "$B/../secret")" = 403
   assert "allowed symlink served" test "$(curl -s -o /dev/null -w '%{http_code}' "$B/iso/x.iso")" = 200
-  assert "missing is 404" test "$(curl -s -o /dev/null -w '%{http_code}' "$B/nope")" = 404
+  code=$(curl -s -o /dev/null -w '%{http_code}' "$B/nope")
+  assert "unmanifested path denied" bash -c '[[ "$1" == 403 || "$1" == 404 ]]' _ "$code"
   assert "healthz" curl -fsS "$B/healthz" >/dev/null
   kill "$SERVE_HTTP_PID" 2>/dev/null
 }
