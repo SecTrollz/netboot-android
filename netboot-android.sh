@@ -2630,20 +2630,20 @@ import_ipxe() {
   done
   (( n )) || die "No iPXE binaries found in $dir"
 
-  if [[ ${IMPORT_KEEP_PIN:-0} == 1 ]]; then
-    # ipxe_fetch already required explicit approval and verified either the signed
-    # saved pin or the exact checksummed build. Do not ask for the same approval twice.
-    :
-  elif [[ $VERIFIED_BOOT == 1 ]]; then
+  if [[ $VERIFIED_BOOT == 1 ]]; then
     [[ -s $ATTEST/ca.crt ]] || die "Run: $0 attest-init first"
     first=$(ipxe_files_for_arch | head -n1)
     [[ -s $dir/$first ]] || die "$first is required for verified boot."
     check_ca_embedded "$dir/$first" "$ATTEST/ca.crt"
-    warn "An embedded CA match is not proof of source or safe behavior. Imported iPXE code will execute on the target computer."
-    ask_yn "Trust and stage these externally built iPXE binaries?" n || die "$E_USAGE" "Import declined; no loader files were copied."
+    if [[ ${IMPORT_KEEP_PIN:-0} != 1 ]]; then
+      warn "An embedded CA match is not proof of source or safe behavior. Imported iPXE code will execute on the target computer."
+      ask_yn "Trust and stage these externally built iPXE binaries?" n || die "$E_USAGE" "Import declined; no loader files were copied."
+    fi
   else
     warn "VERIFIED_BOOT=0: imported binaries are unsigned and unverified."
-    ask_yn "Stage these unverified iPXE binaries anyway?" n || die "$E_USAGE" "Import declined; no loader files were copied."
+    if [[ ${IMPORT_KEEP_PIN:-0} != 1 ]]; then
+      ask_yn "Stage these unverified iPXE binaries anyway?" n || die "$E_USAGE" "Import declined; no loader files were copied."
+    fi
   fi
 
   mkdir -p "$TFTP" "$STATE"
